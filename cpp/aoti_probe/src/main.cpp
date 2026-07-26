@@ -34,7 +34,7 @@ std::unordered_map<std::string, std::string> parse_flags(int argc, char** argv) 
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::cout << "[aoti_probe] header include: OK (compiled)\n";
+    std::cout << "[aoti_probe] header include: OK (compiled)\n" << std::flush;
 
     auto flags = parse_flags(argc, argv);
     auto package_it = flags.find("package");
@@ -54,8 +54,9 @@ int main(int argc, char** argv) {
         // Constructing this object forces the linker to resolve
         // torch::inductor::AOTIModelPackageLoader symbols -> proves LINK, not
         // just COMPILE.
+        std::cout << "[aoti_probe] stage: before AOTIModelPackageLoader construction\n" << std::flush;
         torch::inductor::AOTIModelPackageLoader loader(package_it->second);
-        std::cout << "[aoti_probe] AOTIModelPackageLoader construction: OK (link resolved)\n";
+        std::cout << "[aoti_probe] AOTIModelPackageLoader construction: OK (link resolved)\n" << std::flush;
 
         phase0::TensorMeta meta = phase0::read_tensor_meta(input_meta_it->second);
         std::vector<float> input_data = phase0::read_tensor_bin(input_bin_it->second, meta);
@@ -63,20 +64,23 @@ int main(int argc, char** argv) {
         std::vector<int64_t> shape(meta.shape.begin(), meta.shape.end());
         at::Tensor input = torch::from_blob(input_data.data(), shape, torch::kFloat32).clone();
 
+        std::cout << "[aoti_probe] stage: before loader.run()\n" << std::flush;
         std::vector<at::Tensor> outputs = loader.run({input});
+        std::cout << "[aoti_probe] stage: after loader.run()\n" << std::flush;
         if (outputs.empty()) {
-            std::cerr << "[aoti_probe] result: PACKAGE_LOAD_FAILED (run() returned no outputs)\n";
+            std::cerr << "[aoti_probe] result: PACKAGE_LOAD_FAILED (run() returned no outputs)\n" << std::flush;
             return 1;
         }
 
         std::cout << "[aoti_probe] package load + run: OK, output shape = [";
         for (int64_t d : outputs[0].sizes()) std::cout << d << " ";
         std::cout << "]\n";
-        std::cout << "[aoti_probe] result: SUPPORTED\n";
+        std::cout << "[aoti_probe] result: SUPPORTED\n" << std::flush;
+        std::cout << "[aoti_probe] stage: before return from try block (loader destructor runs next)\n" << std::flush;
         return 0;
     } catch (const std::exception& e) {
-        std::cerr << "[aoti_probe] exception: " << e.what() << "\n";
-        std::cerr << "[aoti_probe] result: PACKAGE_LOAD_FAILED\n";
+        std::cerr << "[aoti_probe] exception: " << e.what() << "\n" << std::flush;
+        std::cerr << "[aoti_probe] result: PACKAGE_LOAD_FAILED\n" << std::flush;
         return 1;
     }
 }

@@ -11,17 +11,16 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from image_ai_studio.tools.run_and_compare import run_case
+from image_ai_studio.tools.run_and_compare import find_runner_binary, run_case
 
 MODELS = ["tiny_cnn", "tiny_residual_cnn"]
 DEVICES = ["cpu", "cuda"]
 
 
 def main() -> None:
-    import platform
-
-    suffix = ".exe" if platform.system() == "Windows" else ""
-    runner_binary = REPO_ROOT / "build-torchscript" / "cpp" / "torchscript_runner" / f"run_torchscript{suffix}"
+    runner_binary = find_runner_binary(
+        REPO_ROOT / "build-torchscript", "torchscript_runner", "run_torchscript"
+    )
 
     for model in MODELS:
         model_artifact = REPO_ROOT / "artifacts" / "torchscript" / model / "model.pt"

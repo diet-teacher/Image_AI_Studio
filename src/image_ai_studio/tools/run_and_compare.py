@@ -6,6 +6,7 @@ hardcoding either backend.
 """
 from __future__ import annotations
 
+import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -29,6 +30,25 @@ ARTIFACTS_COMMON = REPO_ROOT / "artifacts" / "common"
 ARTIFACTS_REFERENCE = REPO_ROOT / "artifacts" / "reference"
 RESULTS_DIR = REPO_ROOT / "results"
 REPORT_LOG = RESULTS_DIR / "test_matrix.json"
+
+
+def find_runner_binary(build_dir: Path, project_subdir: str, exe_name: str) -> Path:
+    """Locate a built runner executable under build_dir/cpp/project_subdir.
+
+    CMake's single-config generators (Ninja, Makefiles) place the binary
+    directly in that directory; MSVC's multi-config Visual Studio generator
+    nests it under a config subdirectory (Release/, Debug/, ...) instead.
+    Check the plain path first, then fall back to Release/.
+    """
+    suffix = ".exe" if platform.system() == "Windows" else ""
+    base = build_dir / "cpp" / project_subdir
+    candidates = [base / f"{exe_name}{suffix}"]
+    if platform.system() == "Windows":
+        candidates.append(base / "Release" / f"{exe_name}{suffix}")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 def run_case(

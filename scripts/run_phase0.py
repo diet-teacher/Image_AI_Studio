@@ -13,6 +13,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOG_DIR = REPO_ROOT / "results" / "logs"
 
+sys.path.insert(0, str(REPO_ROOT / "src"))
+from image_ai_studio.tools.run_and_compare import find_runner_binary
+
 
 def run_step(name: str, cmd: list[str], *, allow_fail: bool = False) -> bool:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -41,8 +44,9 @@ def main() -> None:
     # AOTI compile/link/package-load probe -- independent build dir,
     # failure here must not block step 07 below.
     run_step("06a_build_aoti_probe", [py, "scripts/build_aoti.py", "--build-dir", "build-aoti-probe", "--probe-only"])
+    probe_binary = find_runner_binary(REPO_ROOT / "build-aoti-probe", "aoti_probe", "probe_aoti")
     run_step("06b_run_aoti_probe", [
-        str(REPO_ROOT / "build-aoti-probe" / "cpp" / "aoti_probe" / "probe_aoti"),
+        str(probe_binary),
         "--package", "artifacts/aoti/tiny_cnn/cpu/model.pt2",
         "--input-bin", "artifacts/common/input.bin",
         "--input-meta", "artifacts/common/input.json",
