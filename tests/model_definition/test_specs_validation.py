@@ -8,6 +8,7 @@ from image_ai_studio.model_definition.errors import ModelValidationError
 from image_ai_studio.model_definition.specs import (
     Conv2dSpec,
     DropoutSpec,
+    FlattenSpec,
     LinearSpec,
     MaxPool2dSpec,
     ModelSpec,
@@ -105,3 +106,82 @@ def test_model_spec_rejects_invalid_input_shape(input_shape: tuple) -> None:
 def test_model_spec_converts_list_input_shape_to_tuple() -> None:
     spec = ModelSpec(name="m", input_shape=[3, 224, 224], layers=[])  # type: ignore[arg-type]
     assert spec.input_shape == (3, 224, 224)
+
+
+# -- MaxPool2d padding vs. torch.nn.MaxPool2d's own constraint ---------------
+# torch.nn.MaxPool2d only rejects padding > kernel_size // 2 at forward()
+# time (RuntimeError: "pad should be at most half of effective kernel
+# size"), not at construction. MaxPool2dSpec catches it at spec-construction
+# time instead, matching every other parameter check in this module.
+
+
+@pytest.mark.parametrize(
+    "kernel_size,padding",
+    [(3, 2), (2, 2), (4, 3), (1, 1)],
+)
+def test_max_pool2d_rejects_padding_greater_than_half_kernel_size(kernel_size: int, padding: int) -> None:
+    with pytest.raises(ModelValidationError, match="padding"):
+        MaxPool2dSpec(kernel_size=kernel_size, padding=padding)
+
+
+@pytest.mark.parametrize(
+    "kernel_size,padding",
+    [(3, 1), (2, 1), (4, 2), (1, 0)],
+)
+def test_max_pool2d_accepts_padding_at_most_half_kernel_size(kernel_size: int, padding: int) -> None:
+    spec = MaxPool2dSpec(kernel_size=kernel_size, padding=padding)
+    assert spec.padding == padding
+
+
+# -- strict bool validation ---------------------------------------------------
+# JSON may be hand-edited, so truthy/falsy values (strings, ints) must be
+# rejected rather than silently coerced.
+
+
+@pytest.mark.parametrize("inplace", ["false", "true", 0, 1, None])
+def test_relu_rejects_non_bool_inplace(inplace: object) -> None:
+    with pytest.raises(ModelValidationError, match="inplace"):
+        ReLUSpec(inplace=inplace)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("inplace", [True, False])
+def test_relu_accepts_bool_inplace(inplace: bool) -> None:
+    assert ReLUSpec(inplace=inplace).inplace is inplace
+
+
+@pytest.mark.parametrize("bias", ["false", 0, 1, None])
+def test_linear_rejects_non_bool_bias(bias: object) -> None:
+    with pytest.raises(ModelValidationError, match="bias"):
+        LinearSpec(out_features=10, bias=bias)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("bias", [True, False])
+def test_linear_accepts_bool_bias(bias: bool) -> None:
+    assert LinearSpec(out_features=10, bias=bias).bias is bias
+
+
+# -- ModelSpec.input_shape / layers type validation --------------------------
+# tuple()/list() must never be called on a value whose type wasn't checked
+# first, so a bad type raises ModelValidationError, not a raw TypeError.
+
+
+@pytest.mark.parametrize("input_shape", [123, None, "3,224,224"])
+def test_model_spec_rejects_non_sequence_input_shape(input_shape: object) -> None:
+    with pytest.raises(ModelValidationError, match="input_shape"):
+        ModelSpec(name="m", input_shape=input_shape, layers=[])  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("layers", [123, None, "conv"])
+def test_model_spec_rejects_non_sequence_layers(layers: object) -> None:
+    with pytest.raises(ModelValidationError, match="layers"):
+        ModelSpec(name="m", input_shape=(3, 224, 224), layers=layers)  # type: ignore[arg-type]
+
+
+def test_model_spec_rejects_layers_containing_non_layer_spec_elements() -> None:
+    with pytest.raises(ModelValidationError, match=r"layers\[0\]"):
+        ModelSpec(name="m", input_shape=(3, 224, 224), layers=["conv"])  # type: ignore[list-item]
+
+
+def test_model_spec_accepts_tuple_of_layer_specs() -> None:
+    spec = ModelSpec(name="m", input_shape=(3, 224, 224), layers=(FlattenSpec(),))
+    assert spec.layers == [FlattenSpec()]

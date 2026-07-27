@@ -59,6 +59,10 @@ def _layer_from_dict(data: object, index: int) -> LayerSpec:
         raise ModelValidationError(f"Layer {index}: missing required 'type' field")
 
     type_name = data["type"]
+    if not isinstance(type_name, str):
+        raise ModelValidationError(
+            f"Layer {index}: 'type' must be a string, got {type(type_name).__name__}"
+        )
     layer_cls = _LAYER_REGISTRY.get(type_name)
     if layer_cls is None:
         raise ModelValidationError(
@@ -95,7 +99,10 @@ def model_spec_from_dict(data: dict) -> ModelSpec:
         raise ModelValidationError("Model spec field 'layers' must be a list")
 
     layers = [_layer_from_dict(item, index) for index, item in enumerate(data["layers"])]
-    return ModelSpec(name=data["name"], input_shape=tuple(data["input_shape"]), layers=layers)
+    # input_shape is passed through as-is (not tuple()-converted here): if it
+    # isn't iterable, tuple() would raise a raw TypeError before ModelSpec's
+    # own __post_init__ gets a chance to turn it into a ModelValidationError.
+    return ModelSpec(name=data["name"], input_shape=data["input_shape"], layers=layers)
 
 
 def save_model_spec(model_spec: ModelSpec, path: str | Path) -> None:

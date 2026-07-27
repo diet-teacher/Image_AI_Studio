@@ -1,67 +1,66 @@
 # Image AI Studio
 
-## Long-term goal
+## 장기 목표
 
-Image AI Studio is intended to let a user design an image AI model in a UI,
-train it in PyTorch, export it to a C++ inference environment, and compare
-the Python and C++ outputs and performance.
+Image AI Studio는 사용자가 UI에서 이미지 AI 모델을 설계하고, PyTorch로
+학습시키고, C++ 추론 환경으로 내보낸 뒤, Python과 C++ 출력 및 성능을
+비교할 수 있도록 하는 것을 목표로 합니다.
 
 ```text
-model design
-    -> PyTorch model
-    -> training/checkpoint
-    -> C++ export
-    -> Python inference
-    -> C++ inference
-    -> Python/C++ output & performance comparison
+모델 설계
+    -> PyTorch 모델
+    -> 학습/체크포인트
+    -> C++ 내보내기(export)
+    -> Python 추론
+    -> C++ 추론
+    -> Python/C++ 출력 및 성능 비교
 ```
 
 ## Phase 0
 
-Phase 0 is a technical spike, not the final product.
+Phase 0은 최종 제품이 아니라 기술 스파이크(technical spike)입니다.
 
-Its purpose is to validate the riskiest and most uncertain part of the
-long-term architecture:
+장기 아키텍처에서 가장 위험하고 불확실한 부분을 검증하는 것이 목적입니다.
 
 ```text
-Python PyTorch model
-    -> C++ export
-    -> load in a C++ program
-    -> run with the same input tensor
-    -> compare Python and C++ outputs
+Python PyTorch 모델
+    -> C++ 내보내기
+    -> C++ 프로그램에서 로드
+    -> 동일한 입력 텐서로 실행
+    -> Python과 C++ 출력 비교
 ```
 
-Two deployment paths are evaluated independently:
+두 가지 배포 경로를 독립적으로 평가합니다:
 
 1. **TorchScript** (`torch.jit.trace`)
 
-   * Deprecated upstream.
-   * Used here as the current compatibility path.
+   * 업스트림에서 이미 지원 중단(deprecated)된 상태.
+   * 현재 Phase 0에서는 호환성 및 안정적인 C++ 배포 경로로 사용됨.
 
 2. **torch.export + AOTInductor** (`.pt2`)
 
-   * Evaluated as a newer C++ deployment path.
-   * Actual build and runtime behavior is tested rather than assumed.
+   * 새로운 C++ 배포 경로로 평가.
+   * 가정하지 않고 실제 빌드 및 런타임 동작을 테스트함.
 
-`run_torchscript` and `run_aoti` are separate executables built from
-separate CMake targets.
+`run_torchscript`와 `run_aoti`는 별도의 CMake 타겟으로 빌드되는
+별개의 실행 파일입니다.
 
-A failure in the AOTInductor path must not block building or testing the
-TorchScript path, and vice versa.
+AOTInductor 경로의 실패가 TorchScript 경로의 빌드나 테스트를 막아서는
+안 되며, 그 반대의 경우도 마찬가지입니다.
 
 ---
 
 ## Phase 1
 
-Based on the Phase 0 results (`docs/phase0_results.md`), Phase 1 and
-onward use **TorchScript only** as the C++ deployment/inference path.
-AOTInductor is excluded from new Phase 1 work because of the Windows
-CPU runtime teardown crash and the CUDA Compute Capability limitation
-found in Phase 0; the existing AOTInductor code is kept for the record
-but nothing new depends on it.
+Phase 0 결과(`docs/phase0_results.md`)를 바탕으로, Phase 1부터는 C++
+배포/추론 경로로 **TorchScript만 사용**합니다. Phase 0에서 확인된
+Windows CPU 런타임 종료 시 크래시와 CUDA Compute Capability 제약
+때문에 AOTInductor는 신규 Phase 1 작업에서 제외되며, 기존
+AOTInductor 코드는 기록용으로만 유지되고 새 코드는 이를 참조하지
+않습니다.
 
-Phase 1 builds the **Model Definition Layer** that will sit at the
-center of Image AI Studio once a UI exists:
+Phase 1에서는 앞으로 Image AI Studio의 중심이 될 **Model Definition
+Layer**를 구현합니다:
 
 ```text
 Model Definition
@@ -72,16 +71,16 @@ Model Definition
     -> C++ Inference
 ```
 
-See `docs/phase1_design.md` for the full design (supported layers,
-shape inference, validation, the JSON format, and how it plugs into the
-existing TorchScript exporter). Phase 1 does not include the PySide6
-UI, training, IPC, or detection/segmentation.
+전체 설계(지원 레이어, shape inference, validation, JSON 포맷, 기존
+TorchScript exporter와의 연동 방식)는 `docs/phase1_design.md`를
+참고하세요. Phase 1에는 PySide6 UI, 학습, IPC, Detection/Segmentation이
+포함되지 않습니다.
 
 ---
 
-## Cross-platform scope
+## 크로스 플랫폼 범위
 
-The primary target is:
+주요 대상 환경은 다음과 같습니다:
 
 ```text
 Windows 11
@@ -91,112 +90,116 @@ x64 Release
 NVIDIA CUDA GPU
 ```
 
-The C++ code is written as standard C++17 without intentionally depending
-on MSVC-specific APIs, so the same CMake project can also be built on
-macOS and Linux.
+C++ 코드는 MSVC 전용 API에 의도적으로 의존하지 않는 표준 C++17로
+작성되어 있어, 동일한 CMake 프로젝트를 macOS와 Linux에서도 빌드할
+수 있습니다.
 
 ### Windows
 
-Primary validation environment.
+주요 검증 환경입니다.
 
 ```text
-CPU inference
-CUDA inference
+CPU 추론
+CUDA 추론
 TorchScript
 AOTInductor
-C++ parity testing
+C++ 패리티(parity) 테스트
 ```
+
+현재 검증 결과에서는 TorchScript CPU/CUDA가 정상 동작했으며,
+AOTInductor는 Windows CPU 런타임 종료(teardown) 시 발생하는 문제와
+테스트에 사용된 GPU의 Compute Capability 제약이 확인되었습니다.
+자세한 내용은 `docs/phase0_results.md`를 참고하세요.
 
 ### Linux
 
-Expected to support both CPU and CUDA with the same C++ implementation.
+동일한 C++ 구현으로 CPU와 CUDA를 모두 지원할 것으로 예상됩니다.
 
-Linux CUDA validation is not yet complete.
+Linux CUDA 검증은 아직 완료되지 않았습니다.
 
 ### macOS
 
-CPU-only validation environment.
+CPU 전용 검증 환경입니다.
 
-Apple Silicon does not provide NVIDIA CUDA support, so:
+Apple Silicon은 NVIDIA CUDA를 지원하지 않으므로:
 
 ```text
 --device cuda
 ```
 
-should return `UNSUPPORTED`.
+는 `UNSUPPORTED`를 반환해야 합니다.
 
-The runner must never silently fall back to CPU.
+러너(runner)는 절대 조용히 CPU로 폴백해서는 안 됩니다.
 
-See `docs/phase0_results.md` for environments that have actually been
-executed and validated.
+실제로 실행 및 검증된 환경은 `docs/phase0_results.md`를 참고하세요.
 
 ---
 
-## What's included
+## 포함된 내용
 
 * `TinyCNN`
 * `TinyResidualCNN`
-* Residual connection testing
-* BatchNorm running statistics
-* Reproducible test input tensors
-* Reproducible shared `state_dict`s
-* Fixed random seed
-* SHA-256 artifact checksums
-* Python CPU reference output
-* Python CUDA reference output where available
-* TorchScript trace export
-* AOTInductor export
-* Export environment metadata
-* Independent C++ TorchScript runner
-* Independent C++ AOTInductor runner
-* CPU FP32 inference
-* CUDA FP32 inference where available
-* Python/C++ output parity comparison
-* 100-iteration repeat stability testing
-* Inference timing statistics
-* GPU memory observation
+* 잔차 연결(Residual connection) 테스트
+* BatchNorm 실행 통계(running statistics)
+* 재현 가능한 테스트 입력 텐서
+* 재현 가능한 공유 `state_dict`
+* 고정된 랜덤 시드
+* SHA-256 아티팩트 체크섬
+* Python CPU 참조 출력
+* 가능한 경우 Python CUDA 참조 출력
+* TorchScript trace 내보내기
+* AOTInductor 내보내기
+* 내보내기 환경 메타데이터
+* 독립적인 C++ TorchScript 러너
+* 독립적인 C++ AOTInductor 러너
+* CPU FP32 추론
+* 가능한 경우 CUDA FP32 추론
+* Python/C++ 출력 패리티 비교
+* 100회 반복 안정성 테스트
+* 추론 타이밍 통계
+* GPU 메모리 관측
 
 ---
 
-## What's excluded
+## 제외된 내용
 
-Phase 0 intentionally does not include:
+Phase 0은 다음 항목들을 의도적으로 포함하지 않습니다:
 
 * PySide6 UI
-* Model graph editor
-* Training loop
-* `ImageFolder` dataset integration
-* Shared memory IPC
-* Socket IPC
+* 모델 그래프 편집기
+* 학습 루프
+* `ImageFolder` 데이터셋 통합
+* 공유 메모리 IPC
+* 소켓 IPC
 * JSON-Lines IPC
-* Long-running worker process
-* Dynamic shapes
+* 장기 실행 워커 프로세스
+* 동적 shape(Dynamic shapes)
 * ONNX Runtime
 * TensorRT
-* Detection
-* Segmentation
-* Real-time video processing
-* Model version management UI
+* 객체 탐지(Detection)
+* 세그멘테이션(Segmentation)
+* 실시간 비디오 처리
+* 모델 버전 관리 UI
 * Git LFS
-* Debug builds
-* Building LibTorch from source
+* 디버그 빌드
+* LibTorch 소스 빌드
 
 ---
 
-# Setup
+# 설치(Setup)
 
-## 1. Create a Python environment
+## 1. Python 환경 생성
 
-Python 3.11 is currently used for Phase 0.
+Phase 0에서는 현재 Python 3.11을 사용합니다.
 
-Using conda:
+conda 사용 시:
 
 ```bash
 conda create -n ias python=3.11 pip -y
 conda activate ias
 ```
 
-Verify:
+확인:
 
 ```bash
 python --version
@@ -205,21 +208,21 @@ python -m pip --version
 
 ---
 
-## 2. Install common Python dependencies
+## 2. 공통 Python 의존성 설치
 
-`requirements.txt` contains only platform-independent Python dependencies.
+`requirements.txt`에는 플랫폼에 독립적인 Python 의존성만 포함되어
+있습니다.
 
-PyTorch is intentionally **not included** in `requirements.txt`, because
-the required PyTorch build depends on the operating system and GPU
-environment.
+필요한 PyTorch 빌드가 운영체제와 GPU 환경에 따라 달라지므로,
+PyTorch는 의도적으로 `requirements.txt`에 **포함되어 있지 않습니다**.
 
-Install the common dependencies first:
+먼저 공통 의존성을 설치하세요:
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-Current `requirements.txt`:
+현재 `requirements.txt`:
 
 ```text
 filelock==3.32.0
@@ -236,43 +239,46 @@ typing_extensions==4.16.0
 
 ---
 
-## 3. Install PyTorch separately
+## 3. PyTorch 별도 설치
 
-PyTorch must be installed separately according to the target environment.
+PyTorch는 대상 환경에 맞게 별도로 설치해야 합니다.
 
-This is intentional.
+이는 의도된 것입니다.
 
-Do not assume that:
+다음 명령이
 
 ```bash
 pip install torch
 ```
 
-will install the desired CUDA-enabled build.
+원하는 CUDA 지원 빌드를 설치해줄 것이라고 가정하지 마세요.
+
+아래 버전 번호는 설치 예시입니다. 실제 검증에 사용된 PyTorch 버전은
+`docs/phase0_results.md`를 참고하세요.
 
 ### Windows + NVIDIA CUDA
 
-Install the CUDA-enabled PyTorch wheel appropriate for the environment.
+환경에 맞는 CUDA 지원 PyTorch wheel을 설치하세요.
 
-Example:
+예시:
 
 ```bat
 python -m pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cu126
 ```
 
-After installation, verify:
+설치 후 확인:
 
 ```bat
 python -c "import torch; print('PyTorch:', torch.__version__); print('PyTorch CUDA:', torch.version.cuda); print('CUDA available:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None'); print('Capability:', torch.cuda.get_device_capability(0) if torch.cuda.is_available() else 'None')"
 ```
 
-For a CUDA-enabled environment, the important result is:
+CUDA 지원 환경이라면 다음 결과가 중요합니다:
 
 ```text
 CUDA available: True
 ```
 
-A basic CUDA operation can also be tested:
+기본적인 CUDA 연산도 테스트할 수 있습니다:
 
 ```bat
 python -c "import torch; x=torch.randn(1024,1024,device='cuda'); y=x@x; print(y.device); print(y.mean())"
@@ -280,164 +286,159 @@ python -c "import torch; x=torch.randn(1024,1024,device='cuda'); y=x@x; print(y.
 
 ### macOS
 
-Install the standard macOS PyTorch package:
+표준 macOS PyTorch 패키지를 설치하세요:
 
 ```bash
 python -m pip install torch==2.12.1
 ```
 
-CUDA is not expected to be available on macOS.
+macOS에서는 CUDA를 사용할 수 없을 것으로 예상됩니다.
 
 ### Linux + NVIDIA CUDA
 
-Install the PyTorch CUDA wheel appropriate for the Linux CUDA environment.
+대상 Linux CUDA 환경에 맞는 PyTorch CUDA wheel을 설치하세요.
 
-The exact wheel should be selected based on the target PyTorch and CUDA
-configuration rather than being hardcoded into `requirements.txt`.
+정확한 wheel은 `requirements.txt`에 하드코딩하는 대신, 목표로 하는
+PyTorch 및 CUDA 구성에 따라 선택해야 합니다.
 
 ---
 
-## 4. Install Image AI Studio in editable mode
+## 4. Image AI Studio를 editable 모드로 설치
 
-The project uses a `src/` Python package layout.
+이 프로젝트는 `src/` Python 패키지 레이아웃을 사용합니다.
 
-Install the project itself into the current Python environment:
+프로젝트 자체를 현재 Python 환경에 설치하세요:
 
 ```bash
 python -m pip install -e .
 ```
 
-`-e` means editable installation.
+`-e`는 editable(수정 가능) 설치를 의미합니다.
 
-Python will reference the current source tree directly, so changes under:
+Python이 현재 소스 트리를 직접 참조하므로,
 
 ```text
 src/image_ai_studio/
 ```
 
-are reflected without reinstalling the package after every edit.
+아래의 변경 사항은 패키지를 매번 재설치하지 않아도 반영됩니다.
 
-Verify:
+확인:
 
 ```bash
 python -c "import image_ai_studio; print(image_ai_studio.__file__)"
 ```
 
-The path should point to this repository's:
+경로는 이 저장소의
 
 ```text
 src/image_ai_studio/
 ```
 
-directory.
+디렉터리를 가리켜야 합니다.
 
 ---
 
-## 5. Inspect the environment
+## 5. 환경 점검
 
-Run:
+실행:
 
 ```bash
 python scripts/inspect_environment.py
 ```
 
-The environment inspection should report information including:
+환경 점검 결과에는 다음 정보가 포함되어야 합니다:
 
 ```text
-Python version
-PyTorch version
-PyTorch CUDA version
-CUDA availability
-GPU name
+Python 버전
+PyTorch 버전
+PyTorch CUDA 버전
+CUDA 사용 가능 여부
+GPU 이름
 GPU compute capability
 CUDA Toolkit
-NVIDIA driver
+NVIDIA 드라이버
 CMake
-compiler
-LibTorch location
+컴파일러
+LibTorch 위치
 ```
 
 ---
 
-# LibTorch for the C++ build
+# C++ 빌드를 위한 LibTorch
 
-A separate LibTorch download is not required for the default Phase 0
-workflow.
+기본 Phase 0 워크플로우에서는 별도의 LibTorch 다운로드가 필요하지
+않습니다.
 
-The C++ build uses the LibTorch files bundled with the installed Python
-`torch` package.
+C++ 빌드는 설치된 Python `torch` 패키지에 번들로 포함된 LibTorch
+파일을 사용합니다.
 
-Retrieve its CMake path with:
+CMake 경로는 다음으로 확인할 수 있습니다:
 
 ```bash
 python -c "import torch; print(torch.utils.cmake_prefix_path)"
 ```
 
-This allows the Python and C++ sides to use the same PyTorch installation
-and avoids version drift between:
+이를 통해 Python과 C++ 양쪽이 동일한 PyTorch 설치를 사용하게 되어,
 
 ```text
 Python PyTorch
 C++ LibTorch
 ```
 
-For example, installing a CUDA-enabled PyTorch wheel on Windows also
-means the C++ build uses the LibTorch bundled with that same PyTorch
-installation.
+사이의 버전 불일치를 방지할 수 있습니다.
+
+예를 들어 Windows에 CUDA 지원 PyTorch wheel을 설치하면, C++ 빌드도
+동일한 PyTorch 설치에 번들된 LibTorch를 사용하게 됩니다.
 
 ---
 
-# Windows C++ build configuration
+# Windows C++ 빌드 구성
 
-The primary Phase 0 C++ target is:
+Phase 0의 주요 C++ 타겟은 다음과 같습니다:
 
 ```text
-Platform: x64
-Configuration: Release
+플랫폼: x64
+구성: Release
 ```
 
-Debug builds are intentionally outside the Phase 0 scope.
+디버그 빌드는 Phase 0 범위에서 의도적으로 제외됩니다.
 
-Debug and Release MSVC CRT/ABI combinations must not be mixed.
+Debug와 Release MSVC CRT/ABI 조합을 혼용해서는 안 됩니다.
 
-Configuration errors caused by incompatible Debug/Release combinations
-are classified as:
+호환되지 않는 Debug/Release 조합으로 인한 구성 오류는 TorchScript나
+AOTInductor 백엔드 실패가 아니라 다음으로 분류됩니다:
 
 ```text
 INVALID_BUILD_CONFIGURATION
 ```
 
-rather than as TorchScript or AOTInductor backend failures.
-
-See:
+자세한 빌드 지침은 다음을 참고하세요:
 
 ```text
 docs/build.md
 ```
 
-for detailed build instructions.
-
 ---
 
-# AOTInductor capability probe
+# AOTInductor 지원 여부 프로브(probe)
 
-Before attempting the full AOTInductor C++ runner, verify that the
-installed LibTorch distribution contains the required AOTInductor C++
-runtime.
+전체 AOTInductor C++ 러너를 시도하기 전에, 설치된 LibTorch 배포판에
+필요한 AOTInductor C++ 런타임이 포함되어 있는지 확인하세요.
 
-Run:
+실행:
 
 ```bash
 python scripts/probe_aoti_support.py
 ```
 
-Then build the isolated C++ probe:
+그런 다음 독립된 C++ 프로브를 빌드하세요:
 
 ```bash
 python scripts/build_aoti.py --build-dir build-aoti-probe --probe-only
 ```
 
-Example package test:
+패키지 테스트 예시:
 
 ```bash
 ./build-aoti-probe/cpp/aoti_probe/probe_aoti \
@@ -446,9 +447,18 @@ Example package test:
   --input-meta artifacts/common/input.json
 ```
 
-On Windows, the executable will use the corresponding `.exe` path.
+Windows에서는 실행 파일이 해당하는 `.exe` 경로를 사용합니다.
+Visual Studio의 멀티 컨피그 generator를 사용하는 경우 다음과 같이
+`Release\` 하위 경로가 될 수 있습니다:
 
-Possible capability states include:
+```bat
+build-aoti-probe\cpp\aoti_probe\Release\probe_aoti.exe ^
+  --package artifacts\aoti\tiny_cnn\cpu\model.pt2 ^
+  --input-bin artifacts\common\input.bin ^
+  --input-meta artifacts\common\input.json
+```
+
+가능한 지원 상태(capability states)는 다음과 같습니다:
 
 ```text
 HEADER_NOT_FOUND
@@ -459,40 +469,40 @@ PACKAGE_LOAD_FAILED
 SUPPORTED
 ```
 
-A failed AOTInductor capability probe does not prevent TorchScript from
-being built or tested.
+AOTInductor 지원 여부 프로브가 실패해도 TorchScript의 빌드나 테스트를
+막지 않습니다.
 
-See `docs/phase0_results.md` for actual results.
+실제 결과는 `docs/phase0_results.md`를 참고하세요.
 
 ---
 
-# Generate test artifacts
+# 테스트 아티팩트 생성
 
-Create the deterministic model weights and test input:
+결정론적(deterministic) 모델 가중치와 테스트 입력을 생성하세요:
 
 ```bash
 python -m image_ai_studio.tools.prepare_test_artifacts
 ```
 
-Generate the Python reference outputs:
+Python 참조 출력을 생성하세요:
 
 ```bash
 python -m image_ai_studio.tools.run_python_reference
 ```
 
-Export the models:
+모델을 내보내세요:
 
 ```bash
 python scripts/export_models.py
 ```
 
-This produces the artifacts required by the C++ runners.
+이 과정을 통해 C++ 러너에 필요한 아티팩트가 생성됩니다.
 
 ---
 
-# Build C++ runners
+# C++ 러너 빌드
 
-TorchScript and AOTInductor are built independently.
+TorchScript와 AOTInductor는 독립적으로 빌드됩니다.
 
 ## TorchScript
 
@@ -500,17 +510,21 @@ TorchScript and AOTInductor are built independently.
 python scripts/build_torchscript.py
 ```
 
-Expected output:
+예상 출력:
 
 ```text
 build-torchscript/.../run_torchscript
 ```
 
-On Windows:
+Windows에서는:
 
 ```text
 run_torchscript.exe
 ```
+
+Visual Studio처럼 멀티 컨피그 generator를 사용하는 Windows에서는
+실행 파일이 `Release/` 하위(예: `build-torchscript/.../Release/run_torchscript.exe`)에
+생성될 수 있습니다.
 
 ## AOTInductor
 
@@ -518,21 +532,23 @@ run_torchscript.exe
 python scripts/build_aoti.py
 ```
 
-Expected output:
+예상 출력:
 
 ```text
 build-aoti/.../run_aoti
 ```
 
-On Windows:
+Windows에서는:
 
 ```text
 run_aoti.exe
 ```
 
-Each backend uses its own build directory.
+마찬가지로 `build-aoti/.../Release/run_aoti.exe` 형태가 될 수 있습니다.
 
-A broken AOTInductor build must not affect:
+각 백엔드는 자체 빌드 디렉터리를 사용합니다.
+
+AOTInductor 빌드가 깨지더라도 다음에는 영향을 주지 않아야 합니다:
 
 ```text
 build-torchscript/
@@ -540,19 +556,19 @@ build-torchscript/
 
 ---
 
-# Run tests
+# 테스트 실행
 
-## Phase 1 Model Definition Layer (unit tests)
+## Phase 1 Model Definition Layer (unit test)
 
 ```bash
 python -m pip install -r requirements-dev.txt
 pytest
 ```
 
-These tests run entirely on CPU and do not require any built C++
-runner. See `docs/phase1_design.md`.
+이 테스트들은 전부 CPU에서 동작하며 빌드된 C++ 러너가 필요 없습니다.
+자세한 내용은 `docs/phase1_design.md`를 참고하세요.
 
-## TorchScript (Phase 0 C++ parity)
+## TorchScript (Phase 0 C++ 패리티)
 
 ```bash
 python scripts/run_torchscript_tests.py
@@ -564,84 +580,84 @@ python scripts/run_torchscript_tests.py
 python scripts/run_aoti_tests.py
 ```
 
-Where CUDA is available, the tests include CPU and CUDA parity.
+CUDA를 사용할 수 있는 경우, 테스트에는 CPU와 CUDA 패리티가 포함됩니다.
 
-Where CUDA is unavailable, CUDA tests are reported as skipped or
-unsupported rather than silently falling back to CPU.
+CUDA를 사용할 수 없는 경우, CUDA 테스트는 조용히 CPU로 폴백되지 않고
+건너뜀(skipped) 또는 미지원(unsupported)으로 보고됩니다.
 
 ---
 
-# Run the complete Phase 0 workflow
+# 전체 Phase 0 워크플로우 실행
 
-Run:
+실행:
 
 ```bash
 python scripts/run_phase0.py
 ```
 
-The workflow performs:
+이 워크플로우는 다음을 수행합니다:
 
 ```text
-environment inspection
-    -> AOTInductor capability probe
-    -> deterministic model/input generation
-    -> Python reference inference
-    -> TorchScript export
-    -> AOTInductor export
-    -> C++ build
-    -> C++ inference
-    -> Python/C++ parity comparison
-    -> repeat stability tests
-    -> result generation
+환경 점검
+    -> AOTInductor 지원 여부 프로브
+    -> 결정론적 모델/입력 생성
+    -> Python 참조 추론
+    -> TorchScript 내보내기
+    -> AOTInductor 내보내기
+    -> C++ 빌드
+    -> C++ 추론
+    -> Python/C++ 패리티 비교
+    -> 반복 안정성 테스트
+    -> 결과 생성
 ```
 
-A failure in an AOTInductor step does not stop the TorchScript path from
-continuing.
+AOTInductor 단계에서의 실패는 TorchScript 경로의 진행을 막지 않습니다.
 
 ---
 
-# Known limitations
+# 알려진 제한 사항
 
-* TorchScript validation currently covers only the static
-  `torch.jit.trace` path.
+* TorchScript 검증은 현재 정적(static) `torch.jit.trace` 경로만
+  다룹니다.
 
-* `torch.jit.script` is outside the Phase 0 scope.
+* `torch.jit.script`는 Phase 0 범위 밖입니다.
 
-* AOTInductor APIs may vary between PyTorch versions.
+* AOTInductor API는 PyTorch 버전에 따라 달라질 수 있습니다.
 
-* Some AOTInductor compile/package/load APIs may live under
-  `torch._inductor`, which is an internal/private module and should be
-  treated as version-sensitive.
+* 일부 AOTInductor compile/package/load API는 내부/비공개 모듈인
+  `torch._inductor` 아래에 있을 수 있으며, 버전에 민감한 것으로
+  취급해야 합니다.
 
-* Only float32 tensors are currently supported by the shared
-  binary + JSON tensor format.
+* 현재 공유 바이너리 + JSON 텐서 포맷은 float32 텐서만 지원합니다.
 
-* macOS validation is CPU-only.
+* macOS 검증은 CPU 전용입니다.
 
-* Windows x64 Release + NVIDIA CUDA is the primary environment that must
-  determine the final backend recommendation.
+* Windows x64 Release + NVIDIA CUDA가 주요 타겟 환경이며, 현재
+  검증 결과에서는 TorchScript가 Phase 0의 기본 배포 백엔드로
+  권장됩니다 (자세한 내용은 `docs/phase0_results.md`의 "권장 백엔드"
+  참고).
 
-* A backend that works on macOS CPU does not automatically imply that the
-  Windows MSVC/CUDA path is supported.
+* macOS CPU에서 동작하는 백엔드가 Windows MSVC/CUDA 경로도
+  지원됨을 자동으로 의미하지는 않습니다.
 
 ---
 
-# Dependency policy
+# 의존성 정책
 
-`requirements.txt` intentionally does not contain PyTorch.
+`requirements.txt`에는 의도적으로 PyTorch가 포함되어 있지 않습니다.
 
-The dependency strategy is:
+의존성 전략은 다음과 같습니다:
 
 ```text
 requirements.txt
-    -> common Python dependencies
+    -> 공통 Python 의존성
 
 PyTorch
-    -> installed separately for each OS / GPU configuration
+    -> OS/GPU 구성별로 별도 설치
 
 pip install -e .
-    -> installs the Image AI Studio source package itself
+    -> Image AI Studio 소스 패키지 자체를 설치
 ```
 
-This avoids coupling the repository to one PyTorch CPU/CUDA wheel and
-makes platform-specific environments explicit.
+이를 통해 저장소가 하나의 PyTorch CPU/CUDA wheel에 종속되는 것을
+방지하고, 플랫폼별 환경을 명시적으로 유지합니다.

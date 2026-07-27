@@ -116,6 +116,23 @@ def test_missing_type_field_raises_model_validation_error() -> None:
         model_spec_from_dict({"name": "m", "input_shape": [3, 8, 8], "layers": [{"out_channels": 4}]})
 
 
+def test_non_string_type_field_raises_model_validation_error() -> None:
+    """A non-string 'type' (e.g. a list) must not reach the dict.get() lookup,
+    which would raise a raw TypeError (unhashable type) instead of
+    ModelValidationError."""
+    with pytest.raises(ModelValidationError, match="'type' must be a string"):
+        model_spec_from_dict(
+            {"name": "m", "input_shape": [3, 8, 8], "layers": [{"type": ["conv2d"]}]}
+        )
+
+
+def test_non_sequence_input_shape_in_json_raises_model_validation_error() -> None:
+    """A non-iterable input_shape must not reach a bare tuple() call, which
+    would raise a raw TypeError instead of ModelValidationError."""
+    with pytest.raises(ModelValidationError, match="input_shape"):
+        model_spec_from_dict({"name": "m", "input_shape": 123, "layers": []})
+
+
 def test_missing_required_layer_param_raises_model_validation_error() -> None:
     with pytest.raises(ModelValidationError, match="conv2d"):
         model_spec_from_dict(

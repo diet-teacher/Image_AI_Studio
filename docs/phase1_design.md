@@ -76,10 +76,19 @@ class ModelSpec:
 
 `input_shape`은 Phase 1에서는 이미지 classification용 3차원
 `(C, H, W)`만 지원한다. `__post_init__`에서 `name`이 비어있지 않은
-문자열인지, `input_shape`이 3개의 양의 정수인지 검증한다.
+문자열인지, `input_shape`이 `list`/`tuple`이고 3개의 양의 정수인지
+검증한다. `input_shape`/`layers`가 애초에 `list`/`tuple`이 아니면
+(예: 정수, 문자열, `None`) `tuple()`/`list()` 변환을 시도하기 전에
+타입을 먼저 검사해 `ModelValidationError`를 낸다 -- 그렇지 않으면
+`tuple(123)` 같은 호출이 raw `TypeError`를 먼저 던져 버린다.
 
 `layers`는 **평평한(Sequential) 리스트**만 지원한다. 임의의 DAG나
-분기 구조는 Phase 1 범위 밖이다 (10번 섹션 참고).
+분기 구조는 Phase 1 범위 밖이다 (10번 섹션 참고). `layers`는 문자열
+같은 임의의 iterable을 받아들이지 않으며 (그렇지 않으면 `"conv"`가
+`['c','o','n','v']`로 조용히 쪼개질 수 있다), 각 원소가 실제
+`LayerSpec` 인스턴스인지도 검사한다 -- 그래야 `["conv"]`처럼 잘못된
+원소가 `shape_inference` 단계까지 흘러가지 않고 `ModelSpec` 생성
+시점에 바로 걸린다.
 
 ## 4. 지원 Layer
 
@@ -88,7 +97,7 @@ class ModelSpec:
 | `conv2d` | `Conv2dSpec` | `in_channels`은 이전 레이어에서 자동 추론 |
 | `batch_norm2d` | `BatchNorm2dSpec` | `num_features`는 이전 레이어에서 자동 추론 |
 | `relu` | `ReLUSpec` | |
-| `max_pool2d` | `MaxPool2dSpec` | `stride` 생략 시 `kernel_size`와 동일 (torch.nn.MaxPool2d와 동일한 기본값) |
+| `max_pool2d` | `MaxPool2dSpec` | `stride` 생략 시 `kernel_size`와 동일 (torch.nn.MaxPool2d와 동일한 기본값). `padding`은 `kernel_size // 2` 이하만 허용 (아래 참고) |
 | `adaptive_avg_pool2d` | `AdaptiveAvgPool2dSpec` | 정사각형 `output_size x output_size`만 지원 |
 | `flatten` | `FlattenSpec` | |
 | `linear` | `LinearSpec` | `in_features`는 이전 레이어에서 자동 추론 |
@@ -152,7 +161,14 @@ Conv2d/MaxPool2d 출력 크기가 0 이하로 줄어드는 경우도 같은 방�
 * **파라미터 검증**: `specs.py`의 각 dataclass `__post_init__`.
   shape 정보 없이 그 자체로 판단 가능한 값만 검사한다
   (`kernel_size`, `stride`, `out_channels`, `out_features`,
-  `padding`, `p` 등).
+  `padding`, `p` 등). `bool` 필드(`ReLUSpec.inplace`,
+  `LinearSpec.bias`)는 `True`/`False`만 허용하고, 문자열/정수
+  등 truthy/falsy 값을 암묵적으로 변환하지 않는다 (JSON을 사람이
+  직접 편집할 수 있기 때문). `MaxPool2dSpec.padding`은
+  `kernel_size // 2` 이하인지도 여기서 확인한다 -- `torch.nn.MaxPool2d`는
+  이 제약을 생성 시점이 아니라 `forward()` 호출 시점에서만 검사하므로,
+  그대로 두면 `build_model()`을 통과한 뒤에야(심지어 TorchScript
+  export/추론 시점에) 실패할 수 있다.
 * **shape 연결 검증**: `shape_inference.py`. 이전 레이어의 출력
   shape이 있어야만 판단 가능하다.
 
@@ -213,9 +229,12 @@ dataclass의 필드 그대로다:
 `in_channels`/`num_features`/`in_features`처럼 shape에서 유도되는
 값은 JSON에 절대 포함되지 않는다 -- 로드/빌드할 때마다
 `shape_inference`가 다시 계산한다. `model_spec_from_dict`은 알 수
-없는 `type`, 누락된 `type` 필드, 누락된 필수 파라미터를 모두
+없는 `type`, 누락된 `type` 필드, 문자열이 아닌 `type`(예:
+`{"type": ["conv2d"]}`), 누락된 필수 파라미터를 모두
 `ModelValidationError`로 변환해 사용자에게 이해 가능한 메시지를
-전달한다.
+전달한다. `type`이 문자열인지는 registry에서 `dict.get(type_name)`을
+호출하기 전에 검사한다 -- 그렇지 않으면 리스트처럼 hashable하지 않은
+값이 raw `TypeError`(unhashable type)를 먼저 던진다.
 
 Round-trip(`ModelSpec -> JSON -> ModelSpec`)은 dataclass의 기본
 `__eq__`로 의미적 동일성이 보장된다 (테스트로 검증됨).

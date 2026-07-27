@@ -7,6 +7,7 @@ from torch import nn
 
 from image_ai_studio.model_definition.builder import build_model
 from image_ai_studio.model_definition.errors import ModelValidationError
+from image_ai_studio.model_definition.shape_inference import infer_model_shapes
 from image_ai_studio.model_definition.specs import (
     AdaptiveAvgPool2dSpec,
     BatchNorm2dSpec,
@@ -99,6 +100,21 @@ def test_forward_pass_matches_shape_inference_output() -> None:
     with torch.inference_mode():
         output = model(torch.randn(1, *spec.input_shape))
     assert tuple(output.shape) == (1, 10)
+
+
+def test_flatten_preserves_batch_dimension_matching_shape_inference() -> None:
+    """shape_inference computes (C, H, W) -> (C*H*W,), batch dim excluded.
+    nn.Flatten() must apply that same collapse per-sample while keeping
+    the batch dimension: [N, C, H, W] -> [N, C*H*W]."""
+    spec = ModelSpec(name="m", input_shape=(3, 4, 4), layers=[FlattenSpec()])
+    expected_flat_shape = infer_model_shapes(spec)[0].output_shape
+    assert expected_flat_shape == (3 * 4 * 4,)
+
+    model = build_model(spec).eval()
+    batch_size = 5
+    with torch.inference_mode():
+        output = model(torch.randn(batch_size, *spec.input_shape))
+    assert tuple(output.shape) == (batch_size, *expected_flat_shape)
 
 
 def test_build_model_raises_model_validation_error_for_invalid_connection() -> None:

@@ -46,6 +46,11 @@ def _require_unit_interval(name: str, value: object) -> None:
         raise ModelValidationError(f"'{name}' must be between 0.0 and 1.0, got {value!r}")
 
 
+def _require_bool(name: str, value: object) -> None:
+    if not isinstance(value, bool):
+        raise ModelValidationError(f"'{name}' must be a bool (true/false), got {value!r}")
+
+
 @dataclass
 class Conv2dSpec(LayerSpec):
     """2D convolution. ``in_channels`` is inferred from the previous layer."""
@@ -81,10 +86,18 @@ class BatchNorm2dSpec(LayerSpec):
 class ReLUSpec(LayerSpec):
     inplace: bool = False
 
+    def __post_init__(self) -> None:
+        _require_bool("inplace", self.inplace)
+
 
 @dataclass
 class MaxPool2dSpec(LayerSpec):
-    """2D max pooling. ``stride`` defaults to ``kernel_size`` when omitted, matching torch.nn.MaxPool2d."""
+    """2D max pooling. ``stride`` defaults to ``kernel_size`` when omitted, matching torch.nn.MaxPool2d.
+
+    ``padding`` must be at most ``kernel_size // 2``, matching the
+    constraint torch.nn.MaxPool2d itself enforces (its own check happens
+    at forward() time, not construction, so this catches it earlier).
+    """
 
     kernel_size: int
     stride: int | None = None
@@ -95,6 +108,12 @@ class MaxPool2dSpec(LayerSpec):
         if self.stride is not None:
             _require_positive_int("stride", self.stride)
         _require_non_negative_int("padding", self.padding)
+        if self.padding > self.kernel_size // 2:
+            raise ModelValidationError(
+                f"'padding' must be at most kernel_size // 2 ({self.kernel_size // 2}), "
+                f"got padding={self.padding} for kernel_size={self.kernel_size} "
+                "(matches torch.nn.MaxPool2d's own constraint)"
+            )
 
     @property
     def effective_stride(self) -> int:
@@ -125,6 +144,7 @@ class LinearSpec(LayerSpec):
 
     def __post_init__(self) -> None:
         _require_positive_int("out_features", self.out_features)
+        _require_bool("bias", self.bias)
 
 
 @dataclass
@@ -153,6 +173,10 @@ class ModelSpec:
         if not isinstance(self.name, str) or not self.name.strip():
             raise ModelValidationError("ModelSpec.name must be a non-empty string")
 
+        if not isinstance(self.input_shape, (list, tuple)):
+            raise ModelValidationError(
+                f"ModelSpec.input_shape must be a list or tuple, got {type(self.input_shape).__name__}"
+            )
         self.input_shape = tuple(self.input_shape)  # type: ignore[assignment]
         if len(self.input_shape) != 3 or any(
             not isinstance(v, int) or isinstance(v, bool) or v <= 0 for v in self.input_shape
@@ -162,4 +186,13 @@ class ModelSpec:
                 f"got {self.input_shape!r}"
             )
 
+        if not isinstance(self.layers, (list, tuple)):
+            raise ModelValidationError(
+                f"ModelSpec.layers must be a list or tuple of LayerSpec, got {type(self.layers).__name__}"
+            )
         self.layers = list(self.layers)
+        for index, layer in enumerate(self.layers):
+            if not isinstance(layer, LayerSpec):
+                raise ModelValidationError(
+                    f"ModelSpec.layers[{index}] must be a LayerSpec instance, got {type(layer).__name__}"
+                )

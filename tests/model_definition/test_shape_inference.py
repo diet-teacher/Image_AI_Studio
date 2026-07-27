@@ -140,6 +140,18 @@ def test_linear_before_flatten_raises_clear_validation_error() -> None:
         infer_model_shapes(spec)
 
 
+def test_conv2d_directly_into_linear_without_flatten_raises() -> None:
+    """Conv2d -> Linear must stay an invalid connection: Phase 1 never
+    auto-flattens. The user must insert an explicit Flatten layer."""
+    spec = ModelSpec(
+        name="m",
+        input_shape=(3, 8, 8),
+        layers=[Conv2dSpec(out_channels=4, kernel_size=3, padding=1), LinearSpec(out_features=10)],
+    )
+    with pytest.raises(ModelValidationError, match=r"Layer 1 \(Linear\).*1D"):
+        infer_model_shapes(spec)
+
+
 def test_pooling_that_collapses_spatial_size_to_zero_raises() -> None:
     spec = ModelSpec(
         name="m",
