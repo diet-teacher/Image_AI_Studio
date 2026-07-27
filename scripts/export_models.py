@@ -30,7 +30,7 @@ MODELS = {
 def load_model(name: str, model_cls) -> torch.nn.Module:
     state_dict_path = ARTIFACTS_COMMON / f"{name}_state_dict.pt"
     model = model_cls()
-    model.load_state_dict(torch.load(state_dict_path, map_location="cpu"))
+    model.load_state_dict(torch.load(state_dict_path, map_location="cpu", weights_only=True))
     return model.eval()
 
 

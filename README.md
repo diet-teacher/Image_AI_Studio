@@ -76,6 +76,38 @@ TorchScript exporter와의 연동 방식)는 `docs/phase1_design.md`를
 참고하세요. Phase 1에는 PySide6 UI, 학습, IPC, Detection/Segmentation이
 포함되지 않습니다.
 
+### Phase 1 E2E 검증
+
+`ModelSpec`으로 정의한 임의의 모델이 실제로 Phase 0의 C++ TorchScript
+러너까지 도달하는지 검증합니다 (새 C++ runner나 새 exporter를 만들지
+않고 기존 `run_torchscript.exe`/`TorchScriptExporter`를 그대로 재사용):
+
+```text
+Model JSON (examples/models/phase1_e2e_model.json)
+    -> ModelSpec
+    -> TorchScript
+    -> C++ Runner (run_torchscript.exe)
+    -> Output parity
+```
+
+```bash
+python scripts/run_phase1_e2e.py
+```
+
+`--model-json`으로 다른 `ModelSpec` JSON을 지정하면 같은 검증 흐름을
+그대로 다른 모델에 재사용할 수 있습니다 (기본값은
+`examples/models/phase1_e2e_model.json`이므로 인자 없이 실행하면
+기존과 동일하게 동작합니다):
+
+```bash
+python scripts/run_phase1_e2e.py --model-json examples/models/phase1_e2e_alt_model.json
+python scripts/run_phase1_e2e.py --model-json path/to/other_model.json
+```
+
+C++ 러너가 필요 없는 `pytest`와 달리, `run_phase1_e2e.py`는 빌드된
+`run_torchscript` 실행 파일이 필요합니다 (없으면 `scripts/build_torchscript.py`를
+자동으로 호출해 빌드합니다).
+
 ---
 
 ## 크로스 플랫폼 범위

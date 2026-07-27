@@ -60,6 +60,8 @@ def run_case(
     device: str,
     warmup: int = 10,
     repeat: int = 100,
+    input_bin: Path | None = None,
+    input_meta: Path | None = None,
 ) -> dict:
     record: dict = {
         "runner": runner_name,
@@ -88,12 +90,14 @@ def run_case(
 
     out_bin = RESULTS_DIR / f"{model_name}_{runner_name}_{device}.bin"
     out_json = RESULTS_DIR / f"{model_name}_{runner_name}_{device}.json"
+    input_bin = input_bin if input_bin is not None else ARTIFACTS_COMMON / "input.bin"
+    input_meta = input_meta if input_meta is not None else ARTIFACTS_COMMON / "input.json"
 
     cmd = [
         str(runner_binary),
         "--model", str(model_artifact),
-        "--input-bin", str(ARTIFACTS_COMMON / "input.bin"),
-        "--input-meta", str(ARTIFACTS_COMMON / "input.json"),
+        "--input-bin", str(input_bin),
+        "--input-meta", str(input_meta),
         "--output-bin", str(out_bin),
         "--output-meta", str(out_json),
         "--device", device,

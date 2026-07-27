@@ -40,7 +40,7 @@ def run_reference(name: str, model_cls, device: str) -> str:
         return "SKIPPED"
 
     model = model_cls()
-    model.load_state_dict(torch.load(state_dict_path, map_location="cpu"))
+    model.load_state_dict(torch.load(state_dict_path, map_location="cpu", weights_only=True))
     model = model.to(device).eval()
 
     example_input = load_tensor(

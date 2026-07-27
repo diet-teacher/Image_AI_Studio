@@ -262,6 +262,78 @@ ModelSpec
 
 AOTInductor 연동은 Phase 1에서 하지 않는다.
 
+## 9-1. C++ TorchScript Runner까지의 E2E 검증
+
+위 흐름은 `torch.jit.load()`로 Python 프로세스 안에서만 재로드/비교한다.
+`scripts/run_phase1_e2e.py`는 여기서 한 단계 더 나아가, `ModelSpec`으로
+정의한 모델이 **실제 Phase 0 C++ TorchScript 러너**(`run_torchscript.exe`)
+까지 도달하는지 검증한다:
+
+```text
+Model JSON (examples/models/phase1_e2e_model.json)
+    -> load_model_spec()                (serialization.py, 변경 없음)
+    -> validate_model_spec()            (validation.py, 변경 없음)
+    -> build_model()                    (builder.py, 변경 없음)
+    -> TorchScriptExporter().export()   (Phase 0 코드, 변경 없음)
+    -> model.pt
+    -> run_torchscript.exe              (Phase 0 C++ 러너, 변경 없음)
+    -> Phase 0 parity.compare_outputs로 Python 참조 출력과 비교
+```
+
+새로 만든 것은 없다:
+
+* **새 C++ runner를 만들지 않았다.** `run_torchscript.exe`는 `--model`을
+  CLI 인자로 받는 범용 러너이므로, TinyCNN/TinyResidualCNN에 쓰던 바로
+  그 실행 파일이 이 모델도 그대로 실행한다.
+* **새 TorchScript exporter를 만들지 않았다.** Phase 0의
+  `TorchScriptExporter`를 그대로 호출한다.
+* **새 tensor I/O/parity 코드를 만들지 않았다.** `parity.tensor_io.save_tensor`,
+  `parity.compare_outputs.compare_outputs`, 그리고 러너 실행/비교/결과
+  로깅을 담당하는 `tools.run_and_compare.run_case()`를 그대로 재사용한다.
+  `run_case()`에는 입력 텐서 경로를 지정할 수 있는 `input_bin`/`input_meta`
+  파라미터만 추가했다 (미지정 시 기존 Phase 0 동작과 100% 동일) --
+  Phase 1 E2E 모델의 입력 shape `(3, 16, 16)`이 Phase 0 공유 입력의
+  `(3, 224, 224)`와 다르기 때문에 필요한 최소한의 변경이다.
+**JSON이 각 예시 모델의 단일 소스(single source of truth)다.** 처음에는
+`examples/models/phase1_e2e_model.json`과 짝을 이루는 `_reference_model_spec()`
+Python 함수를 두고 둘이 같은지(`==`) 매번 검사했으나, 이 방식은 예시
+모델이 하나 늘어날 때마다 JSON과 Python 코드를 둘 다 손으로 동기화해야
+해서 확장성이 없었다 (실제로 두 번째 예시
+`examples/models/phase1_e2e_alt_model.json`을 추가하면서 이 패턴이
+깨졌다). JSON ↔ `ModelSpec` 동등성 자체는 어느 한 예시 모델에 묶이지
+않는 일반적인 성질이라 `tests/model_definition/test_serialization.py`의
+round-trip 테스트가 이미 검증하므로, `run_phase1_e2e.py`는 `--model-json`로
+받은 JSON을 그대로 신뢰하고 `load_model_spec()` + `validate_model_spec()`만
+수행한다.
+
+실행:
+
+```bash
+python scripts/run_phase1_e2e.py
+python scripts/run_phase1_e2e.py --model-json examples/models/phase1_e2e_alt_model.json
+```
+
+`--model-json`은 `examples/models/phase1_e2e_model.json`을 기본값으로
+하므로, 인자 없이 실행하면 기존과 동일하게 동작한다. 다른 JSON을
+지정하면 같은 검증 흐름(JSON -> ModelSpec -> validate -> build_model ->
+TorchScript export -> `run_torchscript.exe` -> parity)을 그대로 재사용해
+임의의 `ModelSpec` 모델을 검증할 수 있다 -- 아티팩트(`model.pt`, 입력
+텐서, 참조 출력)는 `ModelSpec.name` 기준으로 경로가 정해진다. **이름이
+다른 모델끼리는 아티팩트가 분리**되지만, 서로 다른 JSON이라도 `name`
+필드가 같으면 같은 경로를 가리키게 되어 아티팩트를 덮어쓸 수 있다 --
+현재는 이를 막는 별도의 이름 유일성 검사가 없으므로, 예시 모델을
+추가할 때는 `name`이 겹치지 않도록 주의해야 한다.
+
+`run_torchscript.exe`가 아직 빌드되지 않았다면 `scripts/build_torchscript.py`를
+그대로 호출해 자동으로 빌드한다 (새 빌드 로직 없음). CUDA가 없는
+머신에서는 CUDA 케이스가 `SKIPPED`로 보고되며 CPU로 조용히
+폴백하지 않는다 (Phase 0과 동일한 정책).
+
+이 스크립트는 `pytest`가 아니라 별도 스크립트다 -- C++ 러너 빌드를
+요구하지 않는 `pytest`의 전체 unit test와, 빌드된 C++ 러너가 있어야
+의미 있는 E2E 검증을 분리하기 위해서다 (정확한 테스트 개수는 새
+테스트가 추가될 때마다 바뀌므로 여기서는 명시하지 않는다).
+
 ## 10. 현재 제한 사항
 
 * `ModelSpec.layers`는 평평한 리스트만 지원한다. 분기/합류가 있는
