@@ -51,6 +51,34 @@ TorchScript path, and vice versa.
 
 ---
 
+## Phase 1
+
+Based on the Phase 0 results (`docs/phase0_results.md`), Phase 1 and
+onward use **TorchScript only** as the C++ deployment/inference path.
+AOTInductor is excluded from new Phase 1 work because of the Windows
+CPU runtime teardown crash and the CUDA Compute Capability limitation
+found in Phase 0; the existing AOTInductor code is kept for the record
+but nothing new depends on it.
+
+Phase 1 builds the **Model Definition Layer** that will sit at the
+center of Image AI Studio once a UI exists:
+
+```text
+Model Definition
+    -> Shape Inference / Validation
+    -> PyTorch Model Builder
+    -> torch.nn.Module
+    -> TorchScript Export
+    -> C++ Inference
+```
+
+See `docs/phase1_design.md` for the full design (supported layers,
+shape inference, validation, the JSON format, and how it plugs into the
+existing TorchScript exporter). Phase 1 does not include the PySide6
+UI, training, IPC, or detection/segmentation.
+
+---
+
 ## Cross-platform scope
 
 The primary target is:
@@ -514,7 +542,17 @@ build-torchscript/
 
 # Run tests
 
-## TorchScript
+## Phase 1 Model Definition Layer (unit tests)
+
+```bash
+python -m pip install -r requirements-dev.txt
+pytest
+```
+
+These tests run entirely on CPU and do not require any built C++
+runner. See `docs/phase1_design.md`.
+
+## TorchScript (Phase 0 C++ parity)
 
 ```bash
 python scripts/run_torchscript_tests.py
