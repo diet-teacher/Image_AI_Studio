@@ -1,5 +1,4 @@
-"""Parameter-level validation: each LayerSpec / ModelSpec must reject bad
-values in __post_init__, independent of shape context."""
+"""파라미터 검증 테스트 (shape 무관, __post_init__ 단위)."""
 from __future__ import annotations
 
 import pytest
@@ -108,11 +107,8 @@ def test_model_spec_converts_list_input_shape_to_tuple() -> None:
     assert spec.input_shape == (3, 224, 224)
 
 
-# -- MaxPool2d padding vs. torch.nn.MaxPool2d's own constraint ---------------
-# torch.nn.MaxPool2d only rejects padding > kernel_size // 2 at forward()
-# time (RuntimeError: "pad should be at most half of effective kernel
-# size"), not at construction. MaxPool2dSpec catches it at spec-construction
-# time instead, matching every other parameter check in this module.
+# -- MaxPool2d padding 제약 ---------------------------------------------------
+# torch.nn.MaxPool2d padding 제약(kernel_size // 2 이하)을 생성 시점에 선검증
 
 
 @pytest.mark.parametrize(
@@ -133,9 +129,8 @@ def test_max_pool2d_accepts_padding_at_most_half_kernel_size(kernel_size: int, p
     assert spec.padding == padding
 
 
-# -- strict bool validation ---------------------------------------------------
-# JSON may be hand-edited, so truthy/falsy values (strings, ints) must be
-# rejected rather than silently coerced.
+# -- bool 엄격 검증 ------------------------------------------------------------
+# JSON 직접 수정 가능성 고려, bool 타입만 허용 (문자열/정수 캐스팅 금지)
 
 
 @pytest.mark.parametrize("inplace", ["false", "true", 0, 1, None])
@@ -160,9 +155,8 @@ def test_linear_accepts_bool_bias(bias: bool) -> None:
     assert LinearSpec(out_features=10, bias=bias).bias is bias
 
 
-# -- ModelSpec.input_shape / layers type validation --------------------------
-# tuple()/list() must never be called on a value whose type wasn't checked
-# first, so a bad type raises ModelValidationError, not a raw TypeError.
+# -- ModelSpec.input_shape / layers 타입 검증 -----------------------------------
+# tuple()/list() 변환 전 타입 선검증 (raw TypeError 방지)
 
 
 @pytest.mark.parametrize("input_shape", [123, None, "3,224,224"])

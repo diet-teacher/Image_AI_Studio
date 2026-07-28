@@ -1,14 +1,10 @@
-"""JSON round-trip for ModelSpec.
+"""ModelSpec <-> JSON.
 
-The JSON layer format is a flat dict with a discriminator ``"type"``
-field (e.g. ``"conv2d"``) plus that layer's own fields, matching the
-dataclass fields in specs.py exactly:
+레이어 JSON 포맷: "type" 필드 + 해당 dataclass 필드 (specs.py와 1:1 대응).
 
     {"type": "conv2d", "out_channels": 32, "kernel_size": 3, "stride": 1, "padding": 1}
 
-Shape-derived fields (Conv2d.in_channels, BatchNorm2d.num_features,
-Linear.in_features) are never part of the JSON -- they are recomputed by
-shape_inference whenever the spec is built or validated.
+shape 자동 계산 값(in_channels 등)은 JSON에 미포함 -- 빌드/검증 시 shape_inference가 재계산.
 """
 from __future__ import annotations
 
@@ -78,7 +74,7 @@ def _layer_from_dict(data: object, index: int) -> LayerSpec:
 
 
 def model_spec_to_dict(model_spec: ModelSpec) -> dict:
-    """Convert a ModelSpec to a plain JSON-serializable dict."""
+    """ModelSpec -> JSON 직렬화 가능한 dict."""
     return {
         "name": model_spec.name,
         "input_shape": list(model_spec.input_shape),
@@ -87,7 +83,7 @@ def model_spec_to_dict(model_spec: ModelSpec) -> dict:
 
 
 def model_spec_from_dict(data: dict) -> ModelSpec:
-    """Build a ModelSpec from a plain dict (e.g. loaded from JSON)."""
+    """dict -> ModelSpec 생성 (JSON 로드 결과 등)."""
     if not isinstance(data, dict):
         raise ModelValidationError(f"Model spec JSON must be an object, got {type(data).__name__}")
 
@@ -99,21 +95,20 @@ def model_spec_from_dict(data: dict) -> ModelSpec:
         raise ModelValidationError("Model spec field 'layers' must be a list")
 
     layers = [_layer_from_dict(item, index) for index, item in enumerate(data["layers"])]
-    # input_shape is passed through as-is (not tuple()-converted here): if it
-    # isn't iterable, tuple() would raise a raw TypeError before ModelSpec's
-    # own __post_init__ gets a chance to turn it into a ModelValidationError.
+    # input_shape은 tuple() 미변환 상태로 전달 -- ModelSpec.__post_init__에서
+    # 타입 검증 (raw TypeError 대신 ModelValidationError 발생시키기 위함)
     return ModelSpec(name=data["name"], input_shape=data["input_shape"], layers=layers)
 
 
 def save_model_spec(model_spec: ModelSpec, path: str | Path) -> None:
-    """Serialize ``model_spec`` to a JSON file, creating parent directories as needed."""
+    """model_spec을 JSON 파일로 저장. 상위 디렉터리 자동 생성."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(model_spec_to_dict(model_spec), indent=2), encoding="utf-8")
 
 
 def load_model_spec(path: str | Path) -> ModelSpec:
-    """Load a ModelSpec previously written by save_model_spec (or hand-authored JSON)."""
+    """JSON 파일 로드 (save_model_spec 저장분 또는 수동 작성분)."""
     path = Path(path)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))

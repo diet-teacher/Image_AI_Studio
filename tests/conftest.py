@@ -1,5 +1,4 @@
-"""Make the src/ layout importable even without `pip install -e .` first,
-matching the sys.path handling already used by scripts/*.py."""
+"""src/ 임포트 경로 등록 (scripts/*.py와 동일 방식)."""
 from __future__ import annotations
 
 import sys

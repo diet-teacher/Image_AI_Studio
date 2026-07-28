@@ -1,15 +1,8 @@
-"""Per-layer tensor shape computation for a ModelSpec (batch dim excluded).
+"""ModelSpec 레이어별 텐서 shape 계산 (batch 차원 제외).
 
-This is the primary validation surface for how layers connect to each
-other: a mismatched shape between two adjacent layers (e.g. Conv2d
-receiving an already-flattened 1D tensor, or a pooling layer shrinking a
-spatial dimension to zero) is caught here with a message that names the
-offending layer, before any torch.nn.Module is built.
-
-It also resolves the layer parameters that depend on the previous
-layer's output shape (Conv2d.in_channels, BatchNorm2d.num_features,
-Linear.in_features) so callers -- currently validation.py, and
-transitively builder.py -- never need to duplicate this arithmetic.
+- 레이어 간 shape 연결 검증 (예: Conv2d에 1D 입력, 풀링 결과 0 이하)
+- 이전 레이어 shape 의존 파라미터 계산 (Conv2d.in_channels,
+  BatchNorm2d.num_features, Linear.in_features)
 """
 from __future__ import annotations
 
@@ -36,12 +29,7 @@ Shape = tuple[int, ...]
 
 @dataclass
 class LayerShapeInfo:
-    """One entry in a model's shape trace.
-
-    ``inferred`` holds any layer parameters that were derived from
-    ``input_shape`` rather than supplied in the spec (e.g.
-    ``{"in_features": 401408}`` for a Linear layer following a Flatten).
-    """
+    """shape trace 한 줄. inferred: shape에서 자동 계산한 파라미터 (예: {"in_features": 401408})."""
 
     index: int
     layer: LayerSpec
@@ -151,7 +139,7 @@ _SHAPE_HANDLERS: dict[type, _ShapeHandler] = {
 
 
 def infer_layer_shape(layer: LayerSpec, input_shape: Shape, index: int = 0) -> tuple[Shape, dict[str, int]]:
-    """Compute one layer's output shape (and any shape-derived parameters)."""
+    """레이어 output shape 계산 (자동 추론 파라미터 포함)."""
     handler = _SHAPE_HANDLERS.get(type(layer))
     if handler is None:
         raise ModelValidationError(
@@ -162,11 +150,7 @@ def infer_layer_shape(layer: LayerSpec, input_shape: Shape, index: int = 0) -> t
 
 
 def infer_model_shapes(model_spec: ModelSpec) -> list[LayerShapeInfo]:
-    """Walk a ModelSpec's layers in order, computing each layer's shape.
-
-    Raises ModelValidationError on the first invalid connection or
-    non-positive resulting dimension.
-    """
+    """ModelSpec 레이어 순회하며 shape 계산. 연결 오류/0 이하 결과 시 ModelValidationError."""
     shape: Shape = tuple(model_spec.input_shape)
     trace: list[LayerShapeInfo] = []
     for index, layer in enumerate(model_spec.layers):
@@ -179,7 +163,7 @@ def infer_model_shapes(model_spec: ModelSpec) -> list[LayerShapeInfo]:
 
 
 def format_shape_trace(trace: list[LayerShapeInfo]) -> str:
-    """Render a shape trace as human-readable lines, e.g. for a future UI:
+    """shape trace를 UI 표시용 텍스트로 변환.
 
         Conv2d
         [3, 224, 224] -> [32, 224, 224]

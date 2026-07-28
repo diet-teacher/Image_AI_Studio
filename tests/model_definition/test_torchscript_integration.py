@@ -1,9 +1,7 @@
-"""ModelSpec -> build_model -> torch.jit.trace -> model.pt -> reload -> parity.
+"""ModelSpec -> build_model -> torch.jit.trace -> model.pt -> reload -> parity 검증.
 
-Reuses the existing Phase 0 TorchScriptExporter (image_ai_studio.export)
-instead of re-implementing export/compare logic, so Phase 1 model
-definitions go through the exact same, already-validated export path
-that scripts/export_models.py uses for TinyCNN/TinyResidualCNN.
+Phase 0 TorchScriptExporter 재사용 (export/compare 로직 중복 구현 없음,
+TinyCNN/TinyResidualCNN과 동일 경로).
 """
 from __future__ import annotations
 
@@ -27,8 +25,7 @@ from image_ai_studio.parity.compare_outputs import CPU_FP32_ATOL, CPU_FP32_RTOL,
 
 
 def _small_model_spec() -> ModelSpec:
-    # Small spatial size keeps this test fast; the shape-inference /
-    # builder code path is identical regardless of input size.
+    # 작은 입력 크기로 테스트 속도 확보 (shape_inference/builder는 크기 무관 동작)
     return ModelSpec(
         name="phase1_torchscript_smoke",
         input_shape=(3, 16, 16),
@@ -58,8 +55,8 @@ def test_model_spec_builds_exports_and_round_trips_through_torchscript(tmp_path:
         output_path,
         metadata_path,
         model_name=spec.name,
-        # Phase 1 model specs have no on-disk state_dict; build_metadata()
-        # tolerates a non-existent path and records state_dict_sha256=None.
+        # Phase 1 모델은 저장된 state_dict 없음 -- build_metadata()는 경로 부재 시
+        # state_dict_sha256=None 처리
         state_dict_path=tmp_path / "no_state_dict.pt",
     )
 

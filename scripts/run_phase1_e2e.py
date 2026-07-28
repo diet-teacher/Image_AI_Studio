@@ -1,36 +1,22 @@
 #!/usr/bin/env python
-"""Phase 1 end-to-end pipeline:
+"""Phase 1 엔드투엔드 파이프라인:
 
     Model JSON -> ModelSpec -> validate_model_spec() -> build_model()
-        -> torch.nn.Module -> TorchScriptExporter (Phase 0, reused)
-        -> run_torchscript.exe (Phase 0, reused) -> C++ inference
-        -> parity vs. Python reference
+        -> torch.nn.Module -> TorchScriptExporter (Phase 0 재사용)
+        -> run_torchscript.exe (Phase 0 재사용) -> C++ 추론
+        -> Python 참조값과 parity 비교
 
-This does not introduce a new C++ runner, a new TorchScript export path,
-or new tensor I/O / parity code. It proves that an arbitrary Model
-Definition Layer model (not just TinyCNN/TinyResidualCNN) can ride the
-exact same Phase 0 C++ inference pipeline end to end -- run_torchscript.exe
-is a generic runner that takes --model as a CLI argument, so the same
-binary already built for Phase 0 also runs this model with zero changes.
+- 새 C++ 러너/export 경로/tensor I/O 없음, Phase 0 파이프라인 그대로 재사용
+- run_torchscript 빌드 필요 (scripts/build_torchscript.py), 없으면 자동 빌드
+- CUDA 미가용 시 CPU 폴백 없이 SKIPPED 처리
 
-Requires a built run_torchscript (see scripts/build_torchscript.py); this
-script builds it automatically if missing. Never falls back to CPU for a
-CUDA request -- a missing CUDA device is reported as SKIPPED via the
-existing run_and_compare.run_case()/report.py status vocabulary.
-
-Usage:
+사용법:
 
     python scripts/run_phase1_e2e.py
     python scripts/run_phase1_e2e.py --model-json examples/models/phase1_e2e_model.json
     python scripts/run_phase1_e2e.py --model-json path/to/other_model.json
 
---model-json defaults to examples/models/phase1_e2e_model.json, so the
-no-argument form keeps working exactly as before. The JSON file is the
-single source of truth for each example model -- there is no parallel
-hand-written Python ModelSpec to keep in sync, so adding another
---model-json example never requires touching this script.
-JSON <-> ModelSpec equivalence in general (not tied to any one example
-model) is already covered by tests/model_definition/test_serialization.py.
+--model-json 기본값: examples/models/phase1_e2e_model.json
 """
 from __future__ import annotations
 
@@ -82,9 +68,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def load_and_validate(model_json_path: Path) -> tuple[ModelSpec, list]:
-    """JSON -> ModelSpec -> validate_model_spec(), with no torch.nn.Module /
-    C++ runner involvement -- kept separate from main() so it can be
-    exercised in pytest without needing a built run_torchscript."""
+    """JSON -> ModelSpec -> validate_model_spec(). torch/C++ 러너 미의존
+    (run_torchscript 빌드 없이 pytest 실행 가능)."""
     model_spec = load_model_spec(model_json_path)
     shape_trace = validate_model_spec(model_spec)
     return model_spec, shape_trace
@@ -116,9 +101,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\nPHASE 1 E2E: FAIL")
         return 1
 
-    # Deterministic input, generated independently of however many random
-    # draws model construction used -- re-seed first, matching the pattern
-    # already used by image_ai_studio.tools.prepare_test_artifacts.
+    # 동일 입력 생성을 위해 seed 재설정 (prepare_test_artifacts와 동일 패턴)
     set_seed()
     example_input = torch.randn(1, *model_spec.input_shape, dtype=torch.float32)
     input_bin = ARTIFACTS_COMMON / f"{model_spec.name}_input.bin"
@@ -147,10 +130,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\nPHASE 1 E2E: FAIL")
         return 1
 
-    # Python reference output per device (CPU always; CUDA only if
-    # available), rebuilt fresh from the saved state_dict -- same
-    # independence-from-the-in-memory-model pattern as
-    # image_ai_studio.tools.run_python_reference.
+    # 디바이스별 Python 참조 출력 생성 (state_dict 재로드, run_python_reference와 동일 패턴)
     for device in DEVICES:
         if device == "cuda" and not torch.cuda.is_available():
             continue

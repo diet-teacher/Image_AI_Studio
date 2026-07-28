@@ -1,4 +1,4 @@
-"""Shape inference: per-layer shape computation and layer-connection validation."""
+"""shape inference 테스트: 레이어별 shape 계산 + 연결 검증."""
 from __future__ import annotations
 
 import pytest
@@ -99,7 +99,7 @@ def test_batch_norm2d_preserves_shape_and_infers_num_features() -> None:
 
 
 def test_full_example_pipeline_matches_expected_shapes() -> None:
-    """Input -> Conv2d -> MaxPool2d -> Flatten -> Linear, as in the Phase 1 spec example."""
+    """Phase 1 스펙 예시 그대로: Input -> Conv2d -> MaxPool2d -> Flatten -> Linear."""
     spec = ModelSpec(
         name="example_model",
         input_shape=(3, 224, 224),
@@ -141,8 +141,7 @@ def test_linear_before_flatten_raises_clear_validation_error() -> None:
 
 
 def test_conv2d_directly_into_linear_without_flatten_raises() -> None:
-    """Conv2d -> Linear must stay an invalid connection: Phase 1 never
-    auto-flattens. The user must insert an explicit Flatten layer."""
+    """Conv2d -> Linear 직결 금지 (자동 flatten 없음, Flatten 명시 필요)."""
     spec = ModelSpec(
         name="m",
         input_shape=(3, 8, 8),

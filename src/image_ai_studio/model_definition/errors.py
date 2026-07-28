@@ -1,10 +1,6 @@
-"""Shared exception type for the model_definition package."""
+"""model_definition 공용 예외 타입."""
 from __future__ import annotations
 
 
 class ModelValidationError(ValueError):
-    """Raised when a ModelSpec or LayerSpec is invalid.
-
-    Messages are written to be understandable when shown directly to a
-    future UI user, not just to a developer reading a traceback.
-    """
+    """ModelSpec/LayerSpec 검증 실패 시 발생. 메시지는 UI 노출 가능한 수준으로 작성."""

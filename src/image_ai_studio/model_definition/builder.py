@@ -1,10 +1,7 @@
-"""Builds a torch.nn.Module from a ModelSpec.
+"""ModelSpec -> torch.nn.Module 빌드.
 
-Phase 1 only supports a flat layer list, so the result is always a
-plain ``nn.Sequential``. Layer parameters that depend on the previous
-layer's output shape (``Conv2d.in_channels``, ``BatchNorm2d.num_features``,
-``Linear.in_features``) are filled in from ``shape_inference`` rather
-than requiring the caller (or a future UI) to compute them.
+- Phase 1: Sequential 구조만 지원, 결과는 항상 nn.Sequential
+- in_channels/num_features/in_features 등은 shape_inference 결과 사용
 """
 from __future__ import annotations
 
@@ -92,11 +89,7 @@ def _build_layer(info: LayerShapeInfo) -> nn.Module:
 
 
 def build_model(model_spec: ModelSpec) -> nn.Sequential:
-    """Validate ``model_spec`` (via shape inference) and build a torch.nn.Sequential.
-
-    Raises ModelValidationError if the spec is invalid; never returns a
-    partially-built module.
-    """
+    """model_spec 검증 후 nn.Sequential로 조립. 검증 실패 시 예외, 부분 생성 모델 반환 없음."""
     shape_trace = validate_model_spec(model_spec)
     modules = [_build_layer(info) for info in shape_trace]
     return nn.Sequential(*modules)

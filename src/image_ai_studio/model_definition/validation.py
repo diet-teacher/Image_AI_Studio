@@ -1,19 +1,9 @@
-"""Top-level validation entry point for a ModelSpec.
+"""ModelSpec 검증 진입점.
 
-Two validation layers already run before this module is involved:
-
-* Each ``LayerSpec`` dataclass validates its own parameters (kernel_size
-  > 0, etc.) in ``__post_init__`` (see specs.py) -- this fires even when
-  the spec is built from JSON.
-* ``shape_inference.infer_model_shapes`` validates that each layer's
-  output shape is a valid input for the next layer, and that no
-  computed dimension collapses to zero or below.
-
-``validate_model_spec`` is the single call ``builder.build_model`` makes
-before constructing any ``torch.nn.Module``. A future UI can also call
-it directly -- e.g. to show inline shape-validation errors while a
-model is being edited, without needing torch installed at all, since
-this module (like specs.py and shape_inference.py) never imports torch.
+- 파라미터 검증: 각 LayerSpec __post_init__ (specs.py)
+- shape 연결 검증: shape_inference.infer_model_shapes
+- validate_model_spec: 위 둘을 묶은 단일 진입점, builder.build_model에서 호출
+- torch 미의존 (향후 UI 프로세스에서 torch 없이도 사용 가능)
 """
 from __future__ import annotations
 
@@ -25,8 +15,5 @@ __all__ = ["ModelValidationError", "validate_model_spec"]
 
 
 def validate_model_spec(model_spec: ModelSpec) -> list[LayerShapeInfo]:
-    """Validate a ModelSpec end-to-end and return its per-layer shape trace.
-
-    Raises ModelValidationError on the first problem found.
-    """
+    """ModelSpec 검증 후 shape trace 반환. 실패 시 ModelValidationError."""
     return infer_model_shapes(model_spec)

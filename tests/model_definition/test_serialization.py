@@ -1,4 +1,4 @@
-"""JSON round-trip for ModelSpec: Python -> JSON -> Python must be semantically identical."""
+"""ModelSpec JSON round-trip 테스트 (Python -> JSON -> Python 동일성)."""
 from __future__ import annotations
 
 import json
@@ -81,7 +81,7 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
 
 
 def test_load_model_spec_from_task_example_json(tmp_path: Path) -> None:
-    """The exact JSON example from the Phase 1 spec must load successfully."""
+    """Phase 1 스펙에 있는 JSON 예시 그대로 로드되는지 확인."""
     example_json = {
         "name": "example_model",
         "input_shape": [3, 224, 224],
@@ -117,9 +117,7 @@ def test_missing_type_field_raises_model_validation_error() -> None:
 
 
 def test_non_string_type_field_raises_model_validation_error() -> None:
-    """A non-string 'type' (e.g. a list) must not reach the dict.get() lookup,
-    which would raise a raw TypeError (unhashable type) instead of
-    ModelValidationError."""
+    """'type' 비문자열(예: list) 시 dict.get() 조회 전 차단 (unhashable type 방지)."""
     with pytest.raises(ModelValidationError, match="'type' must be a string"):
         model_spec_from_dict(
             {"name": "m", "input_shape": [3, 8, 8], "layers": [{"type": ["conv2d"]}]}
@@ -127,8 +125,7 @@ def test_non_string_type_field_raises_model_validation_error() -> None:
 
 
 def test_non_sequence_input_shape_in_json_raises_model_validation_error() -> None:
-    """A non-iterable input_shape must not reach a bare tuple() call, which
-    would raise a raw TypeError instead of ModelValidationError."""
+    """input_shape 비iterable 시 tuple() 호출 전 차단 (raw TypeError 방지)."""
     with pytest.raises(ModelValidationError, match="input_shape"):
         model_spec_from_dict({"name": "m", "input_shape": 123, "layers": []})
 
@@ -139,7 +136,7 @@ def test_missing_required_layer_param_raises_model_validation_error() -> None:
             {
                 "name": "m",
                 "input_shape": [3, 8, 8],
-                # conv2d requires out_channels and kernel_size
+                # conv2d는 out_channels, kernel_size가 필수임
                 "layers": [{"type": "conv2d"}],
             }
         )

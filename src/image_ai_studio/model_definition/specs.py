@@ -1,19 +1,9 @@
-"""Dataclass specs describing a model, independent of any UI or PyTorch object.
+"""모델 정의용 dataclass. UI/PyTorch와 독립적.
 
-Phase 1 supports a single ``ModelSpec`` holding a flat (Sequential) list
-of ``LayerSpec`` objects -- no arbitrary DAG yet. ``LayerSpec`` is kept as
-a plain marker base with no required methods, so a future composite
-layer (e.g. a ``ResidualBlockSpec`` wrapping several sub-layers) can be
-added as just another class without changing this module's shape, and
-without every existing layer needing to implement a new interface.
-
-Parameter-level validation (kernel_size > 0, etc.) runs in each
-dataclass's ``__post_init__``, so an invalid spec fails immediately at
-construction time -- including when built from JSON via
-``serialization.py``. Shape-level validation (e.g. Conv2d receiving a
-flattened 1D tensor) is a separate concern and lives in
-``shape_inference.py``, since it requires knowing the output shape of
-the previous layer.
+- Phase 1: ModelSpec + LayerSpec 순차 리스트만 지원 (Sequential, DAG 아님)
+- LayerSpec: 필드/메서드 없는 마커 베이스 클래스 (향후 ResidualBlockSpec 등 확장 대비)
+- 파라미터 검증: 각 dataclass __post_init__ (JSON 역직렬화 시에도 동일 적용)
+- shape 연결 검증(예: Conv2d에 1D 입력)은 shape_inference.py 담당
 """
 from __future__ import annotations
 
@@ -23,7 +13,7 @@ from image_ai_studio.model_definition.errors import ModelValidationError
 
 
 class LayerSpec:
-    """Marker base class for all layer spec dataclasses."""
+    """모든 레이어 spec의 마커 베이스 클래스. 필드/메서드 없음."""
 
 
 def _require_positive_int(name: str, value: object) -> None:
@@ -53,7 +43,7 @@ def _require_bool(name: str, value: object) -> None:
 
 @dataclass
 class Conv2dSpec(LayerSpec):
-    """2D convolution. ``in_channels`` is inferred from the previous layer."""
+    """2D 컨볼루션. in_channels는 이전 레이어 출력에서 자동 계산."""
 
     out_channels: int
     kernel_size: int
@@ -69,7 +59,7 @@ class Conv2dSpec(LayerSpec):
 
 @dataclass
 class BatchNorm2dSpec(LayerSpec):
-    """2D batch normalization. ``num_features`` is inferred from the previous layer."""
+    """2D BatchNorm. num_features는 이전 레이어 출력에서 자동 계산."""
 
     eps: float = 1e-5
     momentum: float = 0.1
@@ -92,11 +82,10 @@ class ReLUSpec(LayerSpec):
 
 @dataclass
 class MaxPool2dSpec(LayerSpec):
-    """2D max pooling. ``stride`` defaults to ``kernel_size`` when omitted, matching torch.nn.MaxPool2d.
+    """2D 맥스풀링. stride 생략 시 kernel_size로 대체 (torch.nn.MaxPool2d 기본 동작과 동일).
 
-    ``padding`` must be at most ``kernel_size // 2``, matching the
-    constraint torch.nn.MaxPool2d itself enforces (its own check happens
-    at forward() time, not construction, so this catches it earlier).
+    padding은 kernel_size // 2 이하만 허용 (torch.nn.MaxPool2d 제약과 동일,
+    생성 시점에 미리 검증).
     """
 
     kernel_size: int
@@ -122,7 +111,7 @@ class MaxPool2dSpec(LayerSpec):
 
 @dataclass
 class AdaptiveAvgPool2dSpec(LayerSpec):
-    """Adaptive average pooling to a square (output_size, output_size) map."""
+    """Adaptive average pooling. 정사각형 (output_size, output_size)만 지원."""
 
     output_size: int = 1
 
@@ -137,7 +126,7 @@ class FlattenSpec(LayerSpec):
 
 @dataclass
 class LinearSpec(LayerSpec):
-    """Fully-connected layer. ``in_features`` is inferred from the previous layer's shape."""
+    """FC 레이어. in_features는 이전 레이어 shape에서 자동 계산."""
 
     out_features: int
     bias: bool = True
@@ -157,12 +146,10 @@ class DropoutSpec(LayerSpec):
 
 @dataclass
 class ModelSpec:
-    """A full model definition: a name, an input shape, and a flat layer list.
+    """모델 정의 = 이름 + input_shape + 레이어 리스트.
 
-    ``input_shape`` excludes the batch dimension and is always
-    ``(channels, height, width)`` in Phase 1 -- image classification
-    input only. Other input kinds (e.g. 1D sequences) can be added later
-    without changing this field's meaning for existing models.
+    input_shape: batch 제외, (channels, height, width) 고정.
+    Phase 1: 이미지 classification 입력만 지원.
     """
 
     name: str

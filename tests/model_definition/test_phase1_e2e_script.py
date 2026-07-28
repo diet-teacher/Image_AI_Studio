@@ -1,13 +1,7 @@
-"""scripts/run_phase1_e2e.py's CLI + JSON-loading layer, exercised without
-needing a built run_torchscript binary.
+"""scripts/run_phase1_e2e.py의 CLI + JSON 로딩 부분 테스트 (run_torchscript 빌드 불필요).
 
-These tests import the script itself (not a package under src/) the same
-way scripts/run_phase1_e2e.py imports image_ai_studio: by inserting the
-containing directory onto sys.path. They only touch parse_args() and
-load_and_validate() -- both pure Python/model_definition, no torch.nn.Module
-construction, no TorchScript export, no C++ subprocess -- so they run
-alongside the rest of the Phase 1 unit tests without a compiled C++
-runner.
+parse_args()/load_and_validate()만 대상 -- 순수 Python/model_definition
+로직이라 torch.nn.Module 생성, TorchScript export, C++ 서브프로세스 없음.
 """
 from __future__ import annotations
 
@@ -21,7 +15,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from image_ai_studio.model_definition.errors import ModelValidationError
 
-import run_phase1_e2e as e2e  # noqa: E402 -- import after sys.path setup above
+import run_phase1_e2e as e2e  # noqa: E402 -- sys.path 세팅 후 임포트 필요
 
 
 def test_default_model_json_argument_matches_examples_model() -> None:
@@ -44,9 +38,7 @@ def test_load_and_validate_default_model_json_is_valid() -> None:
 
 
 def test_load_and_validate_accepts_a_different_model_json() -> None:
-    """The JSON is the single source of truth per model -- a different
-    --model-json needs no matching hand-written Python ModelSpec to
-    validate against, so an arbitrary second example model must also work."""
+    """JSON이 모델별 유일한 원본 -- 다른 --model-json도 동작해야 함."""
     alt_path = REPO_ROOT / "examples" / "models" / "phase1_e2e_alt_model.json"
     model_spec, shape_trace = e2e.load_and_validate(alt_path)
     assert model_spec.name == "phase1_e2e_alt_model"

@@ -1,4 +1,4 @@
-"""ModelSpec -> torch.nn.Module: module types, auto-inferred sizes, and a real forward pass."""
+"""ModelSpec -> torch.nn.Module 빌드 테스트: 모듈 타입, 자동 추론 크기, forward 검증."""
 from __future__ import annotations
 
 import pytest
@@ -103,9 +103,7 @@ def test_forward_pass_matches_shape_inference_output() -> None:
 
 
 def test_flatten_preserves_batch_dimension_matching_shape_inference() -> None:
-    """shape_inference computes (C, H, W) -> (C*H*W,), batch dim excluded.
-    nn.Flatten() must apply that same collapse per-sample while keeping
-    the batch dimension: [N, C, H, W] -> [N, C*H*W]."""
+    """nn.Flatten()도 shape_inference와 동일하게 batch 차원 유지: [N,C,H,W] -> [N,C*H*W]."""
     spec = ModelSpec(name="m", input_shape=(3, 4, 4), layers=[FlattenSpec()])
     expected_flat_shape = infer_model_shapes(spec)[0].output_shape
     assert expected_flat_shape == (3 * 4 * 4,)
