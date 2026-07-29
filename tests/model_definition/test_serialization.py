@@ -147,6 +147,11 @@ def test_missing_top_level_field_raises_model_validation_error() -> None:
         model_spec_from_dict({"name": "m", "layers": []})
 
 
+def test_empty_layers_list_in_json_raises_model_validation_error() -> None:
+    with pytest.raises(ModelValidationError, match="at least one layer"):
+        model_spec_from_dict({"name": "m", "input_shape": [3, 8, 8], "layers": []})
+
+
 def test_load_model_spec_rejects_invalid_json(tmp_path: Path) -> None:
     path = tmp_path / "broken.json"
     path.write_text("{not valid json", encoding="utf-8")

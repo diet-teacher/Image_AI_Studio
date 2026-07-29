@@ -150,6 +150,7 @@ class ModelSpec:
 
     input_shape: batch 제외, (channels, height, width) 고정.
     Phase 1: 이미지 classification 입력만 지원.
+    layers: 최소 1개 이상 필요 (빈 모델 금지).
     """
 
     name: str
@@ -178,6 +179,8 @@ class ModelSpec:
                 f"ModelSpec.layers must be a list or tuple of LayerSpec, got {type(self.layers).__name__}"
             )
         self.layers = list(self.layers)
+        if not self.layers:
+            raise ModelValidationError("ModelSpec.layers must contain at least one layer")
         for index, layer in enumerate(self.layers):
             if not isinstance(layer, LayerSpec):
                 raise ModelValidationError(

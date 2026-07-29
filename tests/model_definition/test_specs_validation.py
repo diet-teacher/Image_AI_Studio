@@ -103,8 +103,18 @@ def test_model_spec_rejects_invalid_input_shape(input_shape: tuple) -> None:
 
 
 def test_model_spec_converts_list_input_shape_to_tuple() -> None:
-    spec = ModelSpec(name="m", input_shape=[3, 224, 224], layers=[])  # type: ignore[arg-type]
+    spec = ModelSpec(name="m", input_shape=[3, 224, 224], layers=[FlattenSpec()])  # type: ignore[arg-type]
     assert spec.input_shape == (3, 224, 224)
+
+
+def test_model_spec_rejects_empty_layers() -> None:
+    with pytest.raises(ModelValidationError, match="at least one layer"):
+        ModelSpec(name="m", input_shape=(3, 224, 224), layers=[])
+
+
+def test_model_spec_rejects_empty_layers_tuple() -> None:
+    with pytest.raises(ModelValidationError, match="at least one layer"):
+        ModelSpec(name="m", input_shape=(3, 224, 224), layers=())
 
 
 # -- MaxPool2d padding 제약 ---------------------------------------------------

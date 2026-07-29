@@ -31,6 +31,34 @@ C++ Inference (Phase 0 인프라 재사용)
 이번 범위에는 PySide6 UI, 학습 루프, IPC, Detection/Segmentation이
 포함되지 않는다.
 
+## 1-1. 완료 범위 / 미지원 범위
+
+완료 (아래 섹션에서 각각 상세 설명):
+
+* Sequential 기반 `ModelSpec` (`specs.py`)
+* `LayerSpec` 8종: `Conv2d`, `BatchNorm2d`, `ReLU`, `MaxPool2d`,
+  `AdaptiveAvgPool2d`, `Flatten`, `Linear`, `Dropout`
+* JSON serialization/deserialization (`serialization.py`)
+* parameter validation (각 `LayerSpec`/`ModelSpec`의 `__post_init__`)
+* shape inference / layer connection validation (`shape_inference.py`,
+  `validation.py`)
+* PyTorch `nn.Sequential` build (`builder.py`)
+* TorchScript export (Phase 0 `TorchScriptExporter` 재사용)
+* 기존 C++ TorchScript runner(`run_torchscript.exe`) 연동
+  (`scripts/run_phase1_e2e.py`)
+* Python/C++ parity E2E 검증 (`run_phase1_e2e.py`, Phase 0
+  `parity.compare_outputs` 재사용)
+
+미지원 (Phase 2 이후 검토):
+
+* Branch / Merge
+* Residual connection (`ResidualBlockSpec` 등 composite layer 없음,
+  11번 섹션에서 설계만 다룸)
+* DAG (임의의 분기/합류 구조)
+* Detection / Segmentation
+* Training (학습 루프)
+* UI (PySide6)
+
 ## 2. 디렉터리 구조
 
 ```text
@@ -88,7 +116,13 @@ class ModelSpec:
 `['c','o','n','v']`로 조용히 쪼개질 수 있다), 각 원소가 실제
 `LayerSpec` 인스턴스인지도 검사한다 -- 그래야 `["conv"]`처럼 잘못된
 원소가 `shape_inference` 단계까지 흘러가지 않고 `ModelSpec` 생성
-시점에 바로 걸린다.
+시점에 바로 걸린다. `layers`가 빈 리스트/튜플이면
+`ModelValidationError`를 던진다 -- 레이어가 하나도 없는 모델은
+`build_model()`/`shape_inference` 입장에서 "정의된 모델"이 아니라
+빈 자리표시자에 가깝고, 이를 허용하면 `shape_trace[-1]` 같은 최종
+shape 조회(예: `run_phase1_e2e.py`의 요약 출력)가 소비자 쪽마다
+빈 리스트를 방어하는 코드를 반복해야 한다. `ModelSpec`이 생성되는
+순간부터 항상 유효한 모델이라는 불변조건을 보장하는 쪽을 택했다.
 
 ## 4. 지원 Layer
 
@@ -294,6 +328,7 @@ Model JSON (examples/models/phase1_e2e_model.json)
   파라미터만 추가했다 (미지정 시 기존 Phase 0 동작과 100% 동일) --
   Phase 1 E2E 모델의 입력 shape `(3, 16, 16)`이 Phase 0 공유 입력의
   `(3, 224, 224)`와 다르기 때문에 필요한 최소한의 변경이다.
+
 **JSON이 각 예시 모델의 단일 소스(single source of truth)다.** 처음에는
 `examples/models/phase1_e2e_model.json`과 짝을 이루는 `_reference_model_spec()`
 Python 함수를 두고 둘이 같은지(`==`) 매번 검사했으나, 이 방식은 예시
@@ -356,32 +391,17 @@ TorchScript export -> `run_torchscript.exe` -> parity)을 그대로 재사용해
 `LayerSpec`은 필드가 없는 마커 베이스 클래스이고, `specs.py` /
 `shape_inference.py` / `builder.py` 모두 "레이어 타입 -> 처리 함수"
 딕셔너리 조회(`_SHAPE_HANDLERS`, `_BUILDERS`, `_LAYER_REGISTRY`)로
-동작한다. 따라서 향후 다음과 같은 composite spec을 추가할 때, 기존
-레이어 처리 코드를 변경할 필요가 없다:
-
-```python
-@dataclass
-class ResidualBlockSpec(LayerSpec):
-    out_channels: int
-    stride: int = 1
-    # 내부적으로 Conv-BN-ReLU-Conv-BN + shortcut을 표현
-```
-
-필요한 작업은 세 딕셔너리에 `ResidualBlockSpec`에 대한 항목을
-추가하는 것뿐이다:
-
-1. `shape_inference._SHAPE_HANDLERS[ResidualBlockSpec]` -- 내부
-   sub-layer들의 shape을 순서대로 계산해 최종 output shape과
-   (필요하다면) 내부 in_channels를 반환.
-2. `builder._BUILDERS[ResidualBlockSpec]` -- `models/residual_block.py`의
-   `ResidualBlock`처럼 내부 sub-module들을 조립한 `nn.Module`(또는
-   전용 `nn.Module` 서브클래스)을 반환.
-3. `serialization._LAYER_REGISTRY["residual_block"]` -- JSON
-   `"type"` 매핑 추가.
+동작한다. 따라서 향후 `ResidualBlockSpec` 같은 composite layer를
+추가할 때 기존 레이어 처리 코드를 변경할 필요가 없다 -- 세 딕셔너리에
+항목만 추가하면 된다. 상세 설계(데이터 구조, shape inference 공식,
+builder 재사용 방식, 테스트 계획, 예상 변경 파일)는
+`docs/phase2_residual_block_design.md`에 정리했다 (설계 검토만
+완료, 아직 미구현).
 
 `ModelSpec.layers`가 완전한 DAG(임의의 분기/합류)를 지원해야 하는
 시점이 오면, `ModelSpec`은 그대로 두고 `layers: list[LayerSpec]`
 옆에 `graph: GraphSpec | None` 같은 대안 표현을 추가하는 방향을
 권장한다 -- 기존 Sequential 기반 모델과 테스트를 깨지 않기 위해서다.
-이번 Phase 1 구현에서는 `ResidualBlockSpec` 자체를 만들지 않았고,
-기존 `TinyResidualCNN`은 Phase 0 테스트용 모델로 그대로 유지된다.
+`ResidualBlockSpec` 하나만 필요한 현재로서는 이런 일반 DAG 계층을
+미리 만들지 않는다. 기존 `TinyResidualCNN`은 Phase 0 테스트용 모델로
+그대로 유지된다.
