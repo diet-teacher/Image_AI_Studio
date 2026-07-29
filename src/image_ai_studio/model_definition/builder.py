@@ -97,11 +97,12 @@ _BUILDERS: Dict[Type[LayerSpec], _BuilderFn] = {
 }
 
 
-def _build_plain_layer(layer: LayerSpec, inferred: dict[str, int]) -> nn.Module:
+def _build_plain_layer(layer: LayerSpec, inferred: dict[str, int], *, index: int | None = None) -> nn.Module:
     builder_fn = _BUILDERS.get(type(layer))
     if builder_fn is None:
+        prefix = f"Layer {index}: " if index is not None else ""
         raise ModelValidationError(
-            f"no PyTorch builder is registered for layer type {type(layer).__name__!r}"
+            f"{prefix}no PyTorch builder is registered for layer type {type(layer).__name__!r}"
         )
     return builder_fn(layer, inferred)
 
@@ -126,7 +127,7 @@ def _build_branch(layer: BranchSpec, input_shape) -> nn.Module:
 def _build_layer(info: LayerShapeInfo) -> nn.Module:
     if isinstance(info.layer, BranchSpec):
         return _build_branch(info.layer, info.input_shape)
-    return _build_plain_layer(info.layer, info.inferred)
+    return _build_plain_layer(info.layer, info.inferred, index=info.index)
 
 
 def build_model(model_spec: ModelSpec) -> nn.Sequential:

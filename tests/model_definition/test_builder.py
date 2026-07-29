@@ -5,9 +5,9 @@ import pytest
 import torch
 from torch import nn
 
-from image_ai_studio.model_definition.builder import build_model
+from image_ai_studio.model_definition.builder import _build_layer, build_model
 from image_ai_studio.model_definition.errors import ModelValidationError
-from image_ai_studio.model_definition.shape_inference import infer_model_shapes
+from image_ai_studio.model_definition.shape_inference import LayerShapeInfo, infer_model_shapes
 from image_ai_studio.model_definition.specs import (
     AdaptiveAvgPool2dSpec,
     BatchNorm2dSpec,
@@ -16,6 +16,7 @@ from image_ai_studio.model_definition.specs import (
     DropoutSpec,
     FlattenSpec,
     IdentitySpec,
+    LayerSpec,
     LinearSpec,
     MaxPool2dSpec,
     ModelSpec,
@@ -128,6 +129,18 @@ def test_build_model_raises_model_validation_error_for_invalid_connection() -> N
     )
     with pytest.raises(ModelValidationError, match="Conv2d"):
         build_model(spec)
+
+
+def test_build_layer_keeps_top_level_layer_index_in_no_builder_error() -> None:
+    """_build_plain_layer 리팩터링 후에도 top-level _build_layer 경로는
+    기존처럼 에러 메시지에 레이어 인덱스를 유지해야 한다."""
+
+    class _UnregisteredSpec(LayerSpec):
+        pass
+
+    info = LayerShapeInfo(index=3, layer=_UnregisteredSpec(), input_shape=(1,), output_shape=(1,))
+    with pytest.raises(ModelValidationError, match=r"^Layer 3: no PyTorch builder"):
+        _build_layer(info)
 
 
 # -- ResidualBlockSpec --------------------------------------------------------
