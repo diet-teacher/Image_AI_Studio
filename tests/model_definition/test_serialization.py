@@ -21,6 +21,7 @@ from image_ai_studio.model_definition.specs import (
     LinearSpec,
     ModelSpec,
     ReLUSpec,
+    ResidualBlockSpec,
 )
 
 
@@ -157,3 +158,43 @@ def test_load_model_spec_rejects_invalid_json(tmp_path: Path) -> None:
     path.write_text("{not valid json", encoding="utf-8")
     with pytest.raises(ModelValidationError, match="not valid JSON"):
         load_model_spec(path)
+
+
+# -- ResidualBlockSpec --------------------------------------------------------
+
+
+def test_residual_block_model_round_trips_through_json() -> None:
+    original = ModelSpec(
+        name="residual_example",
+        input_shape=(3, 16, 16),
+        layers=[
+            Conv2dSpec(out_channels=8, kernel_size=3, stride=1, padding=1),
+            ResidualBlockSpec(out_channels=16, stride=2),
+        ],
+    )
+    restored = model_spec_from_dict(model_spec_to_dict(original))
+    assert restored == original
+
+
+def test_residual_block_json_type_loads_directly() -> None:
+    spec = model_spec_from_dict(
+        {
+            "name": "m",
+            "input_shape": [3, 8, 8],
+            "layers": [{"type": "residual_block", "out_channels": 16, "stride": 2}],
+        }
+    )
+    assert isinstance(spec.layers[0], ResidualBlockSpec)
+    assert spec.layers[0].out_channels == 16
+    assert spec.layers[0].stride == 2
+
+
+def test_residual_block_json_default_stride_restores_to_one() -> None:
+    spec = model_spec_from_dict(
+        {
+            "name": "m",
+            "input_shape": [3, 8, 8],
+            "layers": [{"type": "residual_block", "out_channels": 16}],
+        }
+    )
+    assert spec.layers[0].stride == 1

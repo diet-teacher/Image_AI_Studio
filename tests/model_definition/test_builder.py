@@ -18,7 +18,9 @@ from image_ai_studio.model_definition.specs import (
     MaxPool2dSpec,
     ModelSpec,
     ReLUSpec,
+    ResidualBlockSpec,
 )
+from image_ai_studio.models.residual_block import ResidualBlock
 
 
 def _example_model_spec() -> ModelSpec:
@@ -123,3 +125,63 @@ def test_build_model_raises_model_validation_error_for_invalid_connection() -> N
     )
     with pytest.raises(ModelValidationError, match="Conv2d"):
         build_model(spec)
+
+
+# -- ResidualBlockSpec --------------------------------------------------------
+
+
+def test_residual_block_builds_as_existing_residual_block_class() -> None:
+    spec = ModelSpec(name="m", input_shape=(3, 8, 8), layers=[ResidualBlockSpec(out_channels=8)])
+    model = build_model(spec)
+    assert isinstance(model[0], ResidualBlock)
+
+
+def test_residual_block_identity_shortcut_when_channels_and_stride_match() -> None:
+    """in_channels == out_channels, stride == 1이면 shortcut이 nn.Identity()인지 확인."""
+    spec = ModelSpec(name="m", input_shape=(8, 8, 8), layers=[ResidualBlockSpec(out_channels=8, stride=1)])
+    block = build_model(spec)[0]
+    assert isinstance(block.shortcut, nn.Identity)
+
+    block = block.eval()
+    with torch.inference_mode():
+        output = block(torch.randn(2, 8, 8, 8))
+    assert tuple(output.shape) == (2, 8, 8, 8)
+
+
+@pytest.mark.parametrize(
+    "in_channels,out_channels,stride",
+    [(8, 16, 1), (8, 8, 2), (8, 16, 2)],
+)
+def test_residual_block_projection_shortcut_when_channels_or_stride_differ(
+    in_channels: int, out_channels: int, stride: int
+) -> None:
+    """in_channels != out_channels 또는 stride != 1이면 shortcut이 Conv+BN projection인지 확인."""
+    spec = ModelSpec(
+        name="m",
+        input_shape=(in_channels, 8, 8),
+        layers=[ResidualBlockSpec(out_channels=out_channels, stride=stride)],
+    )
+    block = build_model(spec)[0]
+    assert isinstance(block.shortcut, nn.Sequential)
+
+    block = block.eval()
+    with torch.inference_mode():
+        output = block(torch.randn(2, in_channels, 8, 8))
+    assert output.shape[1] == out_channels
+
+
+def test_residual_block_forward_shape_matches_shape_inference() -> None:
+    spec = ModelSpec(
+        name="m",
+        input_shape=(3, 15, 15),
+        layers=[
+            Conv2dSpec(out_channels=8, kernel_size=3, stride=1, padding=1),
+            ResidualBlockSpec(out_channels=16, stride=2),
+        ],
+    )
+    expected_shape = infer_model_shapes(spec)[-1].output_shape
+
+    model = build_model(spec).eval()
+    with torch.inference_mode():
+        output = model(torch.randn(1, *spec.input_shape))
+    assert tuple(output.shape[1:]) == expected_shape

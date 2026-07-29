@@ -24,6 +24,7 @@ from image_ai_studio.model_definition.specs import (
     MaxPool2dSpec,
     ModelSpec,
     ReLUSpec,
+    ResidualBlockSpec,
 )
 
 _LAYER_REGISTRY: dict[str, type[LayerSpec]] = {
@@ -35,6 +36,7 @@ _LAYER_REGISTRY: dict[str, type[LayerSpec]] = {
     "flatten": FlattenSpec,
     "linear": LinearSpec,
     "dropout": DropoutSpec,
+    "residual_block": ResidualBlockSpec,
 }
 _TYPE_NAMES: dict[type[LayerSpec], str] = {cls: name for name, cls in _LAYER_REGISTRY.items()}
 

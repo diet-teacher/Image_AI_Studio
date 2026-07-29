@@ -36,8 +36,10 @@ C++ Inference (Phase 0 인프라 재사용)
 완료 (아래 섹션에서 각각 상세 설명):
 
 * Sequential 기반 `ModelSpec` (`specs.py`)
-* `LayerSpec` 8종: `Conv2d`, `BatchNorm2d`, `ReLU`, `MaxPool2d`,
-  `AdaptiveAvgPool2d`, `Flatten`, `Linear`, `Dropout`
+* `LayerSpec` 9종: `Conv2d`, `BatchNorm2d`, `ReLU`, `MaxPool2d`,
+  `AdaptiveAvgPool2d`, `Flatten`, `Linear`, `Dropout`,
+  `ResidualBlock`(Phase 2에서 추가, `docs/phase2_residual_block_design.md`
+  참고 -- 고정된 skip connection 하나뿐이며 일반 Branch/Merge는 아님)
 * JSON serialization/deserialization (`serialization.py`)
 * parameter validation (각 `LayerSpec`/`ModelSpec`의 `__post_init__`)
 * shape inference / layer connection validation (`shape_inference.py`,
@@ -49,12 +51,10 @@ C++ Inference (Phase 0 인프라 재사용)
 * Python/C++ parity E2E 검증 (`run_phase1_e2e.py`, Phase 0
   `parity.compare_outputs` 재사용)
 
-미지원 (Phase 2 이후 검토):
+현재 미지원:
 
-* Branch / Merge
-* Residual connection (`ResidualBlockSpec` 등 composite layer 없음,
-  11번 섹션에서 설계만 다룸)
-* DAG (임의의 분기/합류 구조)
+* 일반 Branch / Merge (임의 분기/합류)
+* DAG (`GraphSpec`/`NodeSpec`/`EdgeSpec` 등 임의의 그래프 구조)
 * Detection / Segmentation
 * Training (학습 루프)
 * UI (PySide6)
@@ -136,6 +136,7 @@ shape 조회(예: `run_phase1_e2e.py`의 요약 출력)가 소비자 쪽마다
 | `flatten` | `FlattenSpec` | |
 | `linear` | `LinearSpec` | `in_features`는 이전 레이어에서 자동 추론 |
 | `dropout` | `DropoutSpec` | |
+| `residual_block` | `ResidualBlockSpec` | Phase 2에서 추가. `in_channels`는 이전 레이어에서 자동 추론. 기존 `ResidualBlock`을 사용하는 고정 composite layer이며 일반 DAG는 미지원 |
 
 각 dataclass는 자기 파라미터만 검증한다 (예: `Conv2dSpec.__post_init__`이
 `kernel_size > 0`을 확인). 이 검증은 JSON에서 역직렬화될 때도 그대로
@@ -371,8 +372,10 @@ TorchScript export -> `run_torchscript.exe` -> parity)을 그대로 재사용해
 
 ## 10. 현재 제한 사항
 
-* `ModelSpec.layers`는 평평한 리스트만 지원한다. 분기/합류가 있는
-  DAG(예: ResidualBlock)는 아직 표현할 수 없다.
+* `ModelSpec.layers`는 평평한 리스트만 지원한다. `ResidualBlockSpec`
+  (고정된 skip connection 하나, Phase 2에서 추가)처럼 "레이어 하나로
+  보이는 고정된 composite"는 표현할 수 있지만, 사용자가 임의로 분기/합류
+  구조를 정의하는 일반 DAG는 여전히 지원하지 않는다.
 * `input_shape`은 3차원 `(C, H, W)` 이미지 입력만 지원한다.
 * `AdaptiveAvgPool2d`는 정사각형 `(output_size, output_size)`만
   지원한다 (직사각형 `(h, w)` 출력 미지원).
@@ -386,22 +389,21 @@ TorchScript export -> `run_torchscript.exe` -> parity)을 그대로 재사용해
 * AOTInductor 경로는 Phase 1 신규 코드에서 의도적으로 제외했다
   (1번 섹션 참고). 필요해지면 별도로 재평가한다.
 
-## 11. 향후 ResidualBlock / DAG 확장 방향
+## 11. ResidualBlock(구현됨) / 향후 DAG 확장 방향
 
 `LayerSpec`은 필드가 없는 마커 베이스 클래스이고, `specs.py` /
 `shape_inference.py` / `builder.py` 모두 "레이어 타입 -> 처리 함수"
 딕셔너리 조회(`_SHAPE_HANDLERS`, `_BUILDERS`, `_LAYER_REGISTRY`)로
-동작한다. 따라서 향후 `ResidualBlockSpec` 같은 composite layer를
-추가할 때 기존 레이어 처리 코드를 변경할 필요가 없다 -- 세 딕셔너리에
-항목만 추가하면 된다. 상세 설계(데이터 구조, shape inference 공식,
-builder 재사용 방식, 테스트 계획, 예상 변경 파일)는
-`docs/phase2_residual_block_design.md`에 정리했다 (설계 검토만
-완료, 아직 미구현).
+동작한다. 이 설계 덕분에 Phase 2에서 `ResidualBlockSpec`을 추가할 때
+기존 레이어 처리 코드는 전혀 바꾸지 않고 세 딕셔너리에 항목만
+추가하면 됐다. 상세 설계와 실제 구현/검증 결과(shape inference 공식,
+builder 재사용 방식, 테스트 결과, C++ E2E parity)는
+`docs/phase2_residual_block_design.md`에 정리했다.
 
 `ModelSpec.layers`가 완전한 DAG(임의의 분기/합류)를 지원해야 하는
 시점이 오면, `ModelSpec`은 그대로 두고 `layers: list[LayerSpec]`
 옆에 `graph: GraphSpec | None` 같은 대안 표현을 추가하는 방향을
 권장한다 -- 기존 Sequential 기반 모델과 테스트를 깨지 않기 위해서다.
-`ResidualBlockSpec` 하나만 필요한 현재로서는 이런 일반 DAG 계층을
-미리 만들지 않는다. 기존 `TinyResidualCNN`은 Phase 0 테스트용 모델로
-그대로 유지된다.
+고정된 composite layer(`ResidualBlockSpec`)만으로 충분한 현재로서는
+이런 일반 DAG 계층을 미리 만들지 않는다. 기존 `TinyResidualCNN`은
+Phase 0 테스트용 모델로 그대로 유지된다.

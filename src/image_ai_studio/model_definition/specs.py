@@ -145,6 +145,22 @@ class DropoutSpec(LayerSpec):
 
 
 @dataclass
+class ResidualBlockSpec(LayerSpec):
+    """Conv-BN-ReLU-Conv-BN + shortcut (models.residual_block.ResidualBlock 재사용).
+
+    in_channels는 이전 레이어 출력에서 자동 계산. 내부 kernel_size/padding은
+    ResidualBlock과 동일하게 고정 (설계 근거: docs/phase2_residual_block_design.md).
+    """
+
+    out_channels: int
+    stride: int = 1
+
+    def __post_init__(self) -> None:
+        _require_positive_int("out_channels", self.out_channels)
+        _require_positive_int("stride", self.stride)
+
+
+@dataclass
 class ModelSpec:
     """모델 정의 = 이름 + input_shape + 레이어 리스트.
 

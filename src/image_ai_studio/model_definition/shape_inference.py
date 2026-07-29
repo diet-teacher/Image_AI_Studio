@@ -22,6 +22,7 @@ from image_ai_studio.model_definition.specs import (
     MaxPool2dSpec,
     ModelSpec,
     ReLUSpec,
+    ResidualBlockSpec,
 )
 
 Shape = tuple[int, ...]
@@ -124,6 +125,24 @@ def _linear_shape(layer: LinearSpec, input_shape: Shape, index: int) -> tuple[Sh
     return (layer.out_features,), {"in_features": input_shape[0]}
 
 
+def _residual_block_shape(
+    layer: ResidualBlockSpec, input_shape: Shape, index: int
+) -> tuple[Shape, dict[str, int]]:
+    """ResidualBlock 전체 shape을 Conv2d와 동일한 공식 한 번으로 계산
+    (shape 공식 근거는 docs/phase2_residual_block_design.md 4번 섹션 참고)."""
+    _require_rank(layer, input_shape, index, rank=3, expected_desc="(channels, height, width)")
+    in_channels, h_in, w_in = input_shape
+    h_out = _spatial_output_size(
+        h_in, kernel_size=3, stride=layer.stride, padding=1,
+        index=index, layer_name="ResidualBlock", dim_name="height",
+    )
+    w_out = _spatial_output_size(
+        w_in, kernel_size=3, stride=layer.stride, padding=1,
+        index=index, layer_name="ResidualBlock", dim_name="width",
+    )
+    return (layer.out_channels, h_out, w_out), {"in_channels": in_channels}
+
+
 _ShapeHandler = Callable[[LayerSpec, Shape, int], "tuple[Shape, dict[str, int]]"]
 
 _SHAPE_HANDLERS: dict[type, _ShapeHandler] = {
@@ -135,6 +154,7 @@ _SHAPE_HANDLERS: dict[type, _ShapeHandler] = {
     FlattenSpec: _flatten_shape,
     LinearSpec: _linear_shape,
     DropoutSpec: _identity_shape,
+    ResidualBlockSpec: _residual_block_shape,
 }
 
 

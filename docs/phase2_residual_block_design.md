@@ -1,7 +1,9 @@
-# Phase 2 설계 검토: ResidualBlockSpec (composite layer)
+# Phase 2: ResidualBlockSpec (composite layer)
 
-이 문서는 설계 검토 결과만 정리한다. **이번 작업에서 아래 내용은
-구현하지 않았다** -- Phase 1 코드는 변경 없음.
+이 문서는 원래 설계 검토 문서였으나, 아래 설계 그대로 실제
+구현되었다 (구현 결과는 11번 섹션 참고). 코드의 "(추가안, 미구현)"
+표시가 붙은 스니펫들은 실제 구현과 1:1로 일치하며, 별도 리팩터링
+없이 그대로 반영되었다.
 
 ## 1. 범위
 
@@ -54,7 +56,7 @@ bias(False) 등은 `ResidualBlock`과 동일하게 고정하고 확장하지 않
 (필요해지면 별도로 재검토).
 
 ```python
-# specs.py (추가안, 미구현)
+# specs.py (실제 구현)
 @dataclass
 class ResidualBlockSpec(LayerSpec):
     """Conv-BN-ReLU-Conv-BN + shortcut -> Add -> ReLU.
@@ -81,7 +83,7 @@ shortcut(`stride`, kernel=1)은 모두 동일한 출력 크기 공식
 호출하면 된다 -- 새 산술 로직이 필요 없다.
 
 ```python
-# shape_inference.py (추가안, 미구현)
+# shape_inference.py (실제 구현)
 def _residual_block_shape(
     layer: ResidualBlockSpec, input_shape: Shape, index: int
 ) -> tuple[Shape, dict[str, int]]:
@@ -124,7 +126,7 @@ _SHAPE_HANDLERS[ResidualBlockSpec] = _residual_block_shape
 새 `nn.Module`을 만들지 않고 기존 `ResidualBlock`을 그대로 인스턴스화한다.
 
 ```python
-# builder.py (추가안, 미구현)
+# builder.py (실제 구현)
 from image_ai_studio.models.residual_block import ResidualBlock
 
 def _build_residual_block(layer: ResidualBlockSpec, inferred: dict[str, int]) -> nn.Module:
@@ -153,7 +155,7 @@ _BUILDERS[ResidualBlockSpec] = _build_residual_block
 어느 것도 수정할 필요가 없다.
 
 ```python
-# serialization.py (추가안, 미구현)
+# serialization.py (실제 구현)
 _LAYER_REGISTRY: dict[str, type[LayerSpec]] = {
     ...,
     "residual_block": ResidualBlockSpec,
@@ -200,7 +202,7 @@ JSON 예시:
   * `ResidualBlockSpec`을 포함한 모델을 `build_model` -> `torch.jit.trace` ->
     reload -> parity까지 확인 (기존 테스트와 동일한 패턴, 모델 스펙만 교체)
 
-## 9. 예상 변경 파일 (구현 시)
+## 9. 실제 변경 파일
 
 | 파일 | 변경 내용 |
 |---|---|
@@ -209,18 +211,20 @@ JSON 예시:
 | `src/image_ai_studio/model_definition/builder.py` | `_build_residual_block` 추가 (`models.residual_block.ResidualBlock` import), `_BUILDERS`에 등록 |
 | `src/image_ai_studio/model_definition/serialization.py` | `_LAYER_REGISTRY`에 `"residual_block"` 등록 |
 | `tests/model_definition/test_specs_validation.py` | 파라미터 검증 테스트 추가 |
-| `tests/model_definition/test_shape_inference.py` | shape/연결 검증 테스트 추가 |
+| `tests/model_definition/test_shape_inference.py` | shape/연결 검증 테스트 + 홀수 spatial size 실제 `ResidualBlock` 비교 테스트 추가 |
 | `tests/model_definition/test_serialization.py` | round-trip 테스트 추가 |
-| `tests/model_definition/test_builder.py` | 빌드/forward 테스트 추가 |
+| `tests/model_definition/test_builder.py` | 빌드/forward, identity/projection shortcut 테스트 추가 |
 | `tests/model_definition/test_torchscript_integration.py` | ResidualBlock 포함 모델 export 테스트 추가 |
+| `examples/models/phase2_residual_model.json` | Conv2d -> ResidualBlock -> ResidualBlock(stride=2) -> AdaptiveAvgPool2d -> Flatten -> Linear 예시 모델 (신규) |
 | `docs/phase1_design.md` | 4번(지원 Layer) 표에 `residual_block` 추가, 11번 섹션을 "구현됨"으로 갱신 |
 
-**변경 불필요**: `errors.py`, `validation.py`,
+**변경 없음 (설계대로)**: `errors.py`, `validation.py`,
 `export/torchscript_exporter.py`, `models/residual_block.py`(그대로
 재사용), C++ 코드 전부, `run_phase1_e2e.py`(JSON 기반이라 레이어
-타입에 무관).
+타입에 무관 -- `--model-json examples/models/phase2_residual_model.json`으로
+그대로 재사용됨).
 
-## 10. 이번 Phase 2 검토에서 의도적으로 제외한 것
+## 10. 이번 Phase 2에서 의도적으로 구현하지 않은 것
 
 * **`GraphSpec`/`NodeSpec`/`EdgeSpec`** 등 일반 DAG 표현. 아직 필요한
   모델이 ResidualBlock 하나뿐이므로, 이를 위해 그래프 추상화 계층을
@@ -234,3 +238,31 @@ JSON 예시:
 * **중첩 composite** (ResidualBlock 안에 또 다른 composite). 현재
   설계는 `LayerSpec` 하나가 정확히 하나의 `nn.Module`에 대응하는
   1단계 구조만 가정한다.
+
+## 11. 구현 결과 확인
+
+실제 실행으로 확인한 결과 (Windows 11, PyTorch 2.12.1+cu126, GTX 1080):
+
+* **pytest**: 125 passed, FAIL 0, SKIPPED 0. (`ResidualBlockSpec` 관련
+  테스트 구성은 8번 섹션 "테스트 계획" 참고.)
+* **홀수 spatial size 교차 검증**: `test_residual_block_matches_actual_pytorch_module_on_odd_spatial_size`가
+  `in_channels=4, out_channels=6, stride=2, h=w=7`로 실제
+  `ResidualBlock`을 직접 실행해 shape_inference 예측(`floor((7-1)/2)+1=4`)과
+  실제 forward 출력 shape이 일치함을 확인 (7번 섹션 "검증"의 손계산이
+  실제 PyTorch 연산과도 일치함을 재확인).
+* **identity / projection shortcut**: `test_builder.py`에서
+  `in_channels == out_channels and stride == 1` -> `nn.Identity()`,
+  그 외 세 조합(`(8,16,1)`, `(8,8,2)`, `(8,16,2)`) -> `nn.Sequential`
+  (projection) 경로를 각각 forward까지 실행해 확인.
+* **TorchScript 통합 테스트**: `ResidualBlockSpec`을 포함한 모델(Conv2d
+  -> ResidualBlock x2 -> AdaptiveAvgPool2d -> Flatten -> Linear)을
+  `build_model` -> `torch.jit.trace` -> 저장/재로드 -> parity까지
+  실행, PASS (수정 없이 기존 `TorchScriptExporter` 그대로 사용).
+* **Phase 2 C++ E2E**: `python scripts/run_phase1_e2e.py --model-json
+  examples/models/phase2_residual_model.json` 실행 결과 CPU/CUDA 모두
+  `PASS`, parity `max_abs_error=0.0` (bit-identical). `run_phase1_e2e.py`
+  자체는 한 글자도 수정하지 않았다 -- JSON 기반 설계가 실제로
+  레이어 타입에 무관하게 동작함을 증명한다.
+* **Phase 0 regression**: `python scripts/run_torchscript_tests.py`
+  결과 `tiny_cnn`/`tiny_residual_cnn` CPU/CUDA 4개 전부 PASS, 기존
+  동작에 영향 없음.

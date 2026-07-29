@@ -22,8 +22,10 @@ from image_ai_studio.model_definition.specs import (
     MaxPool2dSpec,
     ModelSpec,
     ReLUSpec,
+    ResidualBlockSpec,
 )
 from image_ai_studio.model_definition.validation import validate_model_spec
+from image_ai_studio.models.residual_block import ResidualBlock
 
 
 def _build_conv2d(layer: Conv2dSpec, inferred: dict[str, int]) -> nn.Module:
@@ -64,6 +66,14 @@ def _build_dropout(layer: DropoutSpec, inferred: dict[str, int]) -> nn.Module:
     return nn.Dropout(p=layer.p)
 
 
+def _build_residual_block(layer: ResidualBlockSpec, inferred: dict[str, int]) -> nn.Module:
+    return ResidualBlock(
+        in_channels=inferred["in_channels"],
+        out_channels=layer.out_channels,
+        stride=layer.stride,
+    )
+
+
 _BuilderFn = Callable[[LayerSpec, Dict[str, int]], nn.Module]
 
 _BUILDERS: Dict[Type[LayerSpec], _BuilderFn] = {
@@ -75,6 +85,7 @@ _BUILDERS: Dict[Type[LayerSpec], _BuilderFn] = {
     FlattenSpec: _build_flatten,
     LinearSpec: _build_linear,
     DropoutSpec: _build_dropout,
+    ResidualBlockSpec: _build_residual_block,
 }
 
 

@@ -12,6 +12,7 @@ from image_ai_studio.model_definition.specs import (
     MaxPool2dSpec,
     ModelSpec,
     ReLUSpec,
+    ResidualBlockSpec,
 )
 
 
@@ -189,3 +190,42 @@ def test_model_spec_rejects_layers_containing_non_layer_spec_elements() -> None:
 def test_model_spec_accepts_tuple_of_layer_specs() -> None:
     spec = ModelSpec(name="m", input_shape=(3, 224, 224), layers=(FlattenSpec(),))
     assert spec.layers == [FlattenSpec()]
+
+
+# -- ResidualBlockSpec --------------------------------------------------------
+
+
+@pytest.mark.parametrize("out_channels", [0, -1])
+def test_residual_block_rejects_non_positive_out_channels(out_channels: int) -> None:
+    with pytest.raises(ModelValidationError, match="out_channels"):
+        ResidualBlockSpec(out_channels=out_channels)
+
+
+@pytest.mark.parametrize("stride", [0, -2])
+def test_residual_block_rejects_non_positive_stride(stride: int) -> None:
+    with pytest.raises(ModelValidationError, match="stride"):
+        ResidualBlockSpec(out_channels=16, stride=stride)
+
+
+@pytest.mark.parametrize("out_channels", [True, False])
+def test_residual_block_rejects_bool_out_channels(out_channels: bool) -> None:
+    """bool도 int로 취급되므로 (isinstance(True, int) == True), 다른 int
+    필드와 동일하게 명시적으로 거부되는지 확인."""
+    with pytest.raises(ModelValidationError, match="out_channels"):
+        ResidualBlockSpec(out_channels=out_channels)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("stride", [True, False])
+def test_residual_block_rejects_bool_stride(stride: bool) -> None:
+    with pytest.raises(ModelValidationError, match="stride"):
+        ResidualBlockSpec(out_channels=16, stride=stride)  # type: ignore[arg-type]
+
+
+def test_residual_block_accepts_valid_params() -> None:
+    spec = ResidualBlockSpec(out_channels=32, stride=2)
+    assert spec.out_channels == 32
+    assert spec.stride == 2
+
+
+def test_residual_block_stride_defaults_to_one() -> None:
+    assert ResidualBlockSpec(out_channels=16).stride == 1

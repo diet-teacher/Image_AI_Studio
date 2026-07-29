@@ -15,6 +15,7 @@ from image_ai_studio.model_definition.specs import (
     MaxPool2dSpec,
     ModelSpec,
     ReLUSpec,
+    ResidualBlockSpec,
 )
 
 
@@ -180,3 +181,59 @@ def test_format_shape_trace_renders_layer_name_and_shapes() -> None:
     trace = infer_model_shapes(spec)
     text = format_shape_trace(trace)
     assert text == "Conv2d\n[3, 224, 224] -> [32, 224, 224]"
+
+
+# -- ResidualBlockSpec --------------------------------------------------------
+
+
+def test_residual_block_stride_1_preserves_spatial_size() -> None:
+    spec = ModelSpec(
+        name="m",
+        input_shape=(16, 32, 32),
+        layers=[ResidualBlockSpec(out_channels=32)],
+    )
+    trace = infer_model_shapes(spec)
+    assert trace[0].output_shape == (32, 32, 32)
+    assert trace[0].inferred == {"in_channels": 16}
+
+
+def test_residual_block_stride_2_halves_spatial_size() -> None:
+    spec = ModelSpec(
+        name="m",
+        input_shape=(16, 32, 32),
+        layers=[ResidualBlockSpec(out_channels=32, stride=2)],
+    )
+    trace = infer_model_shapes(spec)
+    assert trace[0].output_shape == (32, 16, 16)
+
+
+def test_residual_block_after_flatten_raises_clear_validation_error() -> None:
+    spec = ModelSpec(
+        name="m",
+        input_shape=(3, 8, 8),
+        layers=[FlattenSpec(), ResidualBlockSpec(out_channels=8)],
+    )
+    with pytest.raises(ModelValidationError, match=r"Layer 1 \(ResidualBlock\).*3D"):
+        infer_model_shapes(spec)
+
+
+def test_residual_block_matches_actual_pytorch_module_on_odd_spatial_size() -> None:
+    """홀수 spatial size(floor 반올림이 실제로 영향을 주는 경우)에서도
+    shape_inference 예측과 실제 ResidualBlock forward 결과가 일치하는지 확인."""
+    import torch
+
+    from image_ai_studio.models.residual_block import ResidualBlock
+
+    in_channels, out_channels, stride, h, w = 4, 6, 2, 7, 7
+    spec = ModelSpec(
+        name="m",
+        input_shape=(in_channels, h, w),
+        layers=[ResidualBlockSpec(out_channels=out_channels, stride=stride)],
+    )
+    predicted_shape = infer_model_shapes(spec)[0].output_shape
+
+    block = ResidualBlock(in_channels=in_channels, out_channels=out_channels, stride=stride).eval()
+    with torch.inference_mode():
+        actual_output = block(torch.randn(1, in_channels, h, w))
+
+    assert predicted_shape == tuple(actual_output.shape[1:])
