@@ -36,10 +36,12 @@ C++ Inference (Phase 0 인프라 재사용)
 완료 (아래 섹션에서 각각 상세 설명):
 
 * Sequential 기반 `ModelSpec` (`specs.py`)
-* `LayerSpec` 9종: `Conv2d`, `BatchNorm2d`, `ReLU`, `MaxPool2d`,
+* `LayerSpec` 11종: `Conv2d`, `BatchNorm2d`, `ReLU`, `MaxPool2d`,
   `AdaptiveAvgPool2d`, `Flatten`, `Linear`, `Dropout`,
-  `ResidualBlock`(Phase 2에서 추가, `docs/phase2_residual_block_design.md`
-  참고 -- 고정된 skip connection 하나뿐이며 일반 Branch/Merge는 아님)
+  `ResidualBlock`(Phase 2에서 추가 -- 고정된 skip connection 하나뿐인
+  composite, `docs/phase2_residual_block_design.md` 참고),
+  `Branch`/`Identity`(Phase 3에서 추가 -- 사용자가 branch 내부를 직접
+  구성하는 제한된 분기/합류, `docs/phase3_branch_design.md` 참고)
 * JSON serialization/deserialization (`serialization.py`)
 * parameter validation (각 `LayerSpec`/`ModelSpec`의 `__post_init__`)
 * shape inference / layer connection validation (`shape_inference.py`,
@@ -53,8 +55,11 @@ C++ Inference (Phase 0 인프라 재사용)
 
 현재 미지원:
 
-* 일반 Branch / Merge (임의 분기/합류)
-* DAG (`GraphSpec`/`NodeSpec`/`EdgeSpec` 등 임의의 그래프 구조)
+* 일반 DAG (`GraphSpec`/`NodeSpec`/`EdgeSpec` 등 임의의 그래프 구조,
+  즉시 합류하지 않는 skip, 중첩 분기) -- `BranchSpec`은 "입력 하나 ->
+  N개 병렬 branch -> 즉시 merge"라는 제한된 패턴만 지원한다
+  (`docs/phase3_branch_design.md` 참고)
+* multi-input / multi-output 모델 (외부 입력/출력은 항상 1개)
 * Detection / Segmentation
 * Training (학습 루프)
 * UI (PySide6)
@@ -137,6 +142,8 @@ shape 조회(예: `run_phase1_e2e.py`의 요약 출력)가 소비자 쪽마다
 | `linear` | `LinearSpec` | `in_features`는 이전 레이어에서 자동 추론 |
 | `dropout` | `DropoutSpec` | |
 | `residual_block` | `ResidualBlockSpec` | Phase 2에서 추가. `in_channels`는 이전 레이어에서 자동 추론. 기존 `ResidualBlock`을 사용하는 고정 composite layer이며 일반 DAG는 미지원 |
+| `branch` | `BranchSpec` | Phase 3에서 추가. `branches: list[list[LayerSpec]]` + `merge`(`"add"`\|`"concat"`, channel 방향만). 일반 DAG는 미지원 |
+| `identity` | `IdentitySpec` | Phase 3에서 추가. 입력을 그대로 통과 (`BranchSpec`의 skip path 표현용) |
 
 각 dataclass는 자기 파라미터만 검증한다 (예: `Conv2dSpec.__post_init__`이
 `kernel_size > 0`을 확인). 이 검증은 JSON에서 역직렬화될 때도 그대로
@@ -373,9 +380,10 @@ TorchScript export -> `run_torchscript.exe` -> parity)을 그대로 재사용해
 ## 10. 현재 제한 사항
 
 * `ModelSpec.layers`는 평평한 리스트만 지원한다. `ResidualBlockSpec`
-  (고정된 skip connection 하나, Phase 2에서 추가)처럼 "레이어 하나로
-  보이는 고정된 composite"는 표현할 수 있지만, 사용자가 임의로 분기/합류
-  구조를 정의하는 일반 DAG는 여전히 지원하지 않는다.
+  (고정된 skip connection 하나, Phase 2)과 `BranchSpec`(사용자가 정의하는
+  병렬 branch + 즉시 merge, Phase 3)처럼 "레이어 하나로 보이는 composite"는
+  표현할 수 있지만, 즉시 합류하지 않는 skip이나 중첩 분기가 있는 일반 DAG는
+  여전히 지원하지 않는다.
 * `input_shape`은 3차원 `(C, H, W)` 이미지 입력만 지원한다.
 * `AdaptiveAvgPool2d`는 정사각형 `(output_size, output_size)`만
   지원한다 (직사각형 `(h, w)` 출력 미지원).
@@ -389,21 +397,23 @@ TorchScript export -> `run_torchscript.exe` -> parity)을 그대로 재사용해
 * AOTInductor 경로는 Phase 1 신규 코드에서 의도적으로 제외했다
   (1번 섹션 참고). 필요해지면 별도로 재평가한다.
 
-## 11. ResidualBlock(구현됨) / 향후 DAG 확장 방향
+## 11. ResidualBlock/Branch(구현됨) / 향후 DAG 확장 방향
 
 `LayerSpec`은 필드가 없는 마커 베이스 클래스이고, `specs.py` /
 `shape_inference.py` / `builder.py` 모두 "레이어 타입 -> 처리 함수"
 딕셔너리 조회(`_SHAPE_HANDLERS`, `_BUILDERS`, `_LAYER_REGISTRY`)로
-동작한다. 이 설계 덕분에 Phase 2에서 `ResidualBlockSpec`을 추가할 때
-기존 레이어 처리 코드는 전혀 바꾸지 않고 세 딕셔너리에 항목만
-추가하면 됐다. 상세 설계와 실제 구현/검증 결과(shape inference 공식,
-builder 재사용 방식, 테스트 결과, C++ E2E parity)는
-`docs/phase2_residual_block_design.md`에 정리했다.
+동작한다. 이 설계 덕분에 Phase 2의 `ResidualBlockSpec`(고정된 composite)에
+이어 Phase 3의 `BranchSpec`(사용자가 정의하는 병렬 branch + merge)까지도,
+기존 레이어 처리 코드를 바꾸지 않고 딕셔너리 항목 추가로 붙었다 (builder만
+`BranchSpec`이 자기 `input_shape` 문맥을 더 필요로 해서 한 곳에 분기가
+생겼다 -- `docs/phase3_branch_design.md` 6번 섹션 참고). 상세 설계와 실제
+구현/검증 결과는 `docs/phase2_residual_block_design.md`,
+`docs/phase3_branch_design.md`에 각각 정리했다.
 
-`ModelSpec.layers`가 완전한 DAG(임의의 분기/합류)를 지원해야 하는
-시점이 오면, `ModelSpec`은 그대로 두고 `layers: list[LayerSpec]`
-옆에 `graph: GraphSpec | None` 같은 대안 표현을 추가하는 방향을
-권장한다 -- 기존 Sequential 기반 모델과 테스트를 깨지 않기 위해서다.
-고정된 composite layer(`ResidualBlockSpec`)만으로 충분한 현재로서는
-이런 일반 DAG 계층을 미리 만들지 않는다. 기존 `TinyResidualCNN`은
-Phase 0 테스트용 모델로 그대로 유지된다.
+`ModelSpec.layers`가 완전한 DAG(임의의 분기/합류, 즉시 합류하지 않는
+skip)를 지원해야 하는 시점이 오면, `ModelSpec`은 그대로 두고
+`layers: list[LayerSpec]` 옆에 `graph: GraphSpec | None` 같은 대안
+표현을 추가하는 방향을 권장한다 -- 기존 Sequential 기반 모델과 테스트를
+깨지 않기 위해서다. `BranchSpec`(입력 하나 -> 병렬 branch -> 즉시
+merge)만으로 충분한 현재로서는 이런 일반 DAG 계층을 미리 만들지 않는다.
+기존 `TinyResidualCNN`은 Phase 0 테스트용 모델로 그대로 유지된다.

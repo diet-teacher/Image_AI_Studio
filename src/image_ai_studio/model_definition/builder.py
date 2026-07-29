@@ -10,13 +10,15 @@ from typing import Callable, Dict, Type
 from torch import nn
 
 from image_ai_studio.model_definition.errors import ModelValidationError
-from image_ai_studio.model_definition.shape_inference import LayerShapeInfo
+from image_ai_studio.model_definition.shape_inference import LayerShapeInfo, infer_layer_shape
 from image_ai_studio.model_definition.specs import (
     AdaptiveAvgPool2dSpec,
     BatchNorm2dSpec,
+    BranchSpec,
     Conv2dSpec,
     DropoutSpec,
     FlattenSpec,
+    IdentitySpec,
     LayerSpec,
     LinearSpec,
     MaxPool2dSpec,
@@ -25,6 +27,7 @@ from image_ai_studio.model_definition.specs import (
     ResidualBlockSpec,
 )
 from image_ai_studio.model_definition.validation import validate_model_spec
+from image_ai_studio.models.branch_block import BranchBlock
 from image_ai_studio.models.residual_block import ResidualBlock
 
 
@@ -66,6 +69,10 @@ def _build_dropout(layer: DropoutSpec, inferred: dict[str, int]) -> nn.Module:
     return nn.Dropout(p=layer.p)
 
 
+def _build_identity(layer: IdentitySpec, inferred: dict[str, int]) -> nn.Module:
+    return nn.Identity()
+
+
 def _build_residual_block(layer: ResidualBlockSpec, inferred: dict[str, int]) -> nn.Module:
     return ResidualBlock(
         in_channels=inferred["in_channels"],
@@ -86,17 +93,40 @@ _BUILDERS: Dict[Type[LayerSpec], _BuilderFn] = {
     LinearSpec: _build_linear,
     DropoutSpec: _build_dropout,
     ResidualBlockSpec: _build_residual_block,
+    IdentitySpec: _build_identity,
 }
 
 
-def _build_layer(info: LayerShapeInfo) -> nn.Module:
-    builder_fn = _BUILDERS.get(type(info.layer))
+def _build_plain_layer(layer: LayerSpec, inferred: dict[str, int]) -> nn.Module:
+    builder_fn = _BUILDERS.get(type(layer))
     if builder_fn is None:
         raise ModelValidationError(
-            f"Layer {info.index}: no PyTorch builder is registered for layer type "
-            f"{type(info.layer).__name__!r}"
+            f"no PyTorch builder is registered for layer type {type(layer).__name__!r}"
         )
-    return builder_fn(info.layer, info.inferred)
+    return builder_fn(layer, inferred)
+
+
+def _build_branch(layer: BranchSpec, input_shape) -> nn.Module:
+    """branch마다 기존 infer_layer_shape/_build_plain_layer를 그대로 재사용해
+    nn.Sequential을 구성한 뒤 BranchBlock으로 묶는다. BranchSpec은 (다른
+    레이어와 달리) 자기 input_shape 문맥이 더 필요해서 _build_layer에서
+    별도로 처리한다 -- 나머지 레이어 타입의 딕셔너리 조회 방식은 그대로다."""
+    branch_modules = []
+    for branch in layer.branches:
+        shape = input_shape
+        modules = []
+        for index, sub_layer in enumerate(branch):
+            output_shape, inferred = infer_layer_shape(sub_layer, shape, index)
+            modules.append(_build_plain_layer(sub_layer, inferred))
+            shape = output_shape
+        branch_modules.append(nn.Sequential(*modules))
+    return BranchBlock(branch_modules, merge=layer.merge)
+
+
+def _build_layer(info: LayerShapeInfo) -> nn.Module:
+    if isinstance(info.layer, BranchSpec):
+        return _build_branch(info.layer, info.input_shape)
+    return _build_plain_layer(info.layer, info.inferred)
 
 
 def build_model(model_spec: ModelSpec) -> nn.Sequential:

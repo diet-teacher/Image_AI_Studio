@@ -11,15 +11,18 @@ from image_ai_studio.model_definition.shape_inference import infer_model_shapes
 from image_ai_studio.model_definition.specs import (
     AdaptiveAvgPool2dSpec,
     BatchNorm2dSpec,
+    BranchSpec,
     Conv2dSpec,
     DropoutSpec,
     FlattenSpec,
+    IdentitySpec,
     LinearSpec,
     MaxPool2dSpec,
     ModelSpec,
     ReLUSpec,
     ResidualBlockSpec,
 )
+from image_ai_studio.models.branch_block import BranchBlock
 from image_ai_studio.models.residual_block import ResidualBlock
 
 
@@ -185,3 +188,105 @@ def test_residual_block_forward_shape_matches_shape_inference() -> None:
     with torch.inference_mode():
         output = model(torch.randn(1, *spec.input_shape))
     assert tuple(output.shape[1:]) == expected_shape
+
+
+# -- IdentitySpec ---------------------------------------------------------------
+
+
+def test_identity_builds_as_nn_identity() -> None:
+    spec = ModelSpec(name="m", input_shape=(3, 8, 8), layers=[IdentitySpec()])
+    model = build_model(spec)
+    assert isinstance(model[0], nn.Identity)
+
+
+# -- BranchSpec -------------------------------------------------------------------
+
+
+def test_branch_builds_as_branch_block() -> None:
+    spec = ModelSpec(
+        name="m",
+        input_shape=(3, 8, 8),
+        layers=[
+            BranchSpec(
+                branches=[
+                    [Conv2dSpec(out_channels=8, kernel_size=3, stride=1, padding=1)],
+                    [Conv2dSpec(out_channels=8, kernel_size=3, stride=1, padding=1)],
+                ],
+                merge="add",
+            )
+        ],
+    )
+    model = build_model(spec)
+    assert isinstance(model[0], BranchBlock)
+    assert len(model[0].branches) == 2
+
+
+def test_branch_add_forward_matches_shape_inference() -> None:
+    spec = ModelSpec(
+        name="m",
+        input_shape=(8, 8, 8),
+        layers=[
+            BranchSpec(
+                branches=[
+                    [Conv2dSpec(out_channels=8, kernel_size=3, stride=1, padding=1), BatchNorm2dSpec()],
+                    [IdentitySpec()],
+                ],
+                merge="add",
+            ),
+            ReLUSpec(),
+        ],
+    )
+    expected_shape = infer_model_shapes(spec)[-1].output_shape
+
+    model = build_model(spec).eval()
+    with torch.inference_mode():
+        output = model(torch.randn(2, *spec.input_shape))
+    assert tuple(output.shape[1:]) == expected_shape
+
+
+def test_branch_concat_forward_matches_shape_inference() -> None:
+    spec = ModelSpec(
+        name="m",
+        input_shape=(4, 8, 8),
+        layers=[
+            BranchSpec(
+                branches=[
+                    [Conv2dSpec(out_channels=4, kernel_size=3, stride=1, padding=1)],
+                    [MaxPool2dSpec(kernel_size=1, stride=1, padding=0)],
+                ],
+                merge="concat",
+            )
+        ],
+    )
+    expected_shape = infer_model_shapes(spec)[-1].output_shape
+
+    model = build_model(spec).eval()
+    with torch.inference_mode():
+        output = model(torch.randn(2, *spec.input_shape))
+    assert tuple(output.shape[1:]) == expected_shape
+
+
+def test_branch_with_conv_and_identity_skip_matches_residual_style_output() -> None:
+    """Conv-BN 경로 + Identity 경로를 Add로 합치는 건 ResidualBlockSpec이 내부적으로
+    하는 것과 동일한 패턴을 사용자가 직접 구성한 것이다."""
+    spec = ModelSpec(
+        name="m",
+        input_shape=(8, 8, 8),
+        layers=[
+            BranchSpec(
+                branches=[
+                    [
+                        Conv2dSpec(out_channels=8, kernel_size=3, stride=1, padding=1),
+                        BatchNorm2dSpec(),
+                    ],
+                    [IdentitySpec()],
+                ],
+                merge="add",
+            ),
+            ReLUSpec(),
+        ],
+    )
+    model = build_model(spec).eval()
+    with torch.inference_mode():
+        output = model(torch.randn(1, *spec.input_shape))
+    assert tuple(output.shape) == (1, 8, 8, 8)

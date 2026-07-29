@@ -14,9 +14,11 @@ from image_ai_studio.model_definition.errors import ModelValidationError
 from image_ai_studio.model_definition.specs import (
     AdaptiveAvgPool2dSpec,
     BatchNorm2dSpec,
+    BranchSpec,
     Conv2dSpec,
     DropoutSpec,
     FlattenSpec,
+    IdentitySpec,
     LayerSpec,
     LinearSpec,
     MaxPool2dSpec,
@@ -143,6 +145,45 @@ def _residual_block_shape(
     return (layer.out_channels, h_out, w_out), {"in_channels": in_channels}
 
 
+def _branch_shape(layer: BranchSpec, input_shape: Shape, index: int) -> tuple[Shape, dict[str, int]]:
+    """각 branch는 동일한 input_shape에서 시작해 기존 infer_layer_shape을 그대로
+    재귀 재사용한다 (새 shape 엔진 없음). merge="add"는 모든 branch의 최종
+    output_shape이 완전히 같아야 하고, merge="concat"은 channel(axis 0)만
+    합산하고 나머지(H,W)는 전부 같아야 한다 (Phase 3는 channel concat만 지원,
+    concat_dim은 노출하지 않음)."""
+    branch_output_shapes = []
+    for branch in layer.branches:
+        shape = input_shape
+        for sub_layer in branch:
+            shape, _ = infer_layer_shape(sub_layer, shape, index)
+        branch_output_shapes.append(shape)
+
+    if layer.merge == "add":
+        if len(set(branch_output_shapes)) != 1:
+            raise ModelValidationError(
+                f"Layer {index} (Branch): merge=\"add\" requires all branches to produce the "
+                f"same output shape, got {branch_output_shapes}"
+            )
+        return branch_output_shapes[0], {}
+
+    # merge == "concat"
+    for shape in branch_output_shapes:
+        if len(shape) != 3:
+            raise ModelValidationError(
+                f"Layer {index} (Branch): merge=\"concat\" requires each branch to produce a "
+                f"3D (channels, height, width) output, got {shape}"
+            )
+    spatial_shapes = {shape[1:] for shape in branch_output_shapes}
+    if len(spatial_shapes) != 1:
+        raise ModelValidationError(
+            f"Layer {index} (Branch): merge=\"concat\" requires all branches to share the same "
+            f"(height, width), got {branch_output_shapes}"
+        )
+    height, width = next(iter(spatial_shapes))
+    total_channels = sum(shape[0] for shape in branch_output_shapes)
+    return (total_channels, height, width), {}
+
+
 _ShapeHandler = Callable[[LayerSpec, Shape, int], "tuple[Shape, dict[str, int]]"]
 
 _SHAPE_HANDLERS: dict[type, _ShapeHandler] = {
@@ -155,6 +196,8 @@ _SHAPE_HANDLERS: dict[type, _ShapeHandler] = {
     LinearSpec: _linear_shape,
     DropoutSpec: _identity_shape,
     ResidualBlockSpec: _residual_block_shape,
+    BranchSpec: _branch_shape,
+    IdentitySpec: _identity_shape,
 }
 
 

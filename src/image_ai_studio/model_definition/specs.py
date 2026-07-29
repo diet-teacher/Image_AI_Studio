@@ -145,6 +145,13 @@ class DropoutSpec(LayerSpec):
 
 
 @dataclass
+class IdentitySpec(LayerSpec):
+    """입력을 그대로 통과시키는 passthrough 레이어. BranchSpec의 skip path를
+    명시적으로 표현하기 위한 용도 (빈 branch는 허용하지 않고 IdentitySpec()을
+    명시해야 함)."""
+
+
+@dataclass
 class ResidualBlockSpec(LayerSpec):
     """Conv-BN-ReLU-Conv-BN + shortcut (models.residual_block.ResidualBlock 재사용).
 
@@ -158,6 +165,58 @@ class ResidualBlockSpec(LayerSpec):
     def __post_init__(self) -> None:
         _require_positive_int("out_channels", self.out_channels)
         _require_positive_int("stride", self.stride)
+
+
+@dataclass
+class BranchSpec(LayerSpec):
+    """입력 하나를 N개 병렬 branch로 나눠 처리한 뒤 merge로 다시 하나로 합치는 composite layer.
+
+    각 branch는 그 자체로 완결된 list[LayerSpec] 체인이다 (기존 shape_inference/builder를
+    branch 단위로 재귀 재사용). 중첩 BranchSpec은 이번 Phase에서 금지한다 (설계 근거:
+    docs/phase3_branch_design.md).
+    """
+
+    branches: list[list[LayerSpec]]
+    merge: str = "add"
+
+    def __post_init__(self) -> None:
+        if self.merge not in ("add", "concat"):
+            raise ModelValidationError(f"'merge' must be one of ('add', 'concat'), got {self.merge!r}")
+
+        if not isinstance(self.branches, (list, tuple)):
+            raise ModelValidationError(
+                f"BranchSpec.branches must be a list or tuple, got {type(self.branches).__name__}"
+            )
+        self.branches = [self._validate_branch(index, branch) for index, branch in enumerate(self.branches)]
+        if len(self.branches) < 2:
+            raise ModelValidationError(
+                f"BranchSpec.branches must contain at least 2 branches, got {len(self.branches)}"
+            )
+
+    def _validate_branch(self, branch_index: int, branch: object) -> list[LayerSpec]:
+        if not isinstance(branch, (list, tuple)):
+            raise ModelValidationError(
+                f"BranchSpec.branches[{branch_index}] must be a list of LayerSpec, "
+                f"got {type(branch).__name__}"
+            )
+        branch = list(branch)
+        if not branch:
+            raise ModelValidationError(
+                f"BranchSpec.branches[{branch_index}] must not be empty "
+                "(use a single IdentitySpec() for a passthrough branch)"
+            )
+        for layer_index, layer in enumerate(branch):
+            if not isinstance(layer, LayerSpec):
+                raise ModelValidationError(
+                    f"BranchSpec.branches[{branch_index}][{layer_index}] must be a LayerSpec "
+                    f"instance, got {type(layer).__name__}"
+                )
+            if isinstance(layer, BranchSpec):
+                raise ModelValidationError(
+                    f"BranchSpec.branches[{branch_index}][{layer_index}]: nested BranchSpec "
+                    "is not supported in Phase 3"
+                )
+        return branch
 
 
 @dataclass

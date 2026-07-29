@@ -16,8 +16,10 @@ from image_ai_studio.model_definition.serialization import (
 from image_ai_studio.model_definition.shape_inference import infer_model_shapes
 from image_ai_studio.model_definition.specs import (
     BatchNorm2dSpec,
+    BranchSpec,
     Conv2dSpec,
     FlattenSpec,
+    IdentitySpec,
     LinearSpec,
     ModelSpec,
     ReLUSpec,
@@ -198,3 +200,106 @@ def test_residual_block_json_default_stride_restores_to_one() -> None:
         }
     )
     assert spec.layers[0].stride == 1
+
+
+# -- IdentitySpec --------------------------------------------------------------
+
+
+def test_identity_json_type_loads_directly() -> None:
+    spec = model_spec_from_dict(
+        {"name": "m", "input_shape": [3, 8, 8], "layers": [{"type": "identity"}]}
+    )
+    assert isinstance(spec.layers[0], IdentitySpec)
+
+
+# -- BranchSpec ----------------------------------------------------------------
+
+
+def _branch_example_model_spec() -> ModelSpec:
+    return ModelSpec(
+        name="branch_example",
+        input_shape=(8, 8, 8),
+        layers=[
+            BranchSpec(
+                branches=[
+                    [Conv2dSpec(out_channels=8, kernel_size=3, stride=1, padding=1), BatchNorm2dSpec()],
+                    [IdentitySpec()],
+                ],
+                merge="add",
+            ),
+            ReLUSpec(),
+        ],
+    )
+
+
+def test_branch_model_round_trips_through_json() -> None:
+    original = _branch_example_model_spec()
+    restored = model_spec_from_dict(model_spec_to_dict(original))
+    assert restored == original
+
+
+def test_branch_model_round_trip_preserves_shape_inference_result() -> None:
+    original = _branch_example_model_spec()
+    restored = model_spec_from_dict(model_spec_to_dict(original))
+    original_trace = [(i.input_shape, i.output_shape) for i in infer_model_shapes(original)]
+    restored_trace = [(i.input_shape, i.output_shape) for i in infer_model_shapes(restored)]
+    assert original_trace == restored_trace
+
+
+def test_branch_json_type_loads_directly_with_nested_layers() -> None:
+    spec = model_spec_from_dict(
+        {
+            "name": "m",
+            "input_shape": [4, 8, 8],
+            "layers": [
+                {
+                    "type": "branch",
+                    "merge": "concat",
+                    "branches": [
+                        [{"type": "conv2d", "out_channels": 4, "kernel_size": 3, "stride": 1, "padding": 1}],
+                        [{"type": "identity"}],
+                    ],
+                }
+            ],
+        }
+    )
+    branch = spec.layers[0]
+    assert isinstance(branch, BranchSpec)
+    assert branch.merge == "concat"
+    assert isinstance(branch.branches[0][0], Conv2dSpec)
+    assert isinstance(branch.branches[1][0], IdentitySpec)
+
+
+def test_branch_json_default_merge_restores_to_add() -> None:
+    spec = model_spec_from_dict(
+        {
+            "name": "m",
+            "input_shape": [4, 8, 8],
+            "layers": [
+                {
+                    "type": "branch",
+                    "branches": [[{"type": "identity"}], [{"type": "identity"}]],
+                }
+            ],
+        }
+    )
+    assert spec.layers[0].merge == "add"
+
+
+def test_branch_json_nested_branch_raises_model_validation_error() -> None:
+    with pytest.raises(ModelValidationError, match="nested BranchSpec"):
+        model_spec_from_dict(
+            {
+                "name": "m",
+                "input_shape": [4, 8, 8],
+                "layers": [
+                    {
+                        "type": "branch",
+                        "branches": [
+                            [{"type": "identity"}],
+                            [{"type": "branch", "branches": [[{"type": "identity"}], [{"type": "identity"}]]}],
+                        ],
+                    }
+                ],
+            }
+        )

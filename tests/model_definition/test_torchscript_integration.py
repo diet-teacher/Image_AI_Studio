@@ -15,8 +15,10 @@ from image_ai_studio.model_definition.builder import build_model
 from image_ai_studio.model_definition.specs import (
     AdaptiveAvgPool2dSpec,
     BatchNorm2dSpec,
+    BranchSpec,
     Conv2dSpec,
     FlattenSpec,
+    IdentitySpec,
     LinearSpec,
     MaxPool2dSpec,
     ModelSpec,
@@ -59,6 +61,73 @@ def test_model_spec_builds_exports_and_round_trips_through_torchscript(tmp_path:
         model_name=spec.name,
         # Phase 1 모델은 저장된 state_dict 없음 -- build_metadata()는 경로 부재 시
         # state_dict_sha256=None 처리
+        state_dict_path=tmp_path / "no_state_dict.pt",
+    )
+
+    assert output_path.exists()
+    metadata = json.loads(metadata_path.read_text())
+    assert metadata["status"] == "PASS", metadata.get("error_log")
+
+    reloaded = torch.jit.load(str(output_path))
+    reloaded.eval()
+
+    with torch.inference_mode():
+        original_output = model(example_input)
+        reloaded_output = reloaded(example_input)
+
+    parity = compare_outputs(original_output, reloaded_output, rtol=CPU_FP32_RTOL, atol=CPU_FP32_ATOL)
+    assert parity.allclose, parity.to_dict()
+    assert tuple(reloaded_output.shape) == (1, 4)
+
+
+def _branch_model_spec() -> ModelSpec:
+    """Conv -> ReLU -> Branch(Add: Conv+BN / Identity) -> ReLU ->
+    Branch(Concat: Conv / MaxPool) -> Flatten -> Linear. Add와 Concat
+    두 merge를 한 모델 안에서 모두 거치도록 구성."""
+    return ModelSpec(
+        name="phase3_torchscript_branch_smoke",
+        input_shape=(3, 16, 16),
+        layers=[
+            Conv2dSpec(out_channels=8, kernel_size=3, stride=1, padding=1),
+            ReLUSpec(),
+            BranchSpec(
+                branches=[
+                    [Conv2dSpec(out_channels=8, kernel_size=3, stride=1, padding=1), BatchNorm2dSpec()],
+                    [IdentitySpec()],
+                ],
+                merge="add",
+            ),
+            ReLUSpec(),
+            BranchSpec(
+                branches=[
+                    [Conv2dSpec(out_channels=4, kernel_size=3, stride=1, padding=1)],
+                    [MaxPool2dSpec(kernel_size=1, stride=1, padding=0)],
+                ],
+                merge="concat",
+            ),
+            FlattenSpec(),
+            LinearSpec(out_features=4),
+        ],
+    )
+
+
+def test_branch_model_builds_exports_and_round_trips_through_torchscript(tmp_path: Path) -> None:
+    """새 C++ runner/exporter 없이 기존 TorchScriptExporter 그대로 -- BranchSpec
+    (Add + Concat, Identity skip path 포함)이 정상적으로 trace/재로드되는지 확인."""
+    spec = _branch_model_spec()
+    model = build_model(spec).eval()
+
+    example_input = torch.randn(1, *spec.input_shape)
+    output_path = tmp_path / "model.pt"
+    metadata_path = tmp_path / "metadata.json"
+
+    exporter = TorchScriptExporter()
+    exporter.export(
+        model,
+        example_input,
+        output_path,
+        metadata_path,
+        model_name=spec.name,
         state_dict_path=tmp_path / "no_state_dict.pt",
     )
 

@@ -5,9 +5,11 @@ import pytest
 
 from image_ai_studio.model_definition.errors import ModelValidationError
 from image_ai_studio.model_definition.specs import (
+    BranchSpec,
     Conv2dSpec,
     DropoutSpec,
     FlattenSpec,
+    IdentitySpec,
     LinearSpec,
     MaxPool2dSpec,
     ModelSpec,
@@ -229,3 +231,65 @@ def test_residual_block_accepts_valid_params() -> None:
 
 def test_residual_block_stride_defaults_to_one() -> None:
     assert ResidualBlockSpec(out_channels=16).stride == 1
+
+
+# -- IdentitySpec --------------------------------------------------------------
+
+
+def test_identity_spec_constructs_with_no_fields() -> None:
+    assert IdentitySpec() == IdentitySpec()
+
+
+# -- BranchSpec ----------------------------------------------------------------
+
+
+def _conv_branch() -> list:
+    return [Conv2dSpec(out_channels=8, kernel_size=3, stride=1, padding=1)]
+
+
+def test_branch_rejects_unknown_merge() -> None:
+    with pytest.raises(ModelValidationError, match="merge"):
+        BranchSpec(branches=[_conv_branch(), _conv_branch()], merge="mul")
+
+
+@pytest.mark.parametrize("merge", ["add", "concat"])
+def test_branch_accepts_known_merge(merge: str) -> None:
+    spec = BranchSpec(branches=[_conv_branch(), _conv_branch()], merge=merge)
+    assert spec.merge == merge
+
+
+def test_branch_merge_defaults_to_add() -> None:
+    assert BranchSpec(branches=[_conv_branch(), _conv_branch()]).merge == "add"
+
+
+def test_branch_rejects_fewer_than_two_branches() -> None:
+    with pytest.raises(ModelValidationError, match="at least 2 branches"):
+        BranchSpec(branches=[_conv_branch()], merge="add")
+
+
+def test_branch_rejects_non_sequence_branches() -> None:
+    with pytest.raises(ModelValidationError, match="branches"):
+        BranchSpec(branches="not-a-list", merge="add")  # type: ignore[arg-type]
+
+
+def test_branch_rejects_empty_branch() -> None:
+    with pytest.raises(ModelValidationError, match="must not be empty"):
+        BranchSpec(branches=[_conv_branch(), []], merge="add")
+
+
+def test_branch_rejects_non_layer_spec_element() -> None:
+    with pytest.raises(ModelValidationError, match=r"branches\[1\]\[0\]"):
+        BranchSpec(branches=[_conv_branch(), ["conv"]], merge="add")  # type: ignore[list-item]
+
+
+def test_branch_rejects_nested_branch_spec() -> None:
+    with pytest.raises(ModelValidationError, match="nested BranchSpec"):
+        BranchSpec(
+            branches=[_conv_branch(), [BranchSpec(branches=[_conv_branch(), _conv_branch()])]],
+            merge="add",
+        )
+
+
+def test_branch_accepts_identity_skip_path() -> None:
+    spec = BranchSpec(branches=[_conv_branch(), [IdentitySpec()]], merge="add")
+    assert spec.branches[1] == [IdentitySpec()]

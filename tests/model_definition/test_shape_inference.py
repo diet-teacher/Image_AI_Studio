@@ -8,9 +8,11 @@ from image_ai_studio.model_definition.shape_inference import format_shape_trace,
 from image_ai_studio.model_definition.specs import (
     AdaptiveAvgPool2dSpec,
     BatchNorm2dSpec,
+    BranchSpec,
     Conv2dSpec,
     DropoutSpec,
     FlattenSpec,
+    IdentitySpec,
     LinearSpec,
     MaxPool2dSpec,
     ModelSpec,
@@ -233,6 +235,164 @@ def test_residual_block_matches_actual_pytorch_module_on_odd_spatial_size() -> N
     predicted_shape = infer_model_shapes(spec)[0].output_shape
 
     block = ResidualBlock(in_channels=in_channels, out_channels=out_channels, stride=stride).eval()
+    with torch.inference_mode():
+        actual_output = block(torch.randn(1, in_channels, h, w))
+
+    assert predicted_shape == tuple(actual_output.shape[1:])
+
+
+# -- IdentitySpec --------------------------------------------------------------
+
+
+def test_identity_preserves_shape() -> None:
+    spec = ModelSpec(name="m", input_shape=(3, 8, 8), layers=[IdentitySpec()])
+    trace = infer_model_shapes(spec)
+    assert trace[0].output_shape == (3, 8, 8)
+
+
+# -- BranchSpec: merge="add" ---------------------------------------------------
+
+
+def test_branch_add_requires_matching_shapes_and_preserves_them() -> None:
+    spec = ModelSpec(
+        name="m",
+        input_shape=(8, 8, 8),
+        layers=[
+            BranchSpec(
+                branches=[
+                    [Conv2dSpec(out_channels=8, kernel_size=3, stride=1, padding=1)],
+                    [IdentitySpec()],
+                ],
+                merge="add",
+            )
+        ],
+    )
+    trace = infer_model_shapes(spec)
+    assert trace[0].output_shape == (8, 8, 8)
+    assert trace[0].inferred == {}
+
+
+def test_branch_add_rejects_mismatched_branch_shapes() -> None:
+    spec = ModelSpec(
+        name="m",
+        input_shape=(8, 8, 8),
+        layers=[
+            BranchSpec(
+                branches=[
+                    [Conv2dSpec(out_channels=8, kernel_size=3, stride=1, padding=1)],
+                    [Conv2dSpec(out_channels=8, kernel_size=3, stride=2, padding=1)],
+                ],
+                merge="add",
+            )
+        ],
+    )
+    with pytest.raises(ModelValidationError, match=r'merge="add"'):
+        infer_model_shapes(spec)
+
+
+def test_branch_after_flatten_reuses_add_on_1d_shapes() -> None:
+    """BranchSpec은 3D로 제한하지 않는다 -- 각 branch가 자기 sub-layer의 rank
+    요구사항을 그대로 강제하므로(_require_rank), 1D 입력에서도 add가 성립하면
+    허용된다."""
+    spec = ModelSpec(
+        name="m",
+        input_shape=(3, 4, 4),
+        layers=[
+            FlattenSpec(),
+            BranchSpec(branches=[[IdentitySpec()], [IdentitySpec()]], merge="add"),
+        ],
+    )
+    trace = infer_model_shapes(spec)
+    assert trace[-1].output_shape == (48,)
+
+
+# -- BranchSpec: merge="concat" (channel-only) ---------------------------------
+
+
+def test_branch_concat_sums_channels_and_keeps_spatial_size() -> None:
+    spec = ModelSpec(
+        name="m",
+        input_shape=(4, 8, 8),
+        layers=[
+            BranchSpec(
+                branches=[
+                    [Conv2dSpec(out_channels=4, kernel_size=3, stride=1, padding=1)],
+                    [MaxPool2dSpec(kernel_size=1, stride=1, padding=0)],
+                ],
+                merge="concat",
+            )
+        ],
+    )
+    trace = infer_model_shapes(spec)
+    assert trace[0].output_shape == (8, 8, 8)
+
+
+def test_branch_concat_rejects_mismatched_spatial_size() -> None:
+    spec = ModelSpec(
+        name="m",
+        input_shape=(3, 8, 8),
+        layers=[
+            BranchSpec(
+                branches=[
+                    [Conv2dSpec(out_channels=4, kernel_size=3, stride=1, padding=1)],
+                    [Conv2dSpec(out_channels=4, kernel_size=3, stride=2, padding=1)],
+                ],
+                merge="concat",
+            )
+        ],
+    )
+    with pytest.raises(ModelValidationError, match=r'merge="concat".*\(height, width\)'):
+        infer_model_shapes(spec)
+
+
+def test_branch_concat_rejects_non_3d_branch_output() -> None:
+    spec = ModelSpec(
+        name="m",
+        input_shape=(3, 8, 8),
+        layers=[
+            BranchSpec(
+                branches=[
+                    [FlattenSpec()],
+                    [Conv2dSpec(out_channels=4, kernel_size=3, stride=1, padding=1)],
+                ],
+                merge="concat",
+            )
+        ],
+    )
+    with pytest.raises(ModelValidationError, match=r'merge="concat".*3D'):
+        infer_model_shapes(spec)
+
+
+def test_branch_concat_matches_actual_branch_block_on_odd_spatial_size() -> None:
+    """shape_inference의 concat 예측이 실제 BranchBlock(torch.cat(dim=1))
+    forward 결과와 일치하는지 홀수 spatial size로 교차 검증."""
+    import torch
+
+    from image_ai_studio.models.branch_block import BranchBlock
+
+    in_channels, h, w = 4, 7, 7
+    spec = ModelSpec(
+        name="m",
+        input_shape=(in_channels, h, w),
+        layers=[
+            BranchSpec(
+                branches=[
+                    [Conv2dSpec(out_channels=6, kernel_size=3, stride=2, padding=1)],
+                    [Conv2dSpec(out_channels=3, kernel_size=3, stride=2, padding=1)],
+                ],
+                merge="concat",
+            )
+        ],
+    )
+    predicted_shape = infer_model_shapes(spec)[0].output_shape
+
+    block = BranchBlock(
+        branches=[
+            torch.nn.Conv2d(in_channels, 6, kernel_size=3, stride=2, padding=1),
+            torch.nn.Conv2d(in_channels, 3, kernel_size=3, stride=2, padding=1),
+        ],
+        merge="concat",
+    ).eval()
     with torch.inference_mode():
         actual_output = block(torch.randn(1, in_channels, h, w))
 
