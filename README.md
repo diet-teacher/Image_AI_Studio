@@ -110,6 +110,127 @@ C++ 러너가 필요 없는 `pytest`와 달리, `run_phase1_e2e.py`는 빌드된
 
 ---
 
+## Phase 2
+
+Phase 1의 Sequential 기반 Model Definition Layer 위에, 내부에 skip
+connection이 있는 **`ResidualBlockSpec`**을 추가합니다.
+`_SHAPE_HANDLERS`/`_BUILDERS`/`_LAYER_REGISTRY` 레지스트리에 항목만
+추가하는 방식으로, 기존 shape inference/builder/serialization 코드는
+전혀 바꾸지 않았습니다.
+
+* `ResidualBlockSpec` (Conv-BN-ReLU-Conv-BN + shortcut -> Add -> ReLU)
+* identity shortcut(`in_channels == out_channels`, `stride == 1`)과
+  projection shortcut(1x1 Conv+BatchNorm) 둘 다 지원
+* TorchScript export 및 C++ CPU/CUDA parity로 실제 검증됨
+
+설계와 검증 결과는 `docs/phase2_residual_block_design.md`를 참고하세요.
+
+---
+
+## Phase 3
+
+일반 DAG를 바로 도입하지 않고, 범위를 좁힌 **`BranchSpec`**/**`IdentitySpec`**
+으로 사용자가 직접 구성하는 분기/합류를 지원합니다.
+
+* `BranchSpec`: 입력 하나를 N개 병렬 branch로 나눈 뒤 다시 하나로
+  합류 (`merge="add"` 또는 `merge="concat"`; concat은 channel 방향만
+  지원)
+* `IdentitySpec`: skip path를 명시적으로 표현하는 passthrough 레이어
+  (빈 branch를 암묵적으로 Identity로 취급하지 않음)
+* 즉시 합류하는 분기 구조만 지원 -- ResNet/Inception류 구조는 표현
+  가능하지만, 임의 DAG나 long skip, 중첩 `BranchSpec`은 아직 지원하지
+  않음
+* TorchScript export 및 C++ CPU/CUDA parity로 실제 검증됨
+
+설계와 검증 결과는 `docs/phase3_branch_design.md`를 참고하세요.
+
+---
+
+## Phase 4A / 4B: Training
+
+Phase 0~3이 만든 Model Definition Layer + TorchScript/C++ 배포 경로
+위에, 이 프로젝트에서 처음으로 **실제 학습**을 연결합니다:
+
+```text
+Model JSON
+    -> ModelSpec
+    -> build_model()
+    -> Train / Validation (synthetic dataset)
+    -> best epoch 추적 (validation loss 기준)
+    -> TrainingHistory 저장
+    -> best epoch의 state_dict 저장
+    -> TorchScript export
+    -> C++ LibTorch inference
+    -> Python/C++ parity
+```
+
+**Phase 4A**가 이 흐름을 처음으로 끝까지 연결했고, **Phase 4B**는 "마지막
+epoch"이 아니라 "가장 좋았던 epoch"의 가중치를 배포하도록 발전시켰습니다:
+
+* `TrainingConfig`(epochs/batch_size/learning_rate), optimizer=Adam,
+  loss=CrossEntropyLoss로 고정 (선택 registry 없음)
+* 외부 다운로드 없는 synthetic 이미지 분류 데이터셋 (train/validation
+  분리, 고정 seed로 재현 가능, torchvision 미사용)
+* `train_one_epoch()` / `evaluate()` / `run_training()`
+* BatchNorm running stats 갱신, Dropout train/eval 전환,
+  `ResidualBlockSpec`/`BranchSpec`의 backward를 실제 학습 경로로 검증
+* validation loss가 strict하게 개선될 때만 **best epoch**로 갱신하고,
+  그 시점의 `state_dict`를 메모리에 deep copy로 보존 (`run_training()`은
+  파일을 쓰지 않고 `TrainingResult`로 반환 -- 저장은 호출자 책임)
+* `TrainingHistory`(epoch별 train/val loss, val accuracy, best epoch)
+  JSON 저장/재로드
+* **마지막 epoch이 아니라 best epoch의 가중치**로 state_dict 저장,
+  TorchScript export, C++ CPU/CUDA parity까지 확인
+
+실행:
+
+```bash
+pytest tests/training/
+python scripts/run_training_e2e.py
+```
+
+실제로 검증됨(이 저장소에서 직접 실행 확인): `tests/training/` 38 passed,
+전체 `pytest` 195 passed, Phase 0 regression / Phase 1~3 E2E regression /
+Phase 4B Training E2E 전부 PASS, best epoch 모델 기준 C++ CPU/CUDA
+parity PASS.
+
+설계 배경은 `docs/phase4a_training_design.md`를 참고하세요.
+
+---
+
+## 현재 지원 범위
+
+* Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
+  직렬화)
+* `ResidualBlock` (Phase 2)
+* `Branch` Add / channel `Concat` + `Identity` skip path (Phase 3)
+* Classification 학습 (Adam + CrossEntropyLoss 고정)
+* Synthetic train/validation 데이터셋
+* Best epoch 모델 추적 + `TrainingHistory` JSON 저장
+* TorchScript 배포, C++(LibTorch) CPU/CUDA 추론
+* Python/C++ parity 검증 (Phase 0~4B 전 구간)
+
+## 아직 미지원 / 향후 계획
+
+다음은 아직 구현되지 않았습니다:
+
+* 실제 이미지 dataset 연동 (torchvision 기반 `ImageFolder` 등),
+  augmentation
+* optimizer/loss 선택, LR scheduler, early stopping
+* optimizer state/epoch가 포함된 full checkpoint, 중단된 학습 재개(resume)
+* mixed precision, multi-GPU/distributed training
+* 일반 DAG(`GraphSpec`/`NodeSpec`/`EdgeSpec`), long skip connection,
+  중첩 `BranchSpec`
+* Detection/Segmentation training
+* PySide6 UI
+
+이 항목들은 구체적인 필요가 확인되기 전까지 의도적으로 보류하고
+있습니다 (과설계 방지). 각 Phase가 무엇을 의도적으로 제외했는지는
+해당 `docs/phase*.md` 문서의 "의도적으로 구현하지 않은 것"(또는
+"미지원") 절에 정리되어 있습니다.
+
+---
+
 ## 크로스 플랫폼 범위
 
 주요 대상 환경은 다음과 같습니다:
@@ -167,7 +288,7 @@ Apple Silicon은 NVIDIA CUDA를 지원하지 않으므로:
 
 ---
 
-## 포함된 내용
+## Phase 0에 포함된 내용
 
 * `TinyCNN`
 * `TinyResidualCNN`
@@ -193,7 +314,7 @@ Apple Silicon은 NVIDIA CUDA를 지원하지 않으므로:
 
 ---
 
-## 제외된 내용
+## Phase 0에서 제외된 내용
 
 Phase 0은 다음 항목들을 의도적으로 포함하지 않습니다:
 
@@ -590,15 +711,23 @@ build-torchscript/
 
 # 테스트 실행
 
-## Phase 1 Model Definition Layer (unit test)
+## Model Definition Layer / Training (unit test)
 
 ```bash
 python -m pip install -r requirements-dev.txt
 pytest
 ```
 
-이 테스트들은 전부 CPU에서 동작하며 빌드된 C++ 러너가 필요 없습니다.
-자세한 내용은 `docs/phase1_design.md`를 참고하세요.
+`tests/model_definition/`(Phase 1~3)과 `tests/training/`(Phase 4A/4B)를
+포함한 전체 unit test입니다. 전부 CPU에서 동작하며 빌드된 C++ 러너가
+필요 없습니다. Training 테스트만 따로 돌리려면:
+
+```bash
+pytest tests/training/
+```
+
+자세한 내용은 `docs/phase1_design.md`, `docs/phase4a_training_design.md`를
+참고하세요.
 
 ## TorchScript (Phase 0 C++ 패리티)
 
@@ -616,6 +745,17 @@ CUDA를 사용할 수 있는 경우, 테스트에는 CPU와 CUDA 패리티가 �
 
 CUDA를 사용할 수 없는 경우, CUDA 테스트는 조용히 CPU로 폴백되지 않고
 건너뜀(skipped) 또는 미지원(unsupported)으로 보고됩니다.
+
+## Training E2E (Phase 4A/4B)
+
+```bash
+python scripts/run_training_e2e.py
+```
+
+`ModelSpec` -> 학습 -> best epoch 추적 -> TorchScript export -> C++
+CPU/CUDA parity까지 전체 흐름을 실행합니다. `--model-json`으로 다른
+`ModelSpec` JSON을 지정할 수 있습니다 (기본값:
+`examples/models/phase4_training_model.json`).
 
 ---
 

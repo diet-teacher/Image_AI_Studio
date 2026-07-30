@@ -97,3 +97,62 @@ def test_trained_model_exports_and_round_trips_through_torchscript(tmp_path: Pat
 
     parity = compare_outputs(reloaded_output, traced_output, rtol=CPU_FP32_RTOL, atol=CPU_FP32_ATOL)
     assert parity.allclose, parity.to_dict()
+
+
+def test_best_epoch_model_exports_and_round_trips_through_torchscript(tmp_path: Path) -> None:
+    """run_training()이 반환하는 best_state_dict(마지막 epoch의 가중치가
+    아닐 수 있음)를 새 model에 로드해 export하는, run_training_e2e.py와
+    동일한 패턴을 검증 (Phase 4B)."""
+    torch.manual_seed(0)
+    spec = _spec()
+    model = build_model(spec)
+
+    train_dataset, val_dataset = make_train_val_datasets(
+        spec.input_shape, NUM_CLASSES, seed=0, train_size=32, val_size=16
+    )
+    generator = torch.Generator().manual_seed(0)
+    train_loader = DataLoader(
+        train_dataset, batch_size=8, shuffle=True, generator=generator, drop_last=True
+    )
+    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
+
+    config = TrainingConfig(epochs=3, batch_size=8, learning_rate=1e-2)
+    result = run_training(model, train_loader, val_loader, config)
+
+    best_model = build_model(spec)
+    best_model.load_state_dict(result.best_state_dict)
+    best_model = best_model.eval()
+
+    state_dict_path = tmp_path / "best_state_dict.pt"
+    save_state_dict(best_model, state_dict_path)
+
+    reloaded_model = build_model(spec)
+    load_state_dict(reloaded_model, state_dict_path)
+    reloaded_model = reloaded_model.eval()
+
+    example_input = torch.randn(1, *spec.input_shape)
+    output_path = tmp_path / "best_model.pt"
+    metadata_path = tmp_path / "best_metadata.json"
+
+    TorchScriptExporter().export(
+        reloaded_model,
+        example_input,
+        output_path,
+        metadata_path,
+        model_name=spec.name,
+        state_dict_path=state_dict_path,
+    )
+
+    assert output_path.exists()
+    metadata = json.loads(metadata_path.read_text())
+    assert metadata["status"] == "PASS", metadata.get("error_log")
+
+    traced = torch.jit.load(str(output_path))
+    traced.eval()
+
+    with torch.inference_mode():
+        reloaded_output = reloaded_model(example_input)
+        traced_output = traced(example_input)
+
+    parity = compare_outputs(reloaded_output, traced_output, rtol=CPU_FP32_RTOL, atol=CPU_FP32_ATOL)
+    assert parity.allclose, parity.to_dict()
