@@ -1,0 +1,26 @@
+{
+  "name": "phase4_training_model",
+  "input_shape": [3, 16, 16],
+  "layers": [
+    {"type": "conv2d", "out_channels": 8, "kernel_size": 3, "stride": 1, "padding": 1},
+    {"type": "batch_norm2d"},
+    {"type": "relu"},
+    {"type": "residual_block", "out_channels": 8, "stride": 2},
+    {
+      "type": "branch",
+      "merge": "add",
+      "branches": [
+        [
+          {"type": "conv2d", "out_channels": 8, "kernel_size": 3, "stride": 1, "padding": 1},
+          {"type": "batch_norm2d"}
+        ],
+        [{"type": "identity"}]
+      ]
+    },
+    {"type": "relu"},
+    {"type": "dropout", "p": 0.3},
+    {"type": "adaptive_avg_pool2d", "output_size": 1},
+    {"type": "flatten"},
+    {"type": "linear", "out_features": 4}
+  ]
+}
