@@ -1,0 +1,17 @@
+{
+  "name": "phase4c_cifar10_model",
+  "input_shape": [3, 32, 32],
+  "layers": [
+    {"type": "conv2d", "out_channels": 8, "kernel_size": 3, "stride": 1, "padding": 1},
+    {"type": "batch_norm2d"},
+    {"type": "relu"},
+    {"type": "max_pool2d", "kernel_size": 2, "stride": 2, "padding": 0},
+    {"type": "conv2d", "out_channels": 16, "kernel_size": 3, "stride": 1, "padding": 1},
+    {"type": "batch_norm2d"},
+    {"type": "relu"},
+    {"type": "max_pool2d", "kernel_size": 2, "stride": 2, "padding": 0},
+    {"type": "adaptive_avg_pool2d", "output_size": 1},
+    {"type": "flatten"},
+    {"type": "linear", "out_features": 10}
+  ]
+}

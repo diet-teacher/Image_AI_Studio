@@ -198,6 +198,67 @@ parity PASS.
 
 ---
 
+## Phase 4C: 실제 이미지 데이터셋 (torchvision / CIFAR-10)
+
+Phase 4A/4B는 synthetic dataset(외부 다운로드 없는 랜덤 패턴 이미지)만
+사용했습니다. Phase 4C는 이 학습 루프를 처음으로 **실제 이미지
+dataset**(torchvision `CIFAR10`)에 연결합니다:
+
+```text
+Model JSON
+    -> ModelSpec
+    -> build_model()
+    -> torchvision CIFAR-10 (공식 train split -> Train/Validation 결정론적 분리)
+    -> 기존 학습 루프(train_one_epoch/evaluate/run_training, 변경 없음)
+    -> best epoch 추적 (변경 없음)
+    -> 공식 CIFAR-10 test split으로 best model 최종 평가 (신규)
+    -> TorchScript export -> C++ LibTorch inference -> Python/C++ parity
+```
+
+* `torchvision`을 사용하되 CIFAR-10 전용 구조로 만들지 않았습니다 --
+  `build_transform()`/`limit_dataset()`은 다른 torchvision dataset
+  (`ImageFolder` 등)에도 그대로 재사용 가능한 형태입니다.
+* CIFAR-10 공식 train 50,000을 고정 seed로 Train(45,000)/
+  Validation(5,000)으로 결정론적으로 재분리하고, 공식 test(10,000)는
+  완전히 별도로 유지해 **best epoch 선택이나 학습 중 어떤 판단에도 test
+  split을 사용하지 않습니다**. best epoch 확정 후, 그 model 하나에 대해
+  test split으로 딱 한 번만 최종 평가합니다.
+* 전처리는 `Resize(ModelSpec.input_shape) -> ToTensor -> Normalize`뿐이며
+  augmentation은 포함하지 않습니다 (Train/Validation/Test 전부 동일한
+  deterministic transform).
+* `ModelSpec.input_shape[0] != 3`(RGB가 아님)이면 명확한 `ValueError`로
+  거부합니다 -- grayscale을 억지로 맞추지 않습니다.
+* `train_one_epoch`/`evaluate`/`run_training`/`TrainingHistory`/
+  `TrainingResult`/state_dict 저장/`TorchScriptExporter`/C++ 러너는
+  Phase 4A/4B 코드를 그대로 재사용합니다. `scripts/run_training_e2e.py`
+  (synthetic)는 이번 Phase에서 전혀 수정하지 않았습니다.
+
+실행:
+
+```bash
+pytest tests/training/test_torchvision_dataset.py
+python scripts/run_real_training_e2e.py
+```
+
+`run_real_training_e2e.py`는 처음 실행 시 `--data-root`(기본값
+`artifacts/datasets/cifar10`)에 CIFAR-10을 다운로드합니다 (네트워크
+필요). `--train-limit`/`--val-limit`/`--test-limit`(기본 256/64/128)으로
+빠른 검증용 subset 크기를 조절할 수 있고, `0` 이하를 넘기면 전체 공식
+split을 사용합니다.
+
+실제로 검증됨(이 저장소에서 직접 실행 확인, subset
+train=256/val=64/test=128/epochs=5): training loss 2.3558 -> 2.0817,
+best epoch 4(best val loss 2.1933), best model 기준 test_loss=2.1608 /
+test_accuracy=0.1953, best model save/reload PASS, TorchScript export
+PASS, C++ CPU/CUDA parity PASS. 이 수치는 작은 subset/짧은 학습에서 나온
+것이라 벤치마크 성능이 아니라 "실제 이미지 dataset 경로가 끝까지
+연결되어 동작한다"는 것을 보여주는 결과입니다.
+
+설계 배경과 상세 검증 결과는 `docs/phase4c_real_dataset_design.md`를
+참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
@@ -205,17 +266,23 @@ parity PASS.
 * `ResidualBlock` (Phase 2)
 * `Branch` Add / channel `Concat` + `Identity` skip path (Phase 3)
 * Classification 학습 (Adam + CrossEntropyLoss 고정)
-* Synthetic train/validation 데이터셋
+* Synthetic train/validation 데이터셋 (Phase 4A/4B, 오프라인)
+* torchvision CIFAR-10 real-image 데이터셋, 공식 train split의 결정론적
+  Train/Validation 재분리, 공식 test split의 최종(1회) 평가 (Phase 4C)
 * Best epoch 모델 추적 + `TrainingHistory` JSON 저장
 * TorchScript 배포, C++(LibTorch) CPU/CUDA 추론
-* Python/C++ parity 검증 (Phase 0~4B 전 구간)
+* Python/C++ parity 검증 (Phase 0~4C 전 구간)
 
 ## 아직 미지원 / 향후 계획
 
 다음은 아직 구현되지 않았습니다:
 
-* 실제 이미지 dataset 연동 (torchvision 기반 `ImageFolder` 등),
-  augmentation
+* augmentation (RandomCrop, RandomHorizontalFlip, ColorJitter,
+  RandAugment, AutoAugment 등)
+* dataset registry/factory를 통한 일반 `ImageFolder`, Oxford-IIIT Pet
+  등 다른 dataset 연동 (torchvision 기반 CIFAR-10 하나만 실제로 연결됨 --
+  다른 dataset도 같은 transform/subset 유틸을 재사용할 수 있는 구조지만
+  통합 factory는 아직 없음)
 * optimizer/loss 선택, LR scheduler, early stopping
 * optimizer state/epoch가 포함된 full checkpoint, 중단된 학습 재개(resume)
 * mixed precision, multi-GPU/distributed training
@@ -419,6 +486,22 @@ pip install torch
 python -m pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cu126
 ```
 
+Phase 4C(실제 이미지 dataset)를 사용하려면 `torchvision`도 **같은 CUDA
+index에서, 설치된 `torch` 버전과 짝이 맞는 버전**으로 설치해야 합니다.
+최신 `torchvision`을 그냥 설치하면 `torch`를 다른 버전으로 업그레이드할
+수 있으므로, 먼저 `--dry-run`으로 실제 설치될 `torch` 버전을 확인하는
+것을 권장합니다:
+
+```bat
+python -m pip install torchvision==0.27.1+cu126 --index-url https://download.pytorch.org/whl/cu126 --dry-run
+python -m pip install torchvision==0.27.1+cu126 --index-url https://download.pytorch.org/whl/cu126
+```
+
+`torchvision==0.27.1+cu126`은 이 저장소에서 `torch==2.12.1+cu126`을
+바꾸지 않고 그대로 설치된다는 것을 실제로 확인한 조합입니다. 설치 후
+`torch.__version__`과 `torch.cuda.is_available()`이 이전과 동일한지
+다시 확인하세요.
+
 설치 후 확인:
 
 ```bat
@@ -447,12 +530,19 @@ python -m pip install torch==2.12.1
 
 macOS에서는 CUDA를 사용할 수 없을 것으로 예상됩니다.
 
+Phase 4C를 사용하려면 설치된 `torch` 버전과 짝이 맞는 `torchvision`을
+같은 방식으로 설치하세요 (예: `python -m pip install torchvision==0.27.1`).
+
 ### Linux + NVIDIA CUDA
 
 대상 Linux CUDA 환경에 맞는 PyTorch CUDA wheel을 설치하세요.
 
 정확한 wheel은 `requirements.txt`에 하드코딩하는 대신, 목표로 하는
 PyTorch 및 CUDA 구성에 따라 선택해야 합니다.
+
+Phase 4C를 사용하려면 `torchvision`도 동일한 CUDA index에서 설치된
+`torch` 버전과 짝이 맞는 버전으로 설치하세요 (Windows 예시와 동일하게
+`--dry-run`으로 먼저 확인하는 것을 권장합니다).
 
 ---
 
@@ -718,16 +808,18 @@ python -m pip install -r requirements-dev.txt
 pytest
 ```
 
-`tests/model_definition/`(Phase 1~3)과 `tests/training/`(Phase 4A/4B)를
-포함한 전체 unit test입니다. 전부 CPU에서 동작하며 빌드된 C++ 러너가
-필요 없습니다. Training 테스트만 따로 돌리려면:
+`tests/model_definition/`(Phase 1~3)과 `tests/training/`(Phase
+4A/4B/4C)를 포함한 전체 unit test입니다. 전부 CPU에서 동작하며 빌드된
+C++ 러너가 필요 없고, 네트워크 접근도 없습니다 (CIFAR-10 다운로드는
+`pytest`가 아니라 아래 Real-Image Training E2E에서만 발생). Training
+테스트만 따로 돌리려면:
 
 ```bash
 pytest tests/training/
 ```
 
-자세한 내용은 `docs/phase1_design.md`, `docs/phase4a_training_design.md`를
-참고하세요.
+자세한 내용은 `docs/phase1_design.md`, `docs/phase4a_training_design.md`,
+`docs/phase4c_real_dataset_design.md`를 참고하세요.
 
 ## TorchScript (Phase 0 C++ 패리티)
 
@@ -756,6 +848,19 @@ python scripts/run_training_e2e.py
 CPU/CUDA parity까지 전체 흐름을 실행합니다. `--model-json`으로 다른
 `ModelSpec` JSON을 지정할 수 있습니다 (기본값:
 `examples/models/phase4_training_model.json`).
+
+## Real-Image Training E2E (Phase 4C)
+
+```bash
+python scripts/run_real_training_e2e.py
+```
+
+torchvision CIFAR-10을 사용하는 실제 이미지 학습 E2E입니다. 처음
+실행 시 `--data-root`(기본값 `artifacts/datasets/cifar10`)에 CIFAR-10을
+다운로드하므로 네트워크가 필요합니다. `--train-limit`/`--val-limit`/
+`--test-limit`(기본 256/64/128, `0` 이하면 전체 split)으로 실행 시간을
+조절할 수 있습니다. `scripts/run_training_e2e.py`(synthetic)는 이
+스크립트와 별개로 그대로 유지됩니다.
 
 ---
 
