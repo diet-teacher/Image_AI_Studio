@@ -1,15 +1,18 @@
 #!/usr/bin/env python
-"""Phase 4D 사용자 ImageFolder 데이터셋 학습 엔드투엔드 파이프라인:
+"""사용자 ImageFolder 데이터셋 학습 엔드투엔드 파이프라인 (Phase 4D에서
+신설, Phase 4E에서 학습 설정 확장):
 
     Model JSON -> ModelSpec -> build_model()
         -> 사용자가 미리 분리해 둔 train/val/test ImageFolder 폴더 로딩
         -> class_to_idx 일치 검증 (train/val/test)
         -> dataset 클래스 수 vs ModelSpec 최종 출력 shape 검증
-        -> 실제 학습 (Adam + CrossEntropyLoss, Phase 4A와 동일)
+        -> 실제 학습 (optimizer: Adam/SGD 선택, loss: CrossEntropyLoss
+           고정, scheduler: 없음/ReduceLROnPlateau, early stopping:
+           없음/patience 기반 -- Phase 4E TrainingConfig)
         -> best epoch(최소 validation loss) 추적 (Phase 4B와 동일)
-        -> training history JSON 저장
+        -> training history JSON 저장 (stopped_early 포함, Phase 4E)
         -> best epoch의 state_dict 저장
-        -> class mapping JSON 저장/재로드 확인 (Phase 4D 신규)
+        -> class mapping JSON 저장/재로드 확인 (Phase 4D)
         -> best model의 test split 최종 평가 (Phase 4C와 동일 패턴)
         -> TorchScriptExporter (Phase 0 재사용)
         -> run_torchscript.exe (Phase 0 재사용) -> C++ 추론
@@ -18,11 +21,17 @@
 Phase 4C의 scripts/run_real_training_e2e.py(CIFAR-10 직접 로딩)는 그대로
 유지한다 -- 이 스크립트는 "torchvision에 내장된 특정 dataset"이 아니라
 "사용자가 준비한 일반 이미지 폴더"를 학습하는 별도 경로다.
-train_one_epoch/evaluate/run_training/TrainingHistory/TrainingResult/
-state_dict save-load/build_transform/TorchScriptExporter/C++ 러너는 전부
-Phase 4A~4C 코드 그대로 재사용한다. 이 스크립트가 새로 하는 일은
-"사용자 ImageFolder 폴더를 검증해서 읽어오는 것"과 "class mapping을
-저장하는 것" 두 가지뿐이다.
+
+Phase 4D의 ImageFolder 로딩/dataset 검증/class mapping/TorchScript
+export/C++ 추론 경로는 그대로 재사용하고, Phase 4E에서 TrainingConfig와
+training loop(training/loop.py)만 optimizer/scheduler/early stopping을
+지원하도록 확장했다. train_one_epoch/evaluate의 기본 역할(1 epoch
+학습/평가), state_dict save-load(training/checkpoint.py),
+build_transform(training/torchvision_dataset.py), TorchScriptExporter,
+C++ 러너는 이번에도 수정 없이 그대로 재사용한다. 이 스크립트가 하는
+일은 "사용자 ImageFolder 폴더를 검증해서 읽어오는 것", "CLI로 받은
+학습 설정을 TrainingConfig로 구성하는 것", "class mapping을 저장하는
+것" 세 가지다.
 
 **Test split은 best epoch 선택이나 학습 중 어떤 판단에도 쓰이지 않는다.**
 best_state_dict가 확정된 뒤, 그 model 하나에 대해 딱 한 번만 평가한다
@@ -36,8 +45,10 @@ run_training()에는 전달되지 않는다 -- Phase 4C와 동일한 정책).
         val/<class_name>/*.jpg
         test/<class_name>/*.jpg
 
-- model_definition/*, export/*, run_and_compare.py, C++ 러너, training/loop.py
-  전부 변경 없음
+- model_definition/*, export/*, run_and_compare.py, C++ 러너 전부 변경
+  없음. training/loop.py는 Phase 4E에서 optimizer/scheduler/early
+  stopping 지원을 위해 실제로 변경되었다 (아래 CLI 옵션이 그 확장을
+  사용한다).
 - 네트워크 다운로드 없음 (사용자가 이미 준비한 로컬 폴더만 읽음).
   E2E 검증용 CIFAR-10 기반 fixture가 필요하면
   scripts/prepare_cifar10_imagefolder_fixture.py를 먼저 실행할 것.

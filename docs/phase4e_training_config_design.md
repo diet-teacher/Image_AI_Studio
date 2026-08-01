@@ -26,12 +26,21 @@ SGD dampening/nesterov, scheduler threshold/cooldown/min_lr, StepLR 등
 추가 scheduler, full checkpoint/resume, augmentation, 자동 split,
 registry/factory, GUI.
 
-`run_training()`/`TrainingConfig`/`TrainingHistory` 외의 어떤 모듈도
-수정하지 않았다 -- `checkpoint.py`(모델 가중치만 저장, optimizer/scheduler
-state는 여전히 범위 밖), `history.py`(`TrainingHistory`를 그대로
-직렬화/역직렬화하므로 코드 수정 불필요), `dataset.py`/
+`src/image_ai_studio` 아래 **production code**에서는
+`training/config.py`와 `training/loop.py`(`run_training()`/
+`TrainingConfig`/`TrainingHistory`가 정의된 두 파일)만 수정했다.
+`training/checkpoint.py`(모델 가중치만 저장, optimizer/scheduler state는
+여전히 범위 밖), `training/history.py`의 저장/로드 함수(`TrainingHistory`를
+그대로 직렬화/역직렬화하므로 코드 수정 불필요), `training/dataset.py`/
 `torchvision_dataset.py`, `model_definition/*`, `export/*`, C++ 코드,
-`scripts/run_training_e2e.py`(Phase 4A/4B 회귀 앵커) 전부 그대로다.
+`scripts/run_training_e2e.py`/`scripts/run_real_training_e2e.py`(Phase
+4A/4B/4C 회귀 앵커)는 전부 수정하지 않았다.
+
+이 범위 밖에서 실제로 변경/추가된 파일은 다음과 같다 (production
+code가 아니라 CLI/테스트/문서): `scripts/run_imagefolder_training_e2e.py`
+(새 CLI 플래그), `tests/training/test_config.py`/`test_loop.py`/
+`test_history.py`(신규 테스트), `README.md`, 그리고 이 문서
+(`docs/phase4e_training_config_design.md`) 자체.
 
 ## 2. `TrainingConfig` 신규 필드
 
@@ -280,9 +289,9 @@ call 3: lr 1.0 -> 1.0 (나쁜 epoch 2회)
 call 4: lr 1.0 -> 0.5 (나쁜 epoch 3회 > patience=2 -> 감소)
 ```
 
-즉 `patience=P`는 "첫 `step()`은 기준값으로 소비되고, 그 뒤로 개선이
-없는 `step()`이 `P+1`번째가 될 때 LR이 감소한다"는 PyTorch 자체의
-동작이다. 이 순번을
+즉 `patience=P`는 "첫 `step()`은 baseline(기준값)을 세울 뿐 LR을 바꾸지
+않고, 그 이후로 개선되지 않는(bad) epoch 수가 `P`를 초과하는 `step()`
+호출에서 LR이 감소한다"는 PyTorch 자체의 동작이다. 이 순번을
 `test_build_scheduler_reduces_lr_after_patience_bad_steps`에서
 `lr_scheduler_patience=2`로 그대로 고정했다(4번째 `step()`에서 최초로
 LR이 바뀜을 assert).
@@ -301,14 +310,19 @@ Windows 11, PyTorch 2.12.1+cu126, torchvision 0.27.1+cu126, GTX 1080에서
 * **Phase 1~3 E2E regression** (4개 예시 JSON): 전부 PASS
 * **Phase 4A/4B synthetic E2E** (`scripts/run_training_e2e.py`, 수정
   없음, 기본 설정): train loss 1.3386 -> 0.2867, best epoch 10 --
-  Phase 4D 시점 기록과 **완전히 동일**(byte-identical) -- optimizer 기본값
-  경로가 전혀 바뀌지 않았다는 직접적 증거
+  Phase 4D 시점에 기록된 것과 동일한 epoch별 train/val loss, best
+  epoch가 콘솔 출력 기준으로 재현되었다(개별 텐서/artifact 파일을
+  바이트 단위로 비교한 것은 아니다). `optimizer="adam"`(기본값)이
+  Phase 4D와 동일한 `torch.optim.Adam(model.parameters(),
+  lr=config.learning_rate)` 호출을 그대로 생성하므로(3절), 이 재현은
+  우연이 아니라 코드 경로가 실제로 바뀌지 않았다는 근거다
 * **Phase 4C CIFAR-10 E2E** (`scripts/run_real_training_e2e.py`, 수정
   없음, 기본 설정): best epoch 4, test_accuracy=0.1953 -- 마찬가지로
-  Phase 4D 시점 기록과 완전히 동일
+  Phase 4D 시점 출력과 동일한 수치가 재현되었다
 * **Phase 4D ImageFolder E2E, 기본 설정** (`--optimizer`/`--lr-scheduler`/
   `--early-stopping-patience` 전부 생략): best epoch 5,
-  test_accuracy=0.2600 -- 역시 Phase 4D 시점 기록과 완전히 동일
+  test_accuracy=0.2600 -- 역시 Phase 4D 시점 출력과 동일한 수치가
+  재현되었다
 * **Phase 4D ImageFolder E2E, 신규 설정 조합** (`--optimizer sgd
   --momentum 0.9 --lr-scheduler plateau --lr-scheduler-factor 0.5
   --lr-scheduler-patience 1 --early-stopping-patience 3`):

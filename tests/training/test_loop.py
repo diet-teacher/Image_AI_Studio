@@ -281,10 +281,18 @@ def test_build_scheduler_plateau_matches_config_factor_and_patience() -> None:
 
 
 def test_build_scheduler_reduces_lr_after_patience_bad_steps() -> None:
-    """ReduceLROnPlateau의 실제 동작을 그대로 고정한다: 첫 step()이 기준값을
-    세우고, 그 뒤로 patience번 연속 개선이 없어야(= patience+1번째 step) LR이
-    줄어든다. patience=2, 동일한 loss를 계속 넣으면 4번째 step()에서 처음
-    LR이 바뀐다 (실제로 PyTorch로 직접 실행해 확인한 호출 순번)."""
+    """ReduceLROnPlateau의 실제 동작을 그대로 고정한다: 첫 step() 호출은
+    baseline(기준값)을 세울 뿐 LR을 바꾸지 않는다. 그 이후로 개선되지
+    않는(bad) epoch 수가 patience를 초과하는 step() 호출에서 LR이
+    감소한다. patience=2, 동일한 loss를 계속 넣으면:
+
+        call 1: baseline 설정 (bad epoch 아님)
+        call 2: bad epoch 1
+        call 3: bad epoch 2
+        call 4: bad epoch 3 > patience(2) -> LR 감소
+
+    즉 4번째 step()에서 처음 LR이 바뀐다 (실제로 PyTorch로 직접 실행해
+    확인한 호출 순번)."""
     model = build_model(_mlp_classifier_spec())
     config = TrainingConfig(
         epochs=1, batch_size=8, learning_rate=1.0, lr_scheduler="plateau", lr_scheduler_factor=0.5, lr_scheduler_patience=2
@@ -362,6 +370,60 @@ def test_run_training_stops_exactly_after_patience_non_improving_epochs(
     assert history.best_val_loss == 1.0
     assert result.best_state_dict is not None
     assert len(result.best_state_dict) > 0
+
+
+def test_run_training_early_stopping_preserves_best_epoch_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """best_state_dict가 실제로 best epoch(1)의 파라미터 값을 담고 있는지
+    직접 검증한다 -- "비어있지 않다"는 것만으로는 어느 epoch의 snapshot인지
+    증명하지 못하므로, train_one_epoch을 monkeypatch해 매 epoch 파라미터
+    전체를 서로 다른 상수(epoch 번호)로 명시적으로 채운다. 이 스펙
+    (_mlp_classifier_spec)에는 BatchNorm이 없어 state_dict의 모든
+    텐서가 float32 파라미터뿐이므로 전체를 안전하게 상수로 채울 수 있다.
+
+    patience=2, val_loss 시퀀스 [1.0, 1.0, 1.0, 0.5]:
+    epoch 1 -> best, 파라미터를 전부 1.0으로 채움
+    epoch 2 -> 개선 없음, 파라미터를 전부 2.0으로 채움 (best_state_dict는 안 바뀌어야 함)
+    epoch 3 -> 개선 없음, 파라미터를 전부 3.0으로 채움 -> 중단
+    (epoch 4는 실행되지 않으므로 파라미터가 4.0이 될 일도 없다)
+
+    best_state_dict는 epoch 1에서 채운 1.0을 그대로 유지해야 한다.
+    """
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=10, batch_size=8, learning_rate=1e-2, early_stopping_patience=2)
+
+    call_count = {"value": 0}
+
+    def fake_train_one_epoch(model, loader, optimizer, device="cpu"):
+        call_count["value"] += 1
+        epoch_value = float(call_count["value"])
+        for param in model.parameters():
+            param.data.fill_(epoch_value)
+        return epoch_value  # train_loss 값 자체는 이 테스트의 관심사가 아님
+
+    fixed_val_results = iter([(1.0, 1.0), (1.0, 1.0), (1.0, 1.0), (0.5, 1.0)])
+    monkeypatch.setattr("image_ai_studio.training.loop.train_one_epoch", fake_train_one_epoch)
+    monkeypatch.setattr(
+        "image_ai_studio.training.loop.evaluate",
+        lambda model, loader, device="cpu": next(fixed_val_results),
+    )
+
+    result = run_training(model, train_loader, val_loader, config)
+    history = result.history
+
+    # 중단 시점/best epoch 자체는 기존 테스트와 동일한 계약 재확인
+    assert len(history.train_losses) == 3
+    assert history.stopped_early is True
+    assert history.best_epoch == 1
+
+    # 핵심 검증: best_state_dict가 epoch 2/3의 값(2.0/3.0)이 아니라
+    # epoch 1에서 채운 값(1.0)을 그대로 담고 있는지 확인
+    for tensor in result.best_state_dict.values():
+        assert torch.all(tensor == 1.0)
 
 
 def test_run_training_early_stopping_tie_is_not_improvement(monkeypatch: pytest.MonkeyPatch) -> None:
