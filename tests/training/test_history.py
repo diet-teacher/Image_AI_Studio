@@ -47,6 +47,7 @@ def test_history_json_uses_expected_keys_and_1_indexed_best_epoch(tmp_path: Path
         "val_accuracies",
         "best_epoch",
         "best_val_loss",
+        "stopped_early",
     }
     assert data["best_epoch"] == 2  # 1-indexed, 0이 아님
 
@@ -64,3 +65,52 @@ def test_history_with_default_none_best_fields_round_trips(tmp_path: Path) -> No
 
     restored = load_training_history(path)
     assert restored == history
+
+
+# -- Phase 4E: stopped_early ---------------------------------------------------
+
+
+def test_stopped_early_true_round_trips(tmp_path: Path) -> None:
+    history = TrainingHistory(
+        train_losses=[1.0, 0.9], val_losses=[1.0, 1.0], val_accuracies=[0.1, 0.1], stopped_early=True
+    )
+    path = tmp_path / "history.json"
+    save_training_history(history, path)
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["stopped_early"] is True
+
+    restored = load_training_history(path)
+    assert restored == history
+    assert restored.stopped_early is True
+
+
+def test_stopped_early_false_round_trips(tmp_path: Path) -> None:
+    history = _example_history()
+    assert history.stopped_early is False  # 기본값
+    path = tmp_path / "history.json"
+    save_training_history(history, path)
+
+    restored = load_training_history(path)
+    assert restored.stopped_early is False
+
+
+def test_load_training_history_defaults_stopped_early_when_key_is_missing(tmp_path: Path) -> None:
+    """Phase 4D까지 저장된 과거 형식 history.json에는 stopped_early 키가
+    없다 -- load_training_history()가 TrainingHistory(**data)로 복원하므로,
+    누락된 키는 dataclass 기본값(False)으로 자동 채워져야 한다 (하위 호환)."""
+    legacy_data = {
+        "train_losses": [1.0, 0.5],
+        "val_losses": [1.1, 0.6],
+        "val_accuracies": [0.2, 0.6],
+        "best_epoch": 2,
+        "best_val_loss": 0.6,
+        # "stopped_early" 키 없음 (Phase 4D까지의 실제 저장 형식)
+    }
+    path = tmp_path / "legacy_history.json"
+    path.write_text(json.dumps(legacy_data), encoding="utf-8")
+
+    restored = load_training_history(path)
+
+    assert restored.stopped_early is False
+    assert restored.best_epoch == 2

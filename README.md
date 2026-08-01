@@ -259,19 +259,157 @@ PASS, C++ CPU/CUDA parity PASS. 이 수치는 작은 subset/짧은 학습에서 
 
 ---
 
+## Phase 4D: 사용자 ImageFolder 데이터셋
+
+Phase 4C는 torchvision에 내장된 특정 dataset(CIFAR-10)만 연결했습니다.
+Phase 4D는 **특정 내장 dataset에 의존하지 않고, 사용자가 준비한 일반
+이미지 폴더**를 `torchvision.datasets.ImageFolder`로 읽어 같은
+파이프라인에 연결합니다:
+
+```text
+사용자 이미지 폴더 (train/val/test로 이미 분리됨)
+    -> ImageFolder (3 split)
+    -> class_to_idx 일치 검증
+    -> dataset 클래스 수 vs ModelSpec 최종 출력 shape 검증
+    -> 기존 학습 루프(변경 없음)
+    -> best epoch 추적 (변경 없음)
+    -> class mapping JSON 저장/재로드 (신규)
+    -> best model의 test split 최종 평가 (Phase 4C와 동일 패턴)
+    -> TorchScript export -> C++ LibTorch inference -> Python/C++ parity
+```
+
+요구되는 폴더 구조 (사용자가 이미 train/val/test로 분리해 둔 상태만
+지원, **자동 split은 미지원**):
+
+```text
+dataset_root/
+├─ train/
+│  ├─ cat/
+│  └─ dog/
+├─ val/
+│  ├─ cat/
+│  └─ dog/
+└─ test/
+   ├─ cat/
+   └─ dog/
+```
+
+* 클래스는 `ImageFolder`가 폴더 이름에서 자동으로 찾습니다
+  (하위 폴더 하나 = 클래스 하나).
+* `train`/`val`/`test`의 `class_to_idx`가 완전히 일치하는지 학습 시작
+  전에 검증합니다. 클래스가 하나라도 다르면(빠지거나 더 있으면) 어느
+  split에 어떤 클래스가 다른지 보여주는 에러로 즉시 실패합니다.
+* dataset이 실제로 찾은 클래스 수와 `ModelSpec` 최종 출력 shape가
+  다르면(`dataset has N classes but model output shape is (M,)`) 학습
+  시작 전에 실패합니다.
+* Phase 4C의 `build_transform()`(Resize/ToTensor/Normalize, augmentation
+  없음)을 그대로 재사용해 Train/Validation/Test 전부 동일한
+  deterministic transform을 씁니다. `ModelSpec.input_shape[0] != 3`이면
+  거부합니다 (RGB 계약, Phase 4C와 동일). 이 계약은 모델 입력 채널
+  수에 대한 것이며, 원본 이미지 파일 자체는 `ImageFolder`의 기본
+  loader가 항상 `convert("RGB")`로 읽으므로 grayscale/alpha(RGBA) 원본
+  이미지도 자동으로 3채널이 됩니다 (이 프로젝트가 구현한 기능이
+  아니라 torchvision의 기본 동작입니다).
+* class 이름/인덱스 매핑을 `artifacts/training/{model_name}_classes.json`
+  으로 저장합니다 (best model과 함께 inference에 필요한 metadata).
+
+실행:
+
+```bash
+python scripts/prepare_cifar10_imagefolder_fixture.py
+python scripts/run_imagefolder_training_e2e.py --dataset-root path/to/dataset --model-json examples/models/phase4c_cifar10_model.json
+```
+
+`prepare_cifar10_imagefolder_fixture.py`는 제품 기능이 아니라, 별도
+개인/사내 dataset 없이도 Phase 4D 경로를 검증할 수 있도록 CIFAR-10
+일부를 일반 `ImageFolder` 구조로 export하는 테스트 준비 전용
+스크립트입니다 (수동 실행 전용, pytest에서 호출되지 않음).
+
+실제로 검증됨(이 저장소에서 직접 실행 확인, CIFAR-10 10 classes,
+train=200/val=50/test=50, epochs=5): training loss 2.3903 -> 2.1509,
+best epoch 5(best val loss 2.1269), class mapping 저장/재로드 PASS,
+best model 기준 test_loss=2.1859 / test_accuracy=0.2600, TorchScript
+export PASS, C++ CPU/CUDA parity PASS. 자동 split과 augmentation은
+아직 지원하지 않습니다.
+
+설계 배경과 상세 검증 결과는 `docs/phase4d_imagefolder_design.md`를
+참고하세요.
+
+---
+
+## Phase 4E: TrainingConfig 확장 (optimizer / scheduler / early stopping)
+
+Phase 4A~4D는 optimizer=Adam, scheduler 없음, early stopping 없음으로
+전부 고정되어 있었습니다. Phase 4E는 이 학습 경로에 사용자가 지정할 수
+있는 최소한의 학습 설정을 추가합니다:
+
+* `TrainingConfig.optimizer`: `"adam"`(기본값) | `"sgd"`(`momentum` 함께 지정)
+* `TrainingConfig.lr_scheduler`: `None`(기본값, scheduler 없음) |
+  `"plateau"`(`ReduceLROnPlateau`, `lr_scheduler_factor`/
+  `lr_scheduler_patience` 지정)
+* `TrainingConfig.early_stopping_patience`: `None`(기본값, 비활성화) |
+  양의 정수 -- validation loss가 N회 연속 개선(strict `<`)되지 않으면
+  N번째 epoch를 완료한 뒤 학습을 중단합니다
+* `TrainingHistory.stopped_early: bool` -- early stopping으로 중단됐는지
+  기록 (기본값 `False`, 기존 history JSON에 이 키가 없어도 하위 호환)
+
+새 필드는 전부 기존 동작(Adam, scheduler 없음, early stopping 없음)을
+그대로 재현하는 기본값을 가지므로, 기존 `TrainingConfig(epochs=...,
+batch_size=..., learning_rate=...)` 호출은 코드 수정 없이 그대로
+동작합니다. `run_training()`의 외부 시그니처(인자/반환 타입)도 변경되지
+않았습니다.
+
+`scripts/run_imagefolder_training_e2e.py`에 `--optimizer`/`--momentum`/
+`--lr-scheduler`/`--lr-scheduler-factor`/`--lr-scheduler-patience`/
+`--early-stopping-patience` CLI 플래그를 추가했습니다 (전부 생략하면
+기존 동작 재현). 예:
+
+```bash
+python scripts/run_imagefolder_training_e2e.py \
+    --optimizer sgd --momentum 0.9 \
+    --lr-scheduler plateau --lr-scheduler-factor 0.5 --lr-scheduler-patience 1 \
+    --early-stopping-patience 3
+```
+
+`scripts/run_training_e2e.py`(Phase 4A/4B 회귀 앵커)와
+`scripts/run_real_training_e2e.py`(Phase 4C CIFAR-10)는 이번 Phase에서
+수정하지 않았습니다.
+
+실제로 검증됨(이 저장소에서 직접 실행 확인): 기본 설정으로 재실행한
+Phase 4A/4B synthetic E2E, Phase 4C CIFAR-10 E2E, Phase 4D ImageFolder
+E2E 전부 기존과 완전히 동일한 수치 재현. SGD + `ReduceLROnPlateau` +
+early stopping(patience=3) 조합으로 Phase 4D ImageFolder E2E를 실행해
+TorchScript export/C++ CPU·CUDA parity까지 PASS 확인. Early
+stopping의 정확한 중단 시점(off-by-one 경계)과 `ReduceLROnPlateau`가
+실제로 LR을 줄이는 호출 순번은 결정론적 unit test로 별도 고정했습니다.
+
+loss function 선택, Adam betas/weight decay, `"plateau"` 외 scheduler,
+full checkpoint/resume은 이번 Phase에서도 지원하지 않습니다.
+
+설계 배경과 상세 검증 결과는
+`docs/phase4e_training_config_design.md`를 참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
   직렬화)
 * `ResidualBlock` (Phase 2)
 * `Branch` Add / channel `Concat` + `Identity` skip path (Phase 3)
-* Classification 학습 (Adam + CrossEntropyLoss 고정)
+* Classification 학습, loss=CrossEntropyLoss 고정, optimizer는 Adam/SGD
+  선택 가능 (Phase 4E)
+* LR scheduler `ReduceLROnPlateau` 선택, early stopping patience 지정,
+  `TrainingHistory.stopped_early` 기록 (Phase 4E)
 * Synthetic train/validation 데이터셋 (Phase 4A/4B, 오프라인)
 * torchvision CIFAR-10 real-image 데이터셋, 공식 train split의 결정론적
   Train/Validation 재분리, 공식 test split의 최종(1회) 평가 (Phase 4C)
+* 사용자가 준비한 `ImageFolder` 폴더(train/val/test로 이미 분리된
+  구조) 학습, class_to_idx 일치 검증, dataset 클래스 수와 `ModelSpec`
+  출력 shape 일치 검증, class mapping JSON 저장 (Phase 4D)
 * Best epoch 모델 추적 + `TrainingHistory` JSON 저장
 * TorchScript 배포, C++(LibTorch) CPU/CUDA 추론
-* Python/C++ parity 검증 (Phase 0~4C 전 구간)
+* Python/C++ parity 검증 (Phase 0~4E 전 구간)
 
 ## 아직 미지원 / 향후 계획
 
@@ -279,11 +417,16 @@ PASS, C++ CPU/CUDA parity PASS. 이 수치는 작은 subset/짧은 학습에서 
 
 * augmentation (RandomCrop, RandomHorizontalFlip, ColorJitter,
   RandAugment, AutoAugment 등)
-* dataset registry/factory를 통한 일반 `ImageFolder`, Oxford-IIIT Pet
-  등 다른 dataset 연동 (torchvision 기반 CIFAR-10 하나만 실제로 연결됨 --
-  다른 dataset도 같은 transform/subset 유틸을 재사용할 수 있는 구조지만
-  통합 factory는 아직 없음)
-* optimizer/loss 선택, LR scheduler, early stopping
+* `ImageFolder` 폴더의 자동 Train/Val/Test split (train/val/test로
+  이미 분리된 구조만 지원 -- 클래스 폴더만 있는 구조를 자동으로
+  나누는 기능은 없음)
+* dataset registry/factory를 통한 통합 연동 (CIFAR-10과 `ImageFolder`가
+  각각 별도 함수로 연결되어 있고, 둘을 묶는 공통 factory/registry는
+  아직 없음), Oxford-IIIT Pet 등 다른 dataset의 실제 연동
+* class imbalance 처리, weighted sampler
+* loss function 선택 (CrossEntropyLoss 고정), Adam betas/weight decay,
+  SGD dampening/nesterov, `"plateau"` 외 LR scheduler(StepLR/
+  CosineAnnealingLR 등), scheduler threshold/cooldown/min_lr
 * optimizer state/epoch가 포함된 full checkpoint, 중단된 학습 재개(resume)
 * mixed precision, multi-GPU/distributed training
 * 일반 DAG(`GraphSpec`/`NodeSpec`/`EdgeSpec`), long skip connection,
@@ -809,17 +952,19 @@ pytest
 ```
 
 `tests/model_definition/`(Phase 1~3)과 `tests/training/`(Phase
-4A/4B/4C)를 포함한 전체 unit test입니다. 전부 CPU에서 동작하며 빌드된
-C++ 러너가 필요 없고, 네트워크 접근도 없습니다 (CIFAR-10 다운로드는
-`pytest`가 아니라 아래 Real-Image Training E2E에서만 발생). Training
-테스트만 따로 돌리려면:
+4A/4B/4C/4D/4E)를 포함한 전체 unit test입니다. 전부 CPU에서 동작하며
+빌드된 C++ 러너가 필요 없고, 네트워크 접근도 없습니다 (CIFAR-10
+다운로드는 `pytest`가 아니라 아래 Real-Image Training E2E에서만
+발생하고, `ImageFolder` 관련 테스트는 `tmp_path` + PIL로 직접 만든
+픽스처만 사용합니다). Training 테스트만 따로 돌리려면:
 
 ```bash
 pytest tests/training/
 ```
 
 자세한 내용은 `docs/phase1_design.md`, `docs/phase4a_training_design.md`,
-`docs/phase4c_real_dataset_design.md`를 참고하세요.
+`docs/phase4c_real_dataset_design.md`, `docs/phase4d_imagefolder_design.md`,
+`docs/phase4e_training_config_design.md`를 참고하세요.
 
 ## TorchScript (Phase 0 C++ 패리티)
 
@@ -861,6 +1006,29 @@ torchvision CIFAR-10을 사용하는 실제 이미지 학습 E2E입니다. 처�
 `--test-limit`(기본 256/64/128, `0` 이하면 전체 split)으로 실행 시간을
 조절할 수 있습니다. `scripts/run_training_e2e.py`(synthetic)는 이
 스크립트와 별개로 그대로 유지됩니다.
+
+## ImageFolder Training E2E (Phase 4D)
+
+```bash
+python scripts/prepare_cifar10_imagefolder_fixture.py
+python scripts/run_imagefolder_training_e2e.py --dataset-root path/to/dataset --model-json examples/models/phase4c_cifar10_model.json
+```
+
+사용자가 준비한 `ImageFolder` 폴더(`train`/`val`/`test`로 이미 분리된
+구조)를 학습하는 E2E입니다. `--dataset-root`를 생략하면
+`prepare_cifar10_imagefolder_fixture.py`가 만드는
+`artifacts/datasets/cifar10_imagefolder`를 기본값으로 사용합니다.
+`prepare_cifar10_imagefolder_fixture.py`는 제품 기능이 아니라, CIFAR-10
+일부를 `ImageFolder` 구조로 export해 이 E2E를 별도 dataset 없이 검증할
+수 있게 해주는 테스트 준비 전용 스크립트입니다 (pytest에서 호출되지
+않음).
+
+Phase 4E부터 `--optimizer`/`--momentum`/`--lr-scheduler`/
+`--lr-scheduler-factor`/`--lr-scheduler-patience`/
+`--early-stopping-patience`로 학습 설정을 조절할 수 있습니다 (전부
+생략하면 Adam/scheduler 없음/early stopping 없음으로 기존과 동일하게
+동작). 자세한 내용은 `docs/phase4e_training_config_design.md`를
+참고하세요.
 
 ---
 
