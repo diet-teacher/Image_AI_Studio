@@ -391,6 +391,72 @@ full checkpoint/resume은 이번 Phase에서도 지원하지 않습니다.
 
 ---
 
+## Phase 4F: Full Checkpoint + Resume
+
+Phase 4A~4E는 `save_state_dict()`/`load_state_dict()`로 모델 가중치만
+저장/재로드할 수 있었습니다 -- optimizer momentum, LR scheduler 진행
+상태, epoch 카운터, `TrainingHistory`, early stopping 카운터는
+`run_training()` 호출이 끝나면 사라졌습니다. Phase 4F는 이 상태를 전부
+저장해 **중단된 학습을 이어서(resume) 실행**할 수 있게 합니다.
+
+핵심 계약은 "optimizer state를 저장하는가"가 아니라 "재개한 학습이
+중단 없이 연속 실행한 학습과 어디까지 같은가"입니다:
+
+* epoch 경계에서만 checkpoint 저장 가능 (`run_training()` 호출이
+  끝난 뒤 caller가 저장 -- 매 epoch 자동 저장/callback 없음)
+* `TrainingConfig.epochs`는 resume 여부와 무관하게 "이번 호출에서
+  추가로 실행할 epoch 수"를 뜻합니다. completed epoch 수는 별도
+  필드가 아니라 `len(history.train_losses)`로 계산합니다
+* optimizer/learning_rate/momentum/lr_scheduler/lr_scheduler_factor/
+  lr_scheduler_patience/batch_size는 resume 시 checkpoint와 반드시
+  일치해야 합니다 (`optimizer.load_state_dict()`가 저장된 param
+  group 값을 그대로 복원하므로, 다른 값을 줘도 조용히 무시됩니다).
+  `epochs`/`early_stopping_patience`는 자유롭게 바꿀 수 있습니다.
+  이 검증은 caller 관례가 아니라 `run_training()`이 `resume_state`를
+  받을 때 항상 스스로 강제하는 core API 계약입니다
+* checkpoint **파일 자체**는 `stopped_early=True`여도
+  `load_training_checkpoint()`로 정상 조회/가중치 추출이 가능합니다 --
+  거부되는 것은 **resume 실행**뿐입니다(early stopping이 이미 학습
+  종료를 결정한 상태이므로). 그 가중치로 새로 학습하려면:
+  ```python
+  payload = load_training_checkpoint(path)
+  model.load_state_dict(payload["best_state_dict"])  # nn.Module.load_state_dict()
+  ```
+  로 가중치를 적용한 뒤 새 `TrainingConfig`로 학습을 시작하세요
+  (`training.checkpoint.load_state_dict(model, path)` helper는 파일
+  경로를 받는 별개의 함수이므로 혼동하지 마세요)
+* DataLoader shuffle generator state와 CPU RNG state를 함께 복원해야
+  exact resume이 됩니다 -- 이 둘은 서로 다른 상태입니다(전자는
+  로컬 `torch.Generator`, 후자는 `nn.Dropout`이 쓰는 전역 RNG)
+* CUDA RNG state, batch-level(worker/sampler) resume은 지원하지
+  않습니다 -- 학습이 CPU 전용으로 고정되어 있고(`device="cpu"`),
+  `num_workers=0`이라 애초에 필요하지 않습니다
+
+실행:
+
+```bash
+python scripts/run_resume_training_e2e.py
+```
+
+이 스크립트는 synthetic dataset과 Dropout이 포함된 기존 모델
+(`examples/models/phase4_training_model.json`)로 "연속 5 epoch 실행"과
+"3 epoch 실행 + checkpoint 저장/로드 + 2 epoch resume"을 비교합니다.
+TorchScript export/C++ parity는 다시 수행하지 않습니다(다른 E2E가 이미
+검증). 기존 3개 E2E 스크립트는 이번 Phase에서도 수정하지 않았습니다.
+
+실제로 검증됨(이 저장소에서 직접 실행 확인): model parameters,
+optimizer state, scheduler state, `TrainingHistory`(train_losses/
+val_losses/val_accuracies), `best_state_dict`, `best_epoch`,
+`best_val_loss`, `epochs_without_improvement` **10개 항목 전부** 연속
+실행과 resume 실행이 정확히 일치(`torch.equal`/정확한 `==`)함을
+확인했습니다. 기존 Phase 4A/4B/4C/4D E2E도 기본 설정으로 재실행해
+기존과 완전히 동일한 수치가 재현됨을 확인했습니다(회귀 없음).
+
+설계 배경과 상세 검증 결과는
+`docs/phase4f_checkpoint_resume_design.md`를 참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
@@ -408,8 +474,14 @@ full checkpoint/resume은 이번 Phase에서도 지원하지 않습니다.
   구조) 학습, class_to_idx 일치 검증, dataset 클래스 수와 `ModelSpec`
   출력 shape 일치 검증, class mapping JSON 저장 (Phase 4D)
 * Best epoch 모델 추적 + `TrainingHistory` JSON 저장
+* Full training checkpoint(model/optimizer/scheduler state, history,
+  best model, early stopping 카운터, DataLoader generator/CPU RNG
+  state) 저장과 epoch 경계 resume, CPU 학습 경로에서 연속 실행과
+  tensor-level exact equality 목표 (Phase 4F)
 * TorchScript 배포, C++(LibTorch) CPU/CUDA 추론
-* Python/C++ parity 검증 (Phase 0~4E 전 구간)
+* Python/C++ parity 검증 (Phase 0~4E 배포 경로; Phase 4F는 export/parity
+  코드를 변경하지 않았고, 기존 parity E2E를 재실행해 회귀 없음을 확인함
+  -- Phase 4F의 resume 기능 자체는 C++에서 실행/검증되지 않음)
 
 ## 아직 미지원 / 향후 계획
 
@@ -427,7 +499,11 @@ full checkpoint/resume은 이번 Phase에서도 지원하지 않습니다.
 * loss function 선택 (CrossEntropyLoss 고정), Adam betas/weight decay,
   SGD dampening/nesterov, `"plateau"` 외 LR scheduler(StepLR/
   CosineAnnealingLR 등), scheduler threshold/cooldown/min_lr
-* optimizer state/epoch가 포함된 full checkpoint, 중단된 학습 재개(resume)
+* resume 시 config 자유 변경 (optimizer/learning_rate/momentum/
+  lr_scheduler/lr_scheduler_factor/lr_scheduler_patience/batch_size는
+  checkpoint와 반드시 일치해야 함), CUDA RNG state 저장(학습이 CPU
+  전용으로 고정되어 있어 검증 불가), batch-level(worker/sampler
+  iterator) resume, epoch 중간/자동 checkpoint, distributed checkpoint
 * mixed precision, multi-GPU/distributed training
 * 일반 DAG(`GraphSpec`/`NodeSpec`/`EdgeSpec`), long skip connection,
   중첩 `BranchSpec`
@@ -952,7 +1028,7 @@ pytest
 ```
 
 `tests/model_definition/`(Phase 1~3)과 `tests/training/`(Phase
-4A/4B/4C/4D/4E)를 포함한 전체 unit test입니다. 전부 CPU에서 동작하며
+4A/4B/4C/4D/4E/4F)를 포함한 전체 unit test입니다. 전부 CPU에서 동작하며
 빌드된 C++ 러너가 필요 없고, 네트워크 접근도 없습니다 (CIFAR-10
 다운로드는 `pytest`가 아니라 아래 Real-Image Training E2E에서만
 발생하고, `ImageFolder` 관련 테스트는 `tmp_path` + PIL로 직접 만든
@@ -964,7 +1040,8 @@ pytest tests/training/
 
 자세한 내용은 `docs/phase1_design.md`, `docs/phase4a_training_design.md`,
 `docs/phase4c_real_dataset_design.md`, `docs/phase4d_imagefolder_design.md`,
-`docs/phase4e_training_config_design.md`를 참고하세요.
+`docs/phase4e_training_config_design.md`, `docs/phase4f_checkpoint_resume_design.md`를
+참고하세요.
 
 ## TorchScript (Phase 0 C++ 패리티)
 
@@ -1028,6 +1105,21 @@ Phase 4E부터 `--optimizer`/`--momentum`/`--lr-scheduler`/
 `--early-stopping-patience`로 학습 설정을 조절할 수 있습니다 (전부
 생략하면 Adam/scheduler 없음/early stopping 없음으로 기존과 동일하게
 동작). 자세한 내용은 `docs/phase4e_training_config_design.md`를
+참고하세요.
+
+## Resume Training E2E (Phase 4F)
+
+```bash
+python scripts/run_resume_training_e2e.py
+```
+
+연속 5 epoch 실행과, 3 epoch 실행 후 full checkpoint 저장/로드를 거쳐
+2 epoch를 resume한 실행을 비교해 model/optimizer/scheduler state,
+history, best model, early stopping 카운터가 전부 정확히 일치하는지
+증명하는 전용 E2E입니다. synthetic dataset과 Dropout이 포함된 기존
+모델(`examples/models/phase4_training_model.json`)을 사용하며,
+TorchScript export/C++ parity는 다시 수행하지 않습니다(다른 E2E가 이미
+검증). 자세한 내용은 `docs/phase4f_checkpoint_resume_design.md`를
 참고하세요.
 
 ---

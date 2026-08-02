@@ -10,6 +10,27 @@ from dataclasses import dataclass
 OPTIMIZER_CHOICES = ("adam", "sgd")
 LR_SCHEDULER_CHOICES = ("plateau",)
 
+# Phase 4F: resume 시 checkpoint와 반드시 일치해야 하는 필드.
+# optimizer.load_state_dict()/scheduler.load_state_dict()가 다른 종류의
+# optimizer/scheduler 사이에서 안전하게 동작하지 않으므로(값이 잘못
+# 섞이거나 저장된 param group 값이 새 값을 조용히 덮어쓰므로), 그 구조를
+# 결정하는 필드들을 여기서 명시적으로 관리한다. epochs/early_stopping_patience는
+# 의도적으로 제외 -- resume마다 자유롭게 바꿀 수 있다.
+#
+# 이 helper는 config.py에 둔다 -- loop.py(run_training())와 checkpoint.py
+# (checkpoint 파일 조회) 둘 다 이 검증이 필요한데, config.py는 이미 둘 중
+# 어느 쪽도 import하지 않는 가장 아래 계층이라 여기 두면 순환 의존 없이
+# 양쪽에서 그대로 가져다 쓸 수 있다.
+RESUME_CONFIG_FIELDS = (
+    "optimizer",
+    "learning_rate",
+    "momentum",
+    "lr_scheduler",
+    "lr_scheduler_factor",
+    "lr_scheduler_patience",
+    "batch_size",
+)
+
 
 class TrainingConfigError(ValueError):
     """TrainingConfig 값이 잘못됐을 때 발생."""
@@ -79,3 +100,46 @@ class TrainingConfig:
 
         if self.early_stopping_patience is not None:
             _require_positive_int("early_stopping_patience", self.early_stopping_patience)
+
+
+def require_compatible_resume_config(checkpoint_config: dict, resume_config: TrainingConfig) -> None:
+    """resume에 사용할 TrainingConfig가 checkpoint 저장 당시의 config와
+    optimizer/scheduler 구조 관련 필드(RESUME_CONFIG_FIELDS)에서 일치하는지
+    확인한다.
+
+    PyTorch의 optimizer.load_state_dict()/scheduler.load_state_dict()는
+    다른 종류의 optimizer/scheduler 사이에서 안전하게 동작하지 않고,
+    저장된 param group 값(learning_rate/momentum 등)을 그대로 복원해
+    새 config 값을 조용히 덮어쓰므로, 여기서 먼저 명확한 에러로 걸러낸다.
+    batch_size가 바뀌면 같은 sample 순서라도 batch 구성과 optimizer step
+    수가 달라지므로 이것도 강제 일치 대상이다. epochs/early_stopping_patience
+    는 의도적으로 비교 대상에서 제외한다 -- resume마다 자유롭게 바꿀 수 있다.
+
+    이 함수는 `run_training()`이 resume_state를 받을 때 항상 스스로
+    호출한다 (loop.py) -- caller가 별도로 이 함수를 부르는 것은 조기
+    검증(fail fast)을 위한 선택 사항일 뿐, config 호환성이 실제로
+    강제되는 지점은 이 함수를 항상 거치는 `run_training()` 내부다.
+
+    `checkpoint_config`가 dict가 아닌 경우(예: TrainingResumeState를
+    파일 경유 없이 직접 만들면서 training_config=None을 넘긴 경우)를
+    가장 먼저 검사한다 -- 그러지 않으면 아래 `in checkpoint_config`에서
+    TypeError가 나서, 이 함수가 항상 명확한 ValueError만 낸다는 계약이
+    깨진다.
+    """
+    if not isinstance(checkpoint_config, dict):
+        raise ValueError(
+            f"checkpoint training_config must be a dict, got {type(checkpoint_config).__name__}"
+        )
+
+    missing = [name for name in RESUME_CONFIG_FIELDS if name not in checkpoint_config]
+    if missing:
+        raise ValueError(f"checkpoint training_config is missing required field(s): {missing}")
+
+    for field_name in RESUME_CONFIG_FIELDS:
+        saved_value = checkpoint_config[field_name]
+        new_value = getattr(resume_config, field_name)
+        if saved_value != new_value:
+            raise ValueError(
+                f"cannot resume: checkpoint was saved with {field_name}={saved_value!r} "
+                f"but resume config uses {field_name}={new_value!r}"
+            )

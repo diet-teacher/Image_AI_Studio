@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import pytest
 
-from image_ai_studio.training.config import TrainingConfig, TrainingConfigError
+from image_ai_studio.training.config import (
+    TrainingConfig,
+    TrainingConfigError,
+    require_compatible_resume_config,
+)
 
 
 @pytest.mark.parametrize("epochs", [0, -1])
@@ -139,3 +143,14 @@ def test_accepts_positive_early_stopping_patience() -> None:
 def test_rejects_non_positive_early_stopping_patience(patience: int) -> None:
     with pytest.raises(TrainingConfigError, match="early_stopping_patience"):
         TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, early_stopping_patience=patience)
+
+
+# -- Phase 4F: require_compatible_resume_config -------------------------------
+
+
+def test_require_compatible_resume_config_rejects_non_dict_checkpoint_config() -> None:
+    """checkpoint_config가 dict가 아니면(예: TrainingResumeState를 파일
+    경유 없이 직접 만들면서 training_config=None을 넘긴 경우) TypeError가
+    아니라 명확한 ValueError를 내야 한다."""
+    with pytest.raises(ValueError, match="training_config must be a dict"):
+        require_compatible_resume_config(None, TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3))

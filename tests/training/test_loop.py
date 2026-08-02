@@ -7,18 +7,20 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import asdict
 
 import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from image_ai_studio.model_definition.builder import build_model
-from image_ai_studio.model_definition.specs import FlattenSpec, LinearSpec, ModelSpec, ReLUSpec
+from image_ai_studio.model_definition.specs import DropoutSpec, FlattenSpec, LinearSpec, ModelSpec, ReLUSpec
 from image_ai_studio.training.config import TrainingConfig
 from image_ai_studio.training.dataset import make_train_val_datasets
 from image_ai_studio.training.loop import (
     TrainingHistory,
     TrainingResult,
+    TrainingResumeState,
     _build_optimizer,
     _build_scheduler,
     evaluate,
@@ -472,3 +474,447 @@ def test_run_training_early_stopping_patience_one_stops_after_first_non_improvem
 
     assert len(result.history.train_losses) == 2
     assert result.history.stopped_early is True
+
+
+# -- Phase 4F: resume ----------------------------------------------------------
+
+
+def _dropout_mlp_classifier_spec() -> ModelSpec:
+    """Dropout이 포함된 스펙. Dropout은 DataLoader shuffle generator가 아니라
+    전역 CPU RNG를 쓰므로(직접 실행해 확인, docs/phase4f 참고), exact
+    resume 테스트에서 CPU RNG state 복원이 실제로 필요함을 증명하는 데
+    쓴다."""
+    return ModelSpec(
+        name="dropout_mlp_classifier",
+        input_shape=INPUT_SHAPE,
+        layers=[
+            FlattenSpec(),
+            LinearSpec(out_features=16),
+            ReLUSpec(),
+            DropoutSpec(p=0.3),
+            LinearSpec(out_features=NUM_CLASSES),
+        ],
+    )
+
+
+def _assert_deep_equal(a: object, b: object, path: str = "value") -> None:
+    """optimizer/scheduler state_dict처럼 텐서와 스칼라가 섞인 중첩
+    dict/list를 재귀적으로 정확히 비교하는 테스트 전용 헬퍼."""
+    if isinstance(a, torch.Tensor):
+        assert torch.equal(a, b), f"tensor mismatch at {path}"
+    elif isinstance(a, dict):
+        assert a.keys() == b.keys(), f"dict keys mismatch at {path}: {a.keys()} != {b.keys()}"
+        for key in a:
+            _assert_deep_equal(a[key], b[key], f"{path}.{key}")
+    elif isinstance(a, (list, tuple)):
+        assert len(a) == len(b), f"length mismatch at {path}"
+        for index, (x, y) in enumerate(zip(a, b)):
+            _assert_deep_equal(x, y, f"{path}[{index}]")
+    else:
+        assert a == b, f"value mismatch at {path}: {a!r} != {b!r}"
+
+
+def _make_resume_state(result: TrainingResult, config: TrainingConfig) -> TrainingResumeState:
+    """config는 result를 만들어 낸 바로 그 TrainingConfig여야 한다 --
+    training_config가 채워져 있어야 run_training()의 core config
+    호환성 검증(require_compatible_resume_config)을 통과한다."""
+    return TrainingResumeState(
+        optimizer_state_dict=result.optimizer_state_dict,
+        scheduler_state_dict=result.scheduler_state_dict,
+        history=result.history,
+        epochs_without_improvement=result.epochs_without_improvement,
+        best_state_dict=result.best_state_dict,
+        training_config=asdict(config),
+    )
+
+
+def test_run_training_resume_appends_history_after_prior_epochs() -> None:
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    first_config = TrainingConfig(epochs=3, batch_size=8, learning_rate=1e-2)
+    first = run_training(model, train_loader, val_loader, first_config)
+
+    second = run_training(
+        model, train_loader, val_loader,
+        TrainingConfig(epochs=2, batch_size=8, learning_rate=1e-2),
+        resume_state=_make_resume_state(first, first_config),
+    )
+
+    assert len(second.history.train_losses) == 5
+    assert second.history.train_losses[:3] == first.history.train_losses
+    assert second.history.val_losses[:3] == first.history.val_losses
+    assert second.history.val_accuracies[:3] == first.history.val_accuracies
+
+
+def test_run_training_resume_records_best_epoch_using_absolute_epoch_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """completed_epochs=3에서 resume 후 첫 epoch(절대 번호 4)에서 새로운
+    best가 나오면 best_epoch는 4여야 한다 -- 1이 되면 안 된다(off-by-reset
+    방지)."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+
+    first_val_results = iter([(1.0, 1.0), (0.9, 1.0), (0.8, 1.0)])
+    monkeypatch.setattr(
+        "image_ai_studio.training.loop.evaluate",
+        lambda model, loader, device="cpu": next(first_val_results),
+    )
+    first_config = TrainingConfig(epochs=3, batch_size=8, learning_rate=1e-2)
+    first = run_training(model, train_loader, val_loader, first_config)
+    assert first.history.best_epoch == 3
+
+    second_val_results = iter([(0.5, 1.0), (0.99, 1.0)])
+    monkeypatch.setattr(
+        "image_ai_studio.training.loop.evaluate",
+        lambda model, loader, device="cpu": next(second_val_results),
+    )
+    second = run_training(
+        model, train_loader, val_loader,
+        TrainingConfig(epochs=2, batch_size=8, learning_rate=1e-2),
+        resume_state=_make_resume_state(first, first_config),
+    )
+
+    assert len(second.history.train_losses) == 5
+    assert second.history.best_epoch == 4
+    assert second.history.best_val_loss == 0.5
+
+
+def test_run_training_resume_preserves_best_state_dict_when_no_new_best(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """resume 이후 epoch들이 전부 이전 best보다 개선되지 않으면,
+    best_state_dict는 resume 이전 값(과거 best epoch의 snapshot)을 그대로
+    유지해야 한다."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+
+    first_val_results = iter([(1.0, 1.0), (0.5, 1.0)])
+    monkeypatch.setattr(
+        "image_ai_studio.training.loop.evaluate",
+        lambda model, loader, device="cpu": next(first_val_results),
+    )
+    first_config = TrainingConfig(epochs=2, batch_size=8, learning_rate=1e-2)
+    first = run_training(model, train_loader, val_loader, first_config)
+    first_best_snapshot = {name: tensor.clone() for name, tensor in first.best_state_dict.items()}
+
+    second_val_results = iter([(0.9, 1.0), (0.8, 1.0)])  # 둘 다 0.5보다 나쁨 -> 개선 없음
+    monkeypatch.setattr(
+        "image_ai_studio.training.loop.evaluate",
+        lambda model, loader, device="cpu": next(second_val_results),
+    )
+    second = run_training(
+        model, train_loader, val_loader,
+        TrainingConfig(epochs=2, batch_size=8, learning_rate=1e-2),
+        resume_state=_make_resume_state(first, first_config),
+    )
+
+    assert second.history.best_epoch == 2  # resume 이전 epoch 그대로
+    assert second.history.best_val_loss == 0.5
+    for name, tensor in second.best_state_dict.items():
+        assert torch.equal(tensor, first_best_snapshot[name])
+
+
+def test_run_training_resume_restores_early_stopping_counter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """checkpoint 시점에 이미 patience-1만큼 카운트된 상태로 resume하면,
+    resume 후 단 1번만 개선에 실패해도 즉시 중단돼야 한다 (카운터가
+    0부터 다시 시작하면 안 됨)."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+
+    # epoch1=best(1.0), epoch2=개선없음(카운터1), epoch3=개선없음(카운터2) -- early_stopping_patience=3이라 아직 중단 안 됨
+    first_val_results = iter([(1.0, 1.0), (1.0, 1.0), (1.0, 1.0)])
+    monkeypatch.setattr(
+        "image_ai_studio.training.loop.evaluate",
+        lambda model, loader, device="cpu": next(first_val_results),
+    )
+    config = TrainingConfig(epochs=3, batch_size=8, learning_rate=1e-2, early_stopping_patience=3)
+    first = run_training(model, train_loader, val_loader, config)
+    assert first.history.stopped_early is False
+    assert first.epochs_without_improvement == 2
+
+    # resume 후 1 epoch만 더 개선 실패하면 카운터가 3 == patience가 되어 즉시 중단돼야 함
+    second_val_results = iter([(1.0, 1.0)])
+    monkeypatch.setattr(
+        "image_ai_studio.training.loop.evaluate",
+        lambda model, loader, device="cpu": next(second_val_results),
+    )
+    second = run_training(
+        model, train_loader, val_loader, config, resume_state=_make_resume_state(first, config)
+    )
+
+    assert len(second.history.train_losses) == 4
+    assert second.history.stopped_early is True
+
+
+def test_run_training_resume_does_not_mutate_resume_state_history() -> None:
+    """resume_state.history 원본 객체는 run_training() 호출로 변형되면
+    안 된다 (caller가 들고 있는 checkpoint payload/TrainingResumeState를
+    나중에 다시 쓸 수 있어야 하므로)."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    first_config = TrainingConfig(epochs=3, batch_size=8, learning_rate=1e-2)
+    first = run_training(model, train_loader, val_loader, first_config)
+    resume_state = _make_resume_state(first, first_config)
+
+    original_length = len(resume_state.history.train_losses)
+    original_losses = list(resume_state.history.train_losses)
+
+    run_training(
+        model, train_loader, val_loader,
+        TrainingConfig(epochs=2, batch_size=8, learning_rate=1e-2),
+        resume_state=resume_state,
+    )
+
+    assert len(resume_state.history.train_losses) == original_length
+    assert resume_state.history.train_losses == original_losses
+
+
+def test_training_resume_state_rejects_stopped_early_history() -> None:
+    stopped_history = TrainingHistory(
+        train_losses=[1.0], val_losses=[1.0], val_accuracies=[0.5],
+        best_epoch=1, best_val_loss=1.0, stopped_early=True,
+    )
+    with pytest.raises(ValueError, match="stopped_early"):
+        TrainingResumeState(
+            optimizer_state_dict={}, scheduler_state_dict=None,
+            history=stopped_history, epochs_without_improvement=0, best_state_dict={},
+            training_config=asdict(TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)),
+        )
+
+
+def test_training_resume_state_rejects_mismatched_history_lengths() -> None:
+    bad_history = TrainingHistory(
+        train_losses=[1.0, 0.9], val_losses=[1.0], val_accuracies=[0.5, 0.6],
+        best_epoch=1, best_val_loss=1.0,
+    )
+    with pytest.raises(ValueError, match="equal length"):
+        TrainingResumeState(
+            optimizer_state_dict={}, scheduler_state_dict=None,
+            history=bad_history, epochs_without_improvement=0, best_state_dict={},
+            training_config=asdict(TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)),
+        )
+
+
+def test_training_resume_state_rejects_empty_history() -> None:
+    empty_history = TrainingHistory(train_losses=[], val_losses=[], val_accuracies=[])
+    with pytest.raises(ValueError, match="must not be empty"):
+        TrainingResumeState(
+            optimizer_state_dict={}, scheduler_state_dict=None,
+            history=empty_history, epochs_without_improvement=0, best_state_dict={},
+            training_config=asdict(TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)),
+        )
+
+
+@pytest.mark.parametrize("value", [None, "2", -1, True])
+def test_training_resume_state_rejects_invalid_epochs_without_improvement(value: object) -> None:
+    """int가 아니거나(None/문자열/bool) 음수면 TypeError가 아니라 명확한
+    ValueError여야 한다. bool은 Python에서 int의 서브클래스라 명시적으로
+    제외한다(TrainingConfig의 기존 검증 스타일과 동일)."""
+    valid_history = TrainingHistory(
+        train_losses=[1.0], val_losses=[1.0], val_accuracies=[0.5], best_epoch=1, best_val_loss=1.0
+    )
+    with pytest.raises(ValueError, match="epochs_without_improvement must be a non-negative integer"):
+        TrainingResumeState(
+            optimizer_state_dict={}, scheduler_state_dict=None,
+            history=valid_history, epochs_without_improvement=value, best_state_dict={},
+            training_config=asdict(TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)),
+        )
+
+
+def test_run_training_resume_rejects_internally_inconsistent_scheduler_state() -> None:
+    """resume_state.training_config는 scheduler가 켜진 것으로 되어 있고
+    새 config도 그와 완전히 일치하는데(= require_compatible_resume_config
+    통과), resume_state.scheduler_state_dict 자체가 없으면(내부적으로
+    손상된 resume_state) run_training()이 이 불일치를 별도로 잡아야
+    한다 -- config 비교만으로는 이 손상을 발견할 수 없다."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    scheduler_config = TrainingConfig(epochs=2, batch_size=8, learning_rate=1e-2, lr_scheduler="plateau")
+    first = run_training(model, train_loader, val_loader, scheduler_config)
+    resume_state = _make_resume_state(first, scheduler_config)
+    resume_state.scheduler_state_dict = None  # 저장/조립 과정에서 손상된 상황을 흉내
+
+    with pytest.raises(ValueError, match="scheduler_state_dict"):
+        run_training(model, train_loader, val_loader, scheduler_config, resume_state=resume_state)
+
+
+def test_run_training_resume_rejects_incompatible_saved_config() -> None:
+    """caller가 require_compatible_resume_config()를 별도로 호출하지 않고
+    바로 run_training()을 호출해도, config가 checkpoint 저장 당시와
+    다르면 core API 자체가 거부해야 한다 (caller helper 호출에 의존하지
+    않음을 증명)."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    first_config = TrainingConfig(epochs=2, batch_size=8, learning_rate=1e-2)
+    first = run_training(model, train_loader, val_loader, first_config)
+    resume_state = _make_resume_state(first, first_config)
+
+    incompatible_config = TrainingConfig(epochs=2, batch_size=8, learning_rate=1e-4)  # learning_rate만 다름
+    with pytest.raises(ValueError, match="learning_rate"):
+        run_training(model, train_loader, val_loader, incompatible_config, resume_state=resume_state)
+
+
+def test_run_training_resume_matches_continuous_run_exactly() -> None:
+    """핵심 계약: 연속 5 epoch 실행과, 3 epoch 실행 후 checkpoint 저장을
+    흉내낸 뒤 2 epoch를 resume한 결과가 다음 전부에서 정확히 일치해야
+    한다 -- model parameters, optimizer state, scheduler state, history,
+    best_state_dict, best_epoch, best_val_loss, epochs_without_improvement.
+
+    Dropout이 포함된 모델을 쓴다 -- Dropout은 DataLoader의 shuffle
+    generator가 아니라 전역 CPU RNG에 의존하므로(직접 실행해 확인),
+    이 테스트가 실제로 CPU RNG state 복원 없이는 통과할 수 없다는 것을
+    (train_one_epoch 안에서 model.train() 상태로 forward가 일어나므로)
+    구조적으로 검증한다.
+    """
+    seed = 20260801
+    spec = _dropout_mlp_classifier_spec()
+
+    def make_loaders() -> tuple[DataLoader, DataLoader, torch.Generator]:
+        train_dataset, val_dataset = make_train_val_datasets(
+            spec.input_shape, NUM_CLASSES, seed=seed, train_size=32, val_size=16
+        )
+        generator = torch.Generator().manual_seed(seed)
+        train_loader = DataLoader(
+            train_dataset, batch_size=8, shuffle=True, generator=generator, drop_last=True
+        )
+        val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
+        return train_loader, val_loader, generator
+
+    config_kwargs = dict(
+        batch_size=8, learning_rate=1e-2, optimizer="sgd", momentum=0.9,
+        lr_scheduler="plateau", lr_scheduler_factor=0.5, lr_scheduler_patience=1,
+    )
+
+    # (a) 연속 5 epoch
+    torch.manual_seed(seed)
+    model_a = build_model(spec)
+    train_loader_a, val_loader_a, _ = make_loaders()
+    torch.manual_seed(seed)
+    result_a = run_training(model_a, train_loader_a, val_loader_a, TrainingConfig(epochs=5, **config_kwargs))
+
+    # (b) 3 epoch 실행
+    torch.manual_seed(seed)
+    model_b = build_model(spec)
+    train_loader_b, val_loader_b, generator_b = make_loaders()
+    torch.manual_seed(seed)
+    first_config = TrainingConfig(epochs=3, **config_kwargs)
+    result_b1 = run_training(model_b, train_loader_b, val_loader_b, first_config)
+
+    # checkpoint 시점 상태를 caller가 직접 채취 (run_training()이 파일을 쓰지 않으므로)
+    loader_generator_state = generator_b.get_state().clone()
+    cpu_rng_state = torch.get_rng_state().clone()
+    resume_state = _make_resume_state(result_b1, first_config)
+
+    # "새 프로세스"를 흉내: 새 model/DataLoader/generator를 만들고 저장된 상태를 복원
+    model_b2 = build_model(spec)
+    model_b2.load_state_dict(model_b.state_dict())  # 3 epoch 완료 시점의 "현재" model
+    train_dataset2, val_dataset2 = make_train_val_datasets(
+        spec.input_shape, NUM_CLASSES, seed=seed, train_size=32, val_size=16
+    )
+    restored_generator = torch.Generator()
+    restored_generator.set_state(loader_generator_state)
+    train_loader_b2 = DataLoader(
+        train_dataset2, batch_size=8, shuffle=True, generator=restored_generator, drop_last=True
+    )
+    val_loader_b2 = DataLoader(val_dataset2, batch_size=8, shuffle=False)
+    torch.set_rng_state(cpu_rng_state)
+
+    result_b2 = run_training(
+        model_b2, train_loader_b2, val_loader_b2, TrainingConfig(epochs=2, **config_kwargs),
+        resume_state=resume_state,
+    )
+
+    assert result_b2.history.train_losses == result_a.history.train_losses
+    assert result_b2.history.val_losses == result_a.history.val_losses
+    assert result_b2.history.val_accuracies == result_a.history.val_accuracies
+    assert result_b2.history.best_epoch == result_a.history.best_epoch
+    assert result_b2.history.best_val_loss == result_a.history.best_val_loss
+    assert result_b2.epochs_without_improvement == result_a.epochs_without_improvement
+
+    for name, tensor in model_a.state_dict().items():
+        assert torch.equal(tensor, model_b2.state_dict()[name])
+    for name, tensor in result_a.best_state_dict.items():
+        assert torch.equal(tensor, result_b2.best_state_dict[name])
+
+    _assert_deep_equal(result_a.optimizer_state_dict, result_b2.optimizer_state_dict)
+    _assert_deep_equal(result_a.scheduler_state_dict, result_b2.scheduler_state_dict)
+
+
+def test_run_training_resume_scheduler_lr_reduction_crosses_checkpoint_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """scheduler resume 계약은 "state_dict가 왕복된다"만으로는 부족하다 --
+    checkpoint 이전에 쌓인 bad epoch 수가 resume 후에도 정확히 이어져서,
+    실제로 같은 시점에 LR이 감소해야 한다.
+
+    lr_scheduler_patience=2, val_loss를 계속 1.0으로 고정하면:
+        epoch 1: baseline (아직 bad epoch 아님)
+        epoch 2: bad 1
+        epoch 3: bad 2
+        checkpoint
+        epoch 4: bad 3 > patience(2) -> LR 감소 (1.0 -> 0.5)
+
+    연속 4 epoch와 (3 epoch 실행 + resume 1 epoch)를 비교해, 4번째
+    epoch에서만 LR이 줄어들고 그 값과 scheduler 내부 상태가 두 경로에서
+    정확히 같은지 확인한다 (실제로 PyTorch로 미리 실행해 4번째 step에서
+    LR이 처음 바뀜을 확인한 순번 -- test_build_scheduler_reduces_lr_after_
+    patience_bad_steps와 동일한 근거)."""
+    spec = _mlp_classifier_spec()
+    scheduler_kwargs = dict(
+        batch_size=8, learning_rate=1.0, lr_scheduler="plateau",
+        lr_scheduler_factor=0.5, lr_scheduler_patience=2,
+    )
+
+    # (a) 연속 4 epoch
+    torch.manual_seed(0)
+    model_a = build_model(spec)
+    train_loader_a, val_loader_a = _make_loaders(spec, seed=0)
+    val_results_a = iter([(1.0, 1.0)] * 4)
+    monkeypatch.setattr(
+        "image_ai_studio.training.loop.evaluate",
+        lambda model, loader, device="cpu": next(val_results_a),
+    )
+    result_a = run_training(model_a, train_loader_a, val_loader_a, TrainingConfig(epochs=4, **scheduler_kwargs))
+    assert result_a.optimizer_state_dict["param_groups"][0]["lr"] == 0.5
+
+    # (b) 3 epoch 실행 -- 아직 bad epoch 2개뿐이라 LR은 그대로여야 함
+    torch.manual_seed(0)
+    model_b = build_model(spec)
+    train_loader_b, val_loader_b = _make_loaders(spec, seed=0)
+    first_config = TrainingConfig(epochs=3, **scheduler_kwargs)
+    val_results_b1 = iter([(1.0, 1.0)] * 3)
+    monkeypatch.setattr(
+        "image_ai_studio.training.loop.evaluate",
+        lambda model, loader, device="cpu": next(val_results_b1),
+    )
+    result_b1 = run_training(model_b, train_loader_b, val_loader_b, first_config)
+    assert result_b1.optimizer_state_dict["param_groups"][0]["lr"] == 1.0  # 아직 감소 전
+
+    # resume 1 epoch -- 이 epoch가 3번째 bad epoch가 되어 LR이 감소해야 함
+    resume_state = _make_resume_state(result_b1, first_config)
+    resume_config = TrainingConfig(epochs=1, **scheduler_kwargs)
+    val_results_b2 = iter([(1.0, 1.0)])
+    monkeypatch.setattr(
+        "image_ai_studio.training.loop.evaluate",
+        lambda model, loader, device="cpu": next(val_results_b2),
+    )
+    result_b2 = run_training(model_b, train_loader_b, val_loader_b, resume_config, resume_state=resume_state)
+
+    assert result_b2.optimizer_state_dict["param_groups"][0]["lr"] == 0.5
+    _assert_deep_equal(result_a.optimizer_state_dict["param_groups"], result_b2.optimizer_state_dict["param_groups"])
+    _assert_deep_equal(result_a.scheduler_state_dict, result_b2.scheduler_state_dict)
