@@ -457,6 +457,62 @@ val_losses/val_accuracies), `best_state_dict`, `best_epoch`,
 
 ---
 
+## Phase 4G: ImageFolder Resume CLI Integration
+
+Phase 4F는 core 수준(라이브러리 함수)에서만 checkpoint/resume을
+제공했습니다. Phase 4G는 이 기능을 실제 `run_imagefolder_training_e2e.py`
+CLI에 연결합니다: `--epochs`(신규 -- 이전에는 CLI로 바꿀 수 없었음),
+`--resume-from PATH`, `--checkpoint-out PATH` 세 옵션을 추가했습니다.
+
+```bash
+# 새로 학습 + checkpoint 저장
+python scripts/run_imagefolder_training_e2e.py --epochs 3 --checkpoint-out artifacts/training/foo_checkpoint.pt
+
+# 이어서 2 epoch 더 (--epochs는 "총 epoch"가 아니라 "이번에 추가로
+# 실행할 epoch 수"이다 -- Phase 4F 계약을 CLI에서도 그대로 유지)
+python scripts/run_imagefolder_training_e2e.py --epochs 2 --resume-from artifacts/training/foo_checkpoint.pt --checkpoint-out artifacts/training/foo_checkpoint.pt
+```
+
+핵심 설계 사항:
+
+* checkpoint(.pt)만으로는 resume할 수 없습니다 -- ImageFolder 전용
+  metadata(`<checkpoint>.meta.json`, ModelSpec 해시 + class_to_idx +
+  split별 크기/파일 목록 해시)가 항상 같이 저장/검증됩니다. 별도
+  플래그 없이 checkpoint 경로로부터 자동 유도됩니다
+  (`checkpoint.pt` -> `checkpoint.pt.meta.json`). 이 metadata는 Phase 4F의
+  checkpoint 포맷(`CHECKPOINT_FORMAT_VERSION`)과 독립적인 별도 JSON
+  파일입니다 -- dataset-agnostic한 core checkpoint 포맷을 건드리지
+  않습니다
+  * 검증 범위는 class_to_idx + train/val/test 크기 + 파일별
+    (상대경로, class_index) 목록 해시입니다. **이미지 내용 자체는
+    해싱하지 않습니다** -- 같은 경로의 파일 내용만 바뀌는 경우는
+    탐지하지 못하는 것이 알려진 한계입니다. dataset 루트의 절대경로
+    일치는 요구하지 않으므로, dataset을 다른 머신/디렉터리로 옮겨도
+    resume할 수 있습니다
+  * `--resume-from`과 `--checkpoint-out`이 같은 경로여도 정상
+    동작합니다(반복 resume의 일반적인 사용 패턴). 다만 checkpoint와
+    metadata는 독립된 두 파일이라, 저장 도중 프로세스가 중단되면
+    한쪽만 갱신된 채로 남을 수 있습니다 -- 두 파일을 하나의 atomic
+    연산으로 묶는 것은 이번 Phase 범위 밖입니다
+* checkpoint 저장은 `best_model`(별도 인스턴스)이 만들어지기 **전**에
+  일어납니다 -- `model`(현재/마지막 epoch 가중치)이 best 가중치로
+  덮어써지는 시점이 스크립트 구조상 존재하지 않으므로,
+  best_state_dict를 현재 모델로 착각해서 저장하는 버그가 애초에
+  발생할 수 없습니다
+* resume 시 checkpoint의 `model_state_dict`(현재/마지막 epoch)를 쓰고,
+  `best_state_dict`(최고 성능 epoch)는 쓰지 않습니다 -- 후자를 쓰면
+  resume 시작점이 어긋납니다
+* `stopped_early=True`인 checkpoint는 (Phase 4F와 동일하게) resume
+  실행은 거부되지만 조회/가중치 추출은 여전히 가능합니다. 이 CLI가
+  스스로 early stopping으로 멈추고 `--checkpoint-out`이 주어진
+  경우에도 checkpoint는 그대로 저장됩니다(이후 resume만 거부됨)
+
+`--resume-from` 없이 실행하면 기존 동작과 완전히 동일합니다(하위
+호환). 설계 배경과 상세 검증 결과는
+`docs/phase4g_imagefolder_resume_design.md`를 참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
@@ -478,6 +534,10 @@ val_losses/val_accuracies), `best_state_dict`, `best_epoch`,
   best model, early stopping 카운터, DataLoader generator/CPU RNG
   state) 저장과 epoch 경계 resume, CPU 학습 경로에서 연속 실행과
   tensor-level exact equality 목표 (Phase 4F)
+* `run_imagefolder_training_e2e.py` CLI에서 `--resume-from`/
+  `--checkpoint-out`으로 Phase 4F checkpoint/resume 실행, ImageFolder
+  전용 metadata(ModelSpec 해시 + class_to_idx + 파일 목록 해시)로 dataset/
+  model 호환성 자동 검증 (Phase 4G)
 * TorchScript 배포, C++(LibTorch) CPU/CUDA 추론
 * Python/C++ parity 검증 (Phase 0~4E 배포 경로; Phase 4F는 export/parity
   코드를 변경하지 않았고, 기존 parity E2E를 재실행해 회귀 없음을 확인함
@@ -1106,6 +1166,11 @@ Phase 4E부터 `--optimizer`/`--momentum`/`--lr-scheduler`/
 생략하면 Adam/scheduler 없음/early stopping 없음으로 기존과 동일하게
 동작). 자세한 내용은 `docs/phase4e_training_config_design.md`를
 참고하세요.
+
+Phase 4G부터 `--epochs`/`--resume-from`/`--checkpoint-out`으로
+checkpoint 저장과 resume을 이 CLI에서 바로 실행할 수 있습니다 (자세한
+내용은 위 "Phase 4G: ImageFolder Resume CLI Integration" 절과
+`docs/phase4g_imagefolder_resume_design.md` 참고).
 
 ## Resume Training E2E (Phase 4F)
 
