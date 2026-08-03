@@ -460,20 +460,28 @@ val_losses/val_accuracies), `best_state_dict`, `best_epoch`,
 ## Phase 4G: ImageFolder Resume CLI Integration
 
 Phase 4F는 core 수준(라이브러리 함수)에서만 checkpoint/resume을
-제공했습니다. Phase 4G는 이 기능을 실제 `run_imagefolder_training_e2e.py`
-CLI에 연결합니다: `--epochs`(신규 -- 이전에는 CLI로 바꿀 수 없었음),
+제공했습니다. Phase 4G는 이 기능을 실제 ImageFolder 학습 CLI에
+연결합니다: `--epochs`(신규 -- 이전에는 CLI로 바꿀 수 없었음),
 `--resume-from PATH`, `--checkpoint-out PATH` 세 옵션을 추가했습니다.
 
+> **Phase 4H 갱신**: 이 절이 설명하는 CLI 옵션(`--epochs`/`--resume-from`/
+> `--checkpoint-out` 등)은 Phase 4H에서 `scripts/train_imagefolder.py`로
+> 옮겨졌습니다. `run_imagefolder_training_e2e.py`는 더 이상 이 옵션들을
+> 지원하지 않고 회귀 검증 전용으로 재구성됐습니다 -- 아래 "Phase 4H:
+> Production ImageFolder Training CLI Separation" 절을 참고하세요. 이
+> 절의 나머지 내용(metadata 검증 범위, checkpoint 저장 시점, resume
+> 시작점 등 core 계약)은 옮겨간 뒤에도 동일하게 유지됩니다.
+
 ```bash
-# 새로 학습 + checkpoint 저장
-python scripts/run_imagefolder_training_e2e.py --epochs 3 --checkpoint-out artifacts/training/foo_checkpoint.pt
+# 새로 학습 + checkpoint 저장 (Phase 4H부터는 scripts/train_imagefolder.py)
+python scripts/train_imagefolder.py --model-json m.json --dataset-root d --output-dir out --epochs 3 --checkpoint-out out/checkpoint.pt
 
 # 이어서 2 epoch 더 (--epochs는 "총 epoch"가 아니라 "이번에 추가로
 # 실행할 epoch 수"이다 -- Phase 4F 계약을 CLI에서도 그대로 유지)
-python scripts/run_imagefolder_training_e2e.py --epochs 2 --resume-from artifacts/training/foo_checkpoint.pt --checkpoint-out artifacts/training/foo_checkpoint.pt
+python scripts/train_imagefolder.py --model-json m.json --dataset-root d --output-dir out --epochs 2 --resume-from out/checkpoint.pt --checkpoint-out out/checkpoint.pt
 ```
 
-핵심 설계 사항:
+핵심 설계 사항(옮겨간 뒤에도 유지되는 core 계약):
 
 * checkpoint(.pt)만으로는 resume할 수 없습니다 -- ImageFolder 전용
   metadata(`<checkpoint>.meta.json`, ModelSpec 해시 + class_to_idx +
@@ -513,6 +521,93 @@ python scripts/run_imagefolder_training_e2e.py --epochs 2 --resume-from artifact
 
 ---
 
+## Phase 4H: Production ImageFolder Training CLI Separation
+
+Phase 4E/4G를 거치며 `run_imagefolder_training_e2e.py`는 원래 "E2E 회귀
+검증 스크립트"였다가 점점 일반 사용자 학습 CLI(optimizer/scheduler/
+resume 옵션까지 갖춘)로 성장했습니다. Phase 4H는 이 두 책임을 분리합니다:
+
+```text
+scripts/train_imagefolder.py            실제 사용자용 production 학습 CLI
+scripts/run_imagefolder_training_e2e.py 회귀 검증 + TorchScript/C++ parity 전용 E2E
+src/image_ai_studio/training/imagefolder_workflow.py
+    "학습 본질" 로직(ModelSpec/dataset 검증, model build/resume, 학습 실행,
+    checkpoint/history/best model/class mapping/test 결과 저장, TorchScript
+    export)을 담은 공통 모듈 -- 위 두 스크립트가 서로 import하지 않고
+    이 모듈만 향해 의존합니다.
+```
+
+`train_imagefolder.py` 사용법:
+
+```bash
+# 새로 학습
+python scripts/train_imagefolder.py \
+    --model-json my_model.json --dataset-root path/to/dataset \
+    --epochs 20 --batch-size 32 --learning-rate 5e-4 \
+    --output-dir artifacts/my_run --checkpoint-out artifacts/my_run/checkpoint.pt
+
+# 이어서 학습
+python scripts/train_imagefolder.py \
+    --model-json my_model.json --dataset-root path/to/dataset \
+    --epochs 10 --batch-size 32 --learning-rate 5e-4 \
+    --output-dir artifacts/my_run \
+    --resume-from artifacts/my_run/checkpoint.pt --checkpoint-out artifacts/my_run/checkpoint.pt
+
+# TorchScript export 생략 (가중치만 필요한 경우)
+python scripts/train_imagefolder.py --model-json my_model.json --dataset-root ... \
+    --output-dir artifacts/my_run --no-export-torchscript
+```
+
+`--model-json`/`--dataset-root`/`--output-dir` 세 개는 필수입니다(기본값
+없음 -- CIFAR-10 fixture를 실수로 학습하는 걸 막기 위해 의도적으로
+기본값을 두지 않았습니다). `--epochs`/`--batch-size`/`--learning-rate`/
+`--optimizer`/`--momentum`/`--lr-scheduler*`/`--early-stopping-patience`/
+`--resume-from`/`--checkpoint-out`은 기존과 동일하게 동작합니다.
+`--batch-size`/`--learning-rate`는 Phase 4H에서 새로 노출됐습니다(이전에는
+하드코딩이었습니다). `--seed`도 새로 노출되지만, **resume 시에는 사실상
+무시됩니다** -- model은 곧바로 checkpoint의 가중치로 덮어써지고,
+DataLoader shuffle 순서와 CPU RNG는 checkpoint에 저장된 상태로 복원되기
+때문입니다.
+
+`train_imagefolder.py`가 의도적으로 하지 않는 것:
+
+* **C++ parity를 실행하지 않습니다** -- 빌드된 러너 바이너리나 CUDA
+  가용성에 전혀 의존하지 않습니다. TorchScript export는 순수 Python
+  (`torch.jit.trace`)이라 기본 포함되며 `--no-export-torchscript`로 끌 수
+  있습니다. 끄면 같은 `--output-dir`에 이전 실행이 남긴 TorchScript
+  산출물(`model.ts`/`model_metadata.json`)도 함께 정리해 최신 실행
+  상태와 디렉터리 내용이 항상 일치하도록 합니다(다른 파일은 건드리지
+  않습니다)
+* **loss가 실제로 줄었는지, class mapping/best model이 저장 후 다시
+  읽어도 같은 값을 내는지를 자동으로 판정하지 않습니다** -- 이런
+  자체 검증은 이미 단위 테스트(`tests/training/`)로 커버된 불변조건을
+  매 실행마다 다시 확인하는 것과 같아서 production 경로에서는 제거했고,
+  회귀 검증이 실제로 필요한 `run_imagefolder_training_e2e.py`에만
+  남아 있습니다
+* **artifact 경로를 하드코딩하지 않습니다** -- `--output-dir` 아래
+  고정 파일명(`best_model_state_dict.pt`, `training_history.json`,
+  `class_mapping.json`, `test_result.json`, 선택적으로 `model.ts`/
+  `model_metadata.json`)으로만 저장합니다. 기존 파일은 확인 없이
+  덮어씁니다(이 프로젝트의 다른 저장 함수들과 동일한 정책)
+
+재구성된 `run_imagefolder_training_e2e.py`는 CIFAR-10 ImageFolder
+fixture로 `run_imagefolder_training_workflow()`를 고정 설정(fresh 3
+epoch + checkpoint 저장, 이어서 resume 2 epoch)으로 두 번 호출한 뒤,
+loss 감소 게이트 + class mapping 재검증 + TorchScript reload + C++
+CPU/CUDA parity를 자체 책임으로 수행합니다 -- 아래 "ImageFolder
+Training E2E" 절 참고. best model save/reload 재검증은 두지 않습니다
+(같은 파일을 두 번 읽어 비교하는 것은 항상 같은 결과만 나오는 무의미한
+검증이라 회귀 가치가 낮다고 판단해 제거했습니다 -- state_dict 저장/
+재로드 정확성은 `tests/training/test_imagefolder_workflow.py`/
+`test_checkpoint.py`가 단위 테스트로 이미 커버합니다). regression anchor
+수치(best_epoch/best_val_loss/test_accuracy 등)는 스크립트가 출력만
+하고 자동 실패 조건으로 삼지 않습니다 -- 환경/PyTorch 버전에 따라
+소수점 마지막 자리가 흔들릴 수 있는 값을 엄격한 자동 gate로 만들지
+않기 위한 의도적 선택입니다. 설계 배경과 상세 검증 결과는
+`docs/phase4h_production_training_cli_design.md`를 참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
@@ -534,10 +629,14 @@ python scripts/run_imagefolder_training_e2e.py --epochs 2 --resume-from artifact
   best model, early stopping 카운터, DataLoader generator/CPU RNG
   state) 저장과 epoch 경계 resume, CPU 학습 경로에서 연속 실행과
   tensor-level exact equality 목표 (Phase 4F)
-* `run_imagefolder_training_e2e.py` CLI에서 `--resume-from`/
-  `--checkpoint-out`으로 Phase 4F checkpoint/resume 실행, ImageFolder
-  전용 metadata(ModelSpec 해시 + class_to_idx + 파일 목록 해시)로 dataset/
-  model 호환성 자동 검증 (Phase 4G)
+* `--resume-from`/`--checkpoint-out`으로 Phase 4F checkpoint/resume 실행,
+  ImageFolder 전용 metadata(ModelSpec 해시 + class_to_idx + 파일 목록
+  해시)로 dataset/model 호환성 자동 검증 (Phase 4G)
+* 실제 사용자용 production 학습 CLI(`scripts/train_imagefolder.py`)와
+  회귀 검증 전용 E2E(`scripts/run_imagefolder_training_e2e.py`)의 책임
+  분리, `--batch-size`/`--learning-rate`/`--output-dir`/`--seed`/
+  `--export-torchscript` 신규 노출, production CLI는 C++ parity를
+  실행하지 않음 (Phase 4H)
 * TorchScript 배포, C++(LibTorch) CPU/CUDA 추론
 * Python/C++ parity 검증 (Phase 0~4E 배포 경로; Phase 4F는 export/parity
   코드를 변경하지 않았고, 기존 parity E2E를 재실행해 회귀 없음을 확인함
@@ -1144,33 +1243,53 @@ torchvision CIFAR-10을 사용하는 실제 이미지 학습 E2E입니다. 처�
 조절할 수 있습니다. `scripts/run_training_e2e.py`(synthetic)는 이
 스크립트와 별개로 그대로 유지됩니다.
 
-## ImageFolder Training E2E (Phase 4D)
+## ImageFolder Training CLI (Phase 4D~4H)
+
+```bash
+python scripts/train_imagefolder.py \
+    --model-json my_model.json --dataset-root path/to/dataset \
+    --output-dir artifacts/my_run
+```
+
+사용자가 준비한 `ImageFolder` 폴더(`train`/`val`/`test`로 이미 분리된
+구조)를 학습하는 **실제 사용자용 production CLI**입니다(Phase 4D~4G에서
+`run_imagefolder_training_e2e.py`가 맡던 학습 CLI 역할을 Phase 4H에서
+이 스크립트로 옮겼습니다). `--model-json`/`--dataset-root`/`--output-dir`
+세 개가 필수입니다. `--optimizer`/`--momentum`/`--lr-scheduler`/
+`--lr-scheduler-factor`/`--lr-scheduler-patience`/
+`--early-stopping-patience`/`--epochs`/`--batch-size`/`--learning-rate`/
+`--resume-from`/`--checkpoint-out`/`--seed`/
+`--export-torchscript`(`--no-export-torchscript`)를 지원합니다. 전부
+생략하면 Adam/scheduler 없음/early stopping 없음/TorchScript export
+포함으로 동작합니다. 자세한 내용은 위 "Phase 4H: Production ImageFolder
+Training CLI Separation" 절과
+`docs/phase4h_production_training_cli_design.md`를 참고하세요.
+
+## ImageFolder Training E2E (Phase 4D, Phase 4H에서 재구성)
 
 ```bash
 python scripts/prepare_cifar10_imagefolder_fixture.py
 python scripts/run_imagefolder_training_e2e.py --dataset-root path/to/dataset --model-json examples/models/phase4c_cifar10_model.json
 ```
 
-사용자가 준비한 `ImageFolder` 폴더(`train`/`val`/`test`로 이미 분리된
-구조)를 학습하는 E2E입니다. `--dataset-root`를 생략하면
-`prepare_cifar10_imagefolder_fixture.py`가 만드는
-`artifacts/datasets/cifar10_imagefolder`를 기본값으로 사용합니다.
+`train_imagefolder.py`가 호출하는 것과 같은 workflow 함수
+(`run_imagefolder_training_workflow()`)를 고정 설정(fresh 3 epoch +
+checkpoint 저장, 이어서 resume 2 epoch)으로 두 번 호출해 Phase 4D~4G의
+전체 계약(학습, checkpoint/resume, metadata 검증)과 TorchScript export +
+C++ CPU/CUDA parity를 한 번에 회귀 검증하는 **E2E 전용** 스크립트입니다
+-- 더 이상 일반 학습 CLI가 아닙니다(옵션은 `--model-json`/`--dataset-root`
+뿐). `--dataset-root`를 생략하면 `prepare_cifar10_imagefolder_fixture.py`가
+만드는 `artifacts/datasets/cifar10_imagefolder`를 기본값으로 사용합니다.
 `prepare_cifar10_imagefolder_fixture.py`는 제품 기능이 아니라, CIFAR-10
 일부를 `ImageFolder` 구조로 export해 이 E2E를 별도 dataset 없이 검증할
 수 있게 해주는 테스트 준비 전용 스크립트입니다 (pytest에서 호출되지
 않음).
 
-Phase 4E부터 `--optimizer`/`--momentum`/`--lr-scheduler`/
-`--lr-scheduler-factor`/`--lr-scheduler-patience`/
-`--early-stopping-patience`로 학습 설정을 조절할 수 있습니다 (전부
-생략하면 Adam/scheduler 없음/early stopping 없음으로 기존과 동일하게
-동작). 자세한 내용은 `docs/phase4e_training_config_design.md`를
+자세한 내용은 `docs/phase4d_imagefolder_design.md`(초기 설계),
+`docs/phase4e_training_config_design.md`(TrainingConfig 확장),
+`docs/phase4g_imagefolder_resume_design.md`(resume 연결),
+`docs/phase4h_production_training_cli_design.md`(production CLI 분리)를
 참고하세요.
-
-Phase 4G부터 `--epochs`/`--resume-from`/`--checkpoint-out`으로
-checkpoint 저장과 resume을 이 CLI에서 바로 실행할 수 있습니다 (자세한
-내용은 위 "Phase 4G: ImageFolder Resume CLI Integration" 절과
-`docs/phase4g_imagefolder_resume_design.md` 참고).
 
 ## Resume Training E2E (Phase 4F)
 
