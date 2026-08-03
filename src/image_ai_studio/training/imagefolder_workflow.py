@@ -50,7 +50,14 @@ from image_ai_studio.training.imagefolder_resume import (
     require_compatible_imagefolder_resume_metadata,
     save_imagefolder_resume_metadata,
 )
-from image_ai_studio.training.loop import TrainingHistory, TrainingResumeState, evaluate, run_training
+from image_ai_studio.training.loop import (
+    ShouldStopCallback,
+    TrainingHistory,
+    TrainingProgressCallback,
+    TrainingResumeState,
+    evaluate,
+    run_training,
+)
 from image_ai_studio.training.torchvision_dataset import (
     ImageFolderSplits,
     make_imagefolder_datasets,
@@ -157,7 +164,12 @@ def _prepare_resume(
     return model, restored_generator, resume_state, payload["cpu_rng_state"]
 
 
-def run_imagefolder_training_workflow(request: ImageFolderWorkflowRequest) -> ImageFolderWorkflowResult:
+def run_imagefolder_training_workflow(
+    request: ImageFolderWorkflowRequest,
+    *,
+    progress_callback: TrainingProgressCallback | None = None,
+    should_stop: ShouldStopCallback | None = None,
+) -> ImageFolderWorkflowResult:
     model_spec = load_model_spec(request.model_json_path)
     shape_trace = validate_model_spec(model_spec)
     final_shape = shape_trace[-1].output_shape
@@ -186,7 +198,8 @@ def run_imagefolder_training_workflow(request: ImageFolderWorkflowRequest) -> Im
         torch.set_rng_state(cpu_rng_state)
 
     training_result = run_training(
-        model, train_loader, val_loader, request.training_config, device="cpu", resume_state=resume_state
+        model, train_loader, val_loader, request.training_config, device="cpu", resume_state=resume_state,
+        progress_callback=progress_callback, should_stop=should_stop,
     )
     # checkpoint 저장에 쓸 RNG snapshot -- 이후 코드(TorchScript export의
     # set_seed() 등)가 전역 RNG를 다시 바꾸기 전에, 학습이 실제로 끝난

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
+from typing import Callable
 
 import torch
 from torch import nn
@@ -100,6 +101,13 @@ class TrainingHistory:
 
     best_epoch는 1-indexed. val_loss가 strict하게(<) 더 낮아질 때만
     갱신되므로, 동률이면 먼저 나온 epoch가 유지된다.
+
+    stopped_by_user(Phase 4I)는 should_stop() 콜백 때문에 아직 실행할
+    epoch가 남은 채로 멈췄으면 True다(docs/phase4i_training_progress_and_stop_design.md
+    §7/§9 참고). stopped_early와 달리 TrainingResumeState는 이 값을
+    거부하지 않는다 -- 사용자가 잠시 멈춘 것뿐이므로 resume이 항상
+    가능해야 한다. 기본값이 있어 옛 checkpoint/JSON history(이 필드가
+    없는)를 읽어도 그대로 False로 채워진다.
     """
 
     train_losses: list[float] = field(default_factory=list)
@@ -108,6 +116,7 @@ class TrainingHistory:
     best_epoch: int | None = None
     best_val_loss: float | None = None
     stopped_early: bool = False
+    stopped_by_user: bool = False
 
 
 @dataclass
@@ -130,6 +139,69 @@ class TrainingResult:
     optimizer_state_dict: dict
     scheduler_state_dict: dict | None
     epochs_without_improvement: int
+
+
+@dataclass(frozen=True)
+class TrainingProgress:
+    """Phase 4I: 한 epoch이 완료될 때마다 run_training()이
+    progress_callback에 넘기는 읽기 전용 스냅샷(docs/
+    phase4i_training_progress_and_stop_design.md §3/§4/§7).
+
+    관찰/UI 갱신 전용이다 -- model 객체, state_dict, optimizer/scheduler
+    상태와 시간 정보는 담지 않고, 완료된 epoch의 지표만 전달한다(나중에
+    필요해지면 기본값 있는 필드를 추가해도 하위 호환이 깨지지 않는다).
+    완전한 학습 상태(model.state_dict()가 아니라 best_state_dict,
+    optimizer_state_dict, scheduler_state_dict, history 전체)는 이
+    dataclass가 아니라 학습이 끝난 뒤 반환되는 TrainingResult가 담당한다.
+    run_training()을 직접 호출하는 코드는 자신이 넘긴 model 참조를 계속
+    들고 있으므로 필요하면 그쪽에서 별도로 들여다볼 수 있지만, 그건 이
+    dataclass의 책임이 아니다.
+
+    run_epoch: 이번 run_training() 호출 안에서 몇 번째 epoch인지(1부터).
+    total_run_epochs: 이번 호출에서 실행 예정인 전체 epoch 수(config.epochs).
+    global_epoch: resume을 포함한 전체 이력에서 이 epoch의 절대 번호
+        (loop.py의 for 루프가 도는 epoch 변수와 동일한 값).
+    learning_rate: 이번 epoch의 train_one_epoch()가 실제로 사용한 값
+        (scheduler.step() 호출 전에 캡처됨). scheduler가 이번 epoch에
+        LR을 바꿨다면 그 바뀐 값은 다음 콜백에서 보인다.
+    stopped_early: 이번 epoch에서 early stopping이 발동했으면 True.
+        사용자 중단 여부는 이 dataclass가 아니라 학습이 끝난 뒤
+        TrainingResult.history.stopped_by_user로만 확인한다(콜백
+        호출 시점에는 아직 should_stop()을 평가하지 않았으므로 이
+        dataclass에는 그 값을 담을 수 없다, §3/§4/§7).
+    """
+
+    run_epoch: int
+    total_run_epochs: int
+    global_epoch: int
+
+    train_loss: float
+    val_loss: float
+    val_accuracy: float
+    learning_rate: float
+
+    best_epoch: int
+    best_val_loss: float
+    epochs_without_improvement: int
+
+    stopped_early: bool
+
+
+TrainingProgressCallback = Callable[[TrainingProgress], None]
+"""epoch 완료마다 정확히 한 번 호출된다(early stopping으로 끝난
+epoch에서도 마찬가지). 예외를 던지면 run_training()이 그대로 전파하고
+TrainingResult를 반환하지 않는다 -- 의도적으로 학습을 중단하려면
+callback에서 예외를 던지지 말고 ShouldStopCallback을 쓸 것을 권장한다.
+그래야 run_training()이 정상적인 TrainingResult를 반환하고, 상위
+workflow(예: run_imagefolder_training_workflow())가 checkpoint_out 등
+기존 artifact 후처리를 계속 수행할 수 있다(docs/
+phase4i_training_progress_and_stop_design.md §5)."""
+
+ShouldStopCallback = Callable[[], bool]
+"""인자 없이 bool을 반환하는 아무 callable이나 가능하다 (예:
+threading.Event().is_set). 이번 호출의 마지막 요청 epoch거나
+config.epochs == 1이면 절대 평가되지 않는다(docs/
+phase4i_training_progress_and_stop_design.md §7 "특수 사례")."""
 
 
 @dataclass
@@ -205,6 +277,9 @@ def run_training(
     config: TrainingConfig,
     device: str = "cpu",
     resume_state: TrainingResumeState | None = None,
+    *,
+    progress_callback: TrainingProgressCallback | None = None,
+    should_stop: ShouldStopCallback | None = None,
 ) -> TrainingResult:
     """train_one_epoch/evaluate를 config.epochs만큼 반복하는 얇은 조립 함수.
 
@@ -256,14 +331,44 @@ def run_training(
 
     매 epoch의 순서는 train -> validation -> history 기록 -> best
     model/개선 카운터 갱신 -> scheduler.step(val_loss) -> early stopping
-    조건 확인이다. 즉 마지막으로 실행된 epoch에서 scheduler가 LR을
-    바꿨더라도, 그 직후 early stopping으로 멈추면 바뀐 LR은 실제로
-    쓰이지 않을 수 있다 -- 이는 의도된 동작이다(다음 epoch이 없으므로
-    바뀐 LR을 쓸 기회 자체가 없을 뿐, 계산 자체는 정상 수행됨).
+    조건 확인 -> progress_callback 호출 -> (early stopping이 아니고
+    다음 epoch가 남아 있을 때만) should_stop() 평가다(Phase 4I, docs/
+    phase4i_training_progress_and_stop_design.md §4/§7). 즉 마지막으로
+    실행된 epoch에서 scheduler가 LR을 바꿨더라도, 그 직후 early
+    stopping으로 멈추면 바뀐 LR은 실제로 쓰이지 않을 수 있다 -- 이는
+    의도된 동작이다(다음 epoch이 없으므로 바뀐 LR을 쓸 기회 자체가
+    없을 뿐, 계산 자체는 정상 수행됨).
     `config.early_stopping_patience`와 `config.lr_scheduler_patience`를
     함께 쓸 때는 early_stopping_patience를 lr_scheduler_patience보다
     크게 잡는 것을 권장한다 -- 그래야 LR이 줄어든 뒤에도 실제로 몇
     epoch 더 학습할 기회가 생긴다 (강제 검증 규칙은 아님).
+
+    progress_callback(Phase 4I)이 주어지면, 완료된 epoch마다(early
+    stopping으로 끝난 epoch 포함) 정확히 한 번 TrainingProgress를
+    만들어 호출한다. 콜백이 예외를 던지면 그대로 전파한다(감싸지
+    않음) -- 이 경우 TrainingResult는 반환되지 않으므로,
+    optimizer/scheduler/history를 하나로 묶어 받을 방법이 없다(단
+    `model`은 호출자가 넘긴 바로 그 참조이므로 예외 후에도 호출자
+    쪽에서 계속 접근 가능하다). 의도적으로 학습을 중단하려면 콜백에서
+    예외를 던지지 말고 should_stop을 쓸 것 -- 그래야 run_training()이
+    정상적인 TrainingResult를 반환하고, 상위 workflow(예:
+    run_imagefolder_training_workflow())가 checkpoint_out 등 기존
+    artifact 후처리를 계속 수행할 수 있다.
+
+    should_stop(Phase 4I)이 주어지면, "이번 epoch이 early stopping으로
+    끝난 게 아니고, 이번 호출에서 아직 실행할 epoch가 하나라도 남아
+    있을 때만" progress_callback 호출 **직후** 평가한다 -- epoch
+    시작 전에는 절대 평가하지 않으므로 항상 최소 1개의 새 epoch이
+    완료된다(0 epoch 결과는 불가능). should_stop()이 True이면
+    `history.stopped_by_user = True`를 설정하고 멈춘다. 이 순서
+    (콜백을 먼저 호출한 뒤 should_stop을 평가) 덕분에, 콜백 안에서
+    동기적으로 stop 플래그를 세팅하는 UI 패턴은 지연 없이 같은 epoch
+    경계에서 바로 반영된다. 이번 호출의 마지막 요청 epoch이거나
+    `config.epochs == 1`이면 should_stop()은 절대 평가되지 않는다
+    (남길 epoch이 없으므로 "중단"이 의미가 없음) -- 이 경우
+    `stopped_by_user`는 `False`로 남는다. early stopping과
+    `stopped_by_user`는 동시에 True가 될 수 없다(early stopping이
+    항상 우선).
     """
     if resume_state is not None:
         # resume 관련 사전 검증은 optimizer/scheduler를 만들기 **전에** 끝낸다 --
@@ -308,6 +413,12 @@ def run_training(
             )
 
         history = copy.deepcopy(resume_state.history)
+        # 이전 checkpoint가 사용자 중단으로 저장된 것이었다면
+        # (resume_state.history.stopped_by_user == True) 그 값이 그대로
+        # 복사되어 온다 -- 이번 호출은 아직 멈춘 적이 없으므로 명시적으로
+        # 되돌린다. stopped_early는 TrainingResumeState.__post_init__이
+        # True인 경우를 이미 거부하므로 이 리셋이 필요 없다.
+        history.stopped_by_user = False
         best_state_dict = copy.deepcopy(resume_state.best_state_dict)
         epochs_without_improvement = resume_state.epochs_without_improvement
         completed_epochs = len(history.train_losses)
@@ -318,10 +429,14 @@ def run_training(
         completed_epochs = 0
 
     for epoch in range(completed_epochs + 1, completed_epochs + config.epochs + 1):
-        history.train_losses.append(train_one_epoch(model, train_loader, optimizer, device=device))
+        run_epoch = epoch - completed_epochs
+
+        train_loss = train_one_epoch(model, train_loader, optimizer, device=device)
+        history.train_losses.append(train_loss)
         val_loss, val_accuracy = evaluate(model, val_loader, device=device)
         history.val_losses.append(val_loss)
         history.val_accuracies.append(val_accuracy)
+        learning_rate = optimizer.param_groups[0]["lr"]
 
         if history.best_val_loss is None or val_loss < history.best_val_loss:
             history.best_epoch = epoch
@@ -339,6 +454,38 @@ def run_training(
             and epochs_without_improvement >= config.early_stopping_patience
         ):
             history.stopped_early = True
+
+        if progress_callback is not None:
+            progress_callback(
+                TrainingProgress(
+                    run_epoch=run_epoch,
+                    total_run_epochs=config.epochs,
+                    global_epoch=epoch,
+                    train_loss=train_loss,
+                    val_loss=val_loss,
+                    val_accuracy=val_accuracy,
+                    learning_rate=learning_rate,
+                    best_epoch=history.best_epoch,
+                    best_val_loss=history.best_val_loss,
+                    epochs_without_improvement=epochs_without_improvement,
+                    stopped_early=history.stopped_early,
+                )
+            )
+
+        # should_stop()은 "이 요청이 실제로 뭔가를 단축시킬 수 있을 때"만
+        # 평가한다 -- early stopping으로 이미 끝났거나, 이번이 이번 호출의
+        # 마지막 요청 epoch라면(더 이상 건너뛸 epoch가 없음) 평가해도
+        # 의미 있는 조기 종료가 아니다.
+        has_next_epoch = run_epoch < config.epochs
+        if (
+            not history.stopped_early
+            and has_next_epoch
+            and should_stop is not None
+            and should_stop()
+        ):
+            history.stopped_by_user = True
+
+        if history.stopped_early or history.stopped_by_user:
             break
 
     # config.epochs >= 1은 TrainingConfig.__post_init__이 이미 보장하므로

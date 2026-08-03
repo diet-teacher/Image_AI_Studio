@@ -48,6 +48,7 @@ def test_history_json_uses_expected_keys_and_1_indexed_best_epoch(tmp_path: Path
         "best_epoch",
         "best_val_loss",
         "stopped_early",
+        "stopped_by_user",
     }
     assert data["best_epoch"] == 2  # 1-indexed, 0이 아님
 
@@ -113,4 +114,45 @@ def test_load_training_history_defaults_stopped_early_when_key_is_missing(tmp_pa
     restored = load_training_history(path)
 
     assert restored.stopped_early is False
+    assert restored.best_epoch == 2
+
+
+# -- Phase 4I: stopped_by_user --------------------------------------------------
+
+
+def test_stopped_by_user_true_round_trips(tmp_path: Path) -> None:
+    history = TrainingHistory(
+        train_losses=[1.0, 0.9], val_losses=[1.0, 1.0], val_accuracies=[0.1, 0.1], stopped_by_user=True
+    )
+    path = tmp_path / "history.json"
+    save_training_history(history, path)
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["stopped_by_user"] is True
+
+    restored = load_training_history(path)
+    assert restored == history
+    assert restored.stopped_by_user is True
+
+
+def test_load_training_history_defaults_stopped_by_user_when_key_is_missing(tmp_path: Path) -> None:
+    """Phase 4H까지 저장된 history.json에는 stopped_by_user 키가 없다 --
+    load_training_history()가 TrainingHistory(**data)로 복원하므로, 누락된
+    키는 dataclass 기본값(False)으로 자동 채워져야 한다 (하위 호환,
+    stopped_early와 동일한 메커니즘)."""
+    legacy_data = {
+        "train_losses": [1.0, 0.5],
+        "val_losses": [1.1, 0.6],
+        "val_accuracies": [0.2, 0.6],
+        "best_epoch": 2,
+        "best_val_loss": 0.6,
+        "stopped_early": False,
+        # "stopped_by_user" 키 없음 (Phase 4H까지의 실제 저장 형식)
+    }
+    path = tmp_path / "legacy_history.json"
+    path.write_text(json.dumps(legacy_data), encoding="utf-8")
+
+    restored = load_training_history(path)
+
+    assert restored.stopped_by_user is False
     assert restored.best_epoch == 2

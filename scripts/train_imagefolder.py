@@ -56,6 +56,7 @@ from image_ai_studio.training.imagefolder_workflow import (
     ImageFolderWorkflowRequest,
     run_imagefolder_training_workflow,
 )
+from image_ai_studio.training.loop import TrainingProgress
 
 DEFAULT_EPOCHS = 5
 DEFAULT_BATCH_SIZE = 8
@@ -120,6 +121,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _print_progress(progress: TrainingProgress) -> None:
+    """Phase 4I: epoch이 완료될 때마다(사후 일괄 출력이 아니라) 실시간으로
+    한 줄씩 찍는다. progress.global_epoch을 쓴다 -- run_epoch(이번 호출
+    기준 1부터)을 쓰면 resume할 때마다 번호가 1로 되돌아가 버려 절대
+    번호(체크포인트 이전 epoch까지 포함한 누적 번호)와 어긋난다. resume
+    실행에서는 이 함수가 새로 완료된 epoch에만 호출되므로, 이전에 이미
+    완료된 epoch은 다시 찍히지 않는다(과거 CLI처럼 history 전체를 사후에
+    재출력하지 않음 -- 의도된 동작 변경,
+    docs/phase4i_training_progress_and_stop_design.md §11/§17 참고)."""
+    print(
+        f"  epoch {progress.global_epoch}: train_loss={progress.train_loss:.4f} "
+        f"val_loss={progress.val_loss:.4f} val_acc={progress.val_accuracy:.4f}"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
@@ -152,17 +168,14 @@ def main(argv: list[str] | None = None) -> int:
             export_torchscript=args.export_torchscript,
             seed=args.seed,
         )
-        result = run_imagefolder_training_workflow(request)
+        result = run_imagefolder_training_workflow(request, progress_callback=_print_progress)
     except (ModelValidationError, TrainingConfigError, ValueError, OSError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
     history = result.history
-    for epoch, (train_loss, val_loss, val_acc) in enumerate(
-        zip(history.train_losses, history.val_losses, history.val_accuracies), start=1
-    ):
-        print(f"  epoch {epoch}: train_loss={train_loss:.4f} val_loss={val_loss:.4f} val_acc={val_acc:.4f}")
     print(f"  stopped_early={history.stopped_early}")
+    print(f"  stopped_by_user={history.stopped_by_user}")
     print(f"Best epoch: {history.best_epoch} (val_loss={history.best_val_loss:.4f})")
     print(f"Test: loss={result.test_loss:.4f} accuracy={result.test_accuracy:.4f}")
 

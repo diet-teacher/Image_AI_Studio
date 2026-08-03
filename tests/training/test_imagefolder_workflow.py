@@ -450,3 +450,123 @@ def test_disabling_export_removes_stale_torchscript_artifacts_but_keeps_other_fi
     assert not (output_dir / "model_metadata.json").exists()
     assert user_file.exists()
     assert user_file.read_text() == "keep me"
+
+
+# -- Phase 4I: progress_callback / should_stop forwarding --------------------
+
+
+def test_workflow_forwards_progress_callback_to_run_training(tmp_path: Path) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=3, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path / "out",
+        export_torchscript=False,
+        seed=SEED,
+    )
+
+    progresses: list = []
+    result = run_imagefolder_training_workflow(request, progress_callback=progresses.append)
+
+    assert len(progresses) == 3 == len(result.history.train_losses)
+    assert [p.global_epoch for p in progresses] == [1, 2, 3]
+
+
+def test_workflow_forwards_should_stop_and_stops_training_early(tmp_path: Path) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=5, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path / "out",
+        export_torchscript=False,
+        seed=SEED,
+    )
+
+    stop_flag = {"value": False}
+
+    def callback(progress) -> None:
+        if progress.run_epoch == 2:
+            stop_flag["value"] = True
+
+    result = run_imagefolder_training_workflow(
+        request, progress_callback=callback, should_stop=lambda: stop_flag["value"]
+    )
+
+    assert len(result.history.train_losses) == 2
+    assert result.history.stopped_by_user is True
+
+
+def test_workflow_user_stopped_run_produces_full_artifact_set(tmp_path: Path) -> None:
+    """stopped_by_user=True로 끝난 학습도 정상 완료와 동일한 아티팩트
+    파이프라인을 전부 거쳐야 한다 -- 별도 분기 없음
+    (docs/phase4i_training_progress_and_stop_design.md §10)."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    output_dir = tmp_path / "out"
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=5, batch_size=4, learning_rate=1e-2),
+        output_dir=output_dir,
+        checkpoint_out=checkpoint_path,
+        export_torchscript=True,
+        seed=SEED,
+    )
+
+    result = run_imagefolder_training_workflow(request, should_stop=lambda: True)
+
+    assert len(result.history.train_losses) == 1
+    assert result.history.stopped_by_user is True
+    for path in (
+        result.best_model_state_dict_path,
+        result.training_history_path,
+        result.class_mapping_path,
+        result.test_result_path,
+        result.checkpoint_path,
+        result.checkpoint_metadata_path,
+        result.torchscript_model_path,
+        result.torchscript_metadata_path,
+    ):
+        assert path is not None
+        assert path.exists()
+
+    payload = load_training_checkpoint(checkpoint_path)
+    assert payload["history"]["stopped_by_user"] is True
+
+
+def test_workflow_user_stopped_checkpoint_is_resumable(tmp_path: Path) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    checkpoint_path = tmp_path / "checkpoint.pt"
+
+    first_request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=5, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path / "out1",
+        checkpoint_out=checkpoint_path,
+        export_torchscript=False,
+        seed=SEED,
+    )
+    first = run_imagefolder_training_workflow(first_request, should_stop=lambda: True)
+    assert len(first.history.train_losses) == 1
+    assert first.history.stopped_by_user is True
+
+    second_request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=2, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path / "out2",
+        resume_from=checkpoint_path,
+        export_torchscript=False,
+        seed=SEED,
+    )
+    second = run_imagefolder_training_workflow(second_request)
+
+    assert len(second.history.train_losses) == 3
+    assert second.history.stopped_by_user is False

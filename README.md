@@ -608,6 +608,65 @@ Training E2E" 절 참고. best model save/reload 재검증은 두지 않습니�
 
 ---
 
+## Phase 4I: Training Progress Callback and Safe Stop
+
+핵심 `run_training()`에 epoch 경계 progress callback과 협조적(cooperative)
+stop 메커니즘을 추가했습니다. 둘 다 키워드 전용(keyword-only) 파라미터로,
+넘기지 않으면(기본값 `None`) Phase 4H까지의 동작과 완전히 동일합니다:
+
+```python
+result = run_training(
+    model, train_loader, val_loader, config,
+    progress_callback=lambda progress: print(progress.global_epoch, progress.val_loss),
+    should_stop=lambda: stop_requested,  # 인자 없이 bool을 반환하는 아무 callable이나 가능 (예: threading.Event().is_set)
+)
+```
+
+* **`progress_callback`**: epoch이 완료될 때마다(early stopping으로 끝난
+  epoch 포함) 정확히 한 번, 읽기 전용 `TrainingProgress` 스냅샷과 함께
+  호출됩니다. `TrainingProgress`는 관찰/UI 갱신 전용 지표만 담고
+  (`run_epoch`/`total_run_epochs`/`global_epoch`/`train_loss`/`val_loss`/
+  `val_accuracy`/`learning_rate`/`best_epoch`/`best_val_loss`/
+  `epochs_without_improvement`/`stopped_early`), model/state_dict/
+  optimizer/scheduler 객체나 시간 정보는 포함하지 않습니다. 콜백이
+  예외를 던지면 그대로 전파되고(감싸지 않음) `TrainingResult`는 반환되지
+  않습니다.
+* **`should_stop`**: `progress_callback` 호출 직후, 같은 epoch 경계에서
+  평가됩니다(콜백 안에서 동기적으로 stop 플래그를 세팅하면 지연 없이
+  바로 반영됨). 단, **epoch 시작 전에는 절대 평가되지 않고**(최소 1개
+  epoch은 항상 실행됨), **이번 호출의 마지막 요청 epoch이거나
+  `config.epochs == 1`이면 평가 자체가 없습니다**(더 이상 건너뛸 epoch이
+  없으므로). `True`를 반환하면 `TrainingHistory.stopped_by_user = True`를
+  설정하고 멈춥니다.
+* **`stopped_by_user`**(새 `TrainingHistory` 필드, 기본값 `False`): 사용자
+  요청으로 epoch를 남긴 채 멈췄음을 나타냅니다. `stopped_early`와 달리
+  resume이 거부되지 않습니다(사용자가 잠시 멈춘 것뿐이므로) -- 기존
+  checkpoint/history JSON은 이 필드가 없어도 기본값으로 채워지며,
+  `checkpoint.py`/`history.py`는 변경되지 않았습니다(둘 다 `asdict()`/
+  `**dict` 기반으로 완전히 범용적이라 새 필드 추가에 코드 변경이
+  필요 없었습니다). resume 시에는 이전 checkpoint의 `stopped_by_user`
+  값이 그대로 이어받지 않도록 항상 `False`로 리셋됩니다.
+* `run_imagefolder_training_workflow()`도 동일한 키워드 전용 파라미터를
+  받아 `run_training()`에 그대로 전달합니다(`ImageFolderWorkflowRequest`
+  dataclass 필드가 아님 -- Request의 JSON 직렬화 가능성과 데이터/제어
+  흐름 관심사 분리를 유지하기 위함). 사용자 중단으로 끝난 결과도 정상
+  완료와 동일하게 checkpoint/history/best model/class mapping/test
+  결과/TorchScript export 전체 아티팩트 파이프라인을 거칩니다(별도
+  분기 없음).
+* `scripts/train_imagefolder.py`는 `progress_callback`으로 epoch마다
+  실시간으로 한 줄씩 출력합니다(`progress.global_epoch` 기준). **resume
+  실행에서는 새로 완료된 epoch만 찍습니다** -- 과거처럼 누적 history
+  전체를 사후 재출력하지 않는 의도된 동작 변경입니다. 새 CLI 플래그(중단
+  요청용)는 추가하지 않았습니다 -- `should_stop`은 core API 계약이고,
+  CLI에서 실제로 중단을 트리거하는 방법(시그널/파일/등)은 이번 Phase
+  범위 밖입니다. `scripts/run_imagefolder_training_e2e.py`는 변경하지
+  않았습니다.
+
+설계 배경, 3라운드 리뷰에서 수정된 논리적 충돌, 17개 동작 계약 테스트
+목록은 `docs/phase4i_training_progress_and_stop_design.md`를 참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
@@ -637,6 +696,9 @@ Training E2E" 절 참고. best model save/reload 재검증은 두지 않습니�
   분리, `--batch-size`/`--learning-rate`/`--output-dir`/`--seed`/
   `--export-torchscript` 신규 노출, production CLI는 C++ parity를
   실행하지 않음 (Phase 4H)
+* `run_training()`의 epoch 경계 progress callback + 협조적(cooperative)
+  stop(`should_stop`), `TrainingHistory.stopped_by_user` 기록, resume
+  계속 가능 (Phase 4I)
 * TorchScript 배포, C++(LibTorch) CPU/CUDA 추론
 * Python/C++ parity 검증 (Phase 0~4E 배포 경로; Phase 4F는 export/parity
   코드를 변경하지 않았고, 기존 parity E2E를 재실행해 회귀 없음을 확인함

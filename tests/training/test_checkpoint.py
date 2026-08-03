@@ -26,7 +26,7 @@ from image_ai_studio.training.checkpoint import (
 )
 from image_ai_studio.training.config import TrainingConfig
 from image_ai_studio.training.dataset import make_train_val_datasets
-from image_ai_studio.training.loop import TrainingResult, run_training
+from image_ai_studio.training.loop import TrainingHistory, TrainingResult, run_training
 
 
 def _spec() -> ModelSpec:
@@ -218,6 +218,29 @@ def test_load_training_checkpoint_allows_stopped_early_for_weight_extraction(tmp
     assert loaded["history"]["stopped_early"] is True
     fresh_model = build_model(_mlp_spec())
     fresh_model.load_state_dict(loaded["best_state_dict"])  # 공식 API로 가중치 추출 가능
+
+
+def test_load_training_checkpoint_accepts_legacy_history_without_stopped_by_user(tmp_path: Path) -> None:
+    """Phase 4H까지 저장된 checkpoint의 history payload에는 stopped_by_user
+    키가 없다. load_training_checkpoint()의 구조 검증(_REQUIRED_HISTORY_FIELDS)
+    은 그 키를 요구하지 않으므로(checkpoint.py 무수정) 여전히 통과해야
+    하고, TrainingHistory(**payload["history"])로 복원하면 dataclass
+    기본값(False)이 채워져야 한다 -- history.py의 legacy history.json
+    하위 호환(tests/training/test_history.py)과 동일한 메커니즘을
+    checkpoint 경로에서도 확인한다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+    checkpoint_path, _, _ = _run_and_save_checkpoint(tmp_path, config)
+
+    payload = torch.load(checkpoint_path, weights_only=True)
+    assert "stopped_by_user" in payload["history"]  # 현재 저장 형식에는 있음을 먼저 확인
+    del payload["history"]["stopped_by_user"]  # Phase 4H까지의 실제 저장 형식을 흉내
+    legacy_path = tmp_path / "legacy_no_stopped_by_user.pt"
+    torch.save(payload, legacy_path)
+
+    loaded = load_training_checkpoint(legacy_path)  # 구조 검증 통과 (필수 필드 목록에 없음)
+
+    restored_history = TrainingHistory(**loaded["history"])
+    assert restored_history.stopped_by_user is False
 
 
 def test_load_training_checkpoint_rejects_non_dict_history(tmp_path: Path) -> None:

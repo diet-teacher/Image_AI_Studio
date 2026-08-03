@@ -918,3 +918,424 @@ def test_run_training_resume_scheduler_lr_reduction_crosses_checkpoint_boundary(
     assert result_b2.optimizer_state_dict["param_groups"][0]["lr"] == 0.5
     _assert_deep_equal(result_a.optimizer_state_dict["param_groups"], result_b2.optimizer_state_dict["param_groups"])
     _assert_deep_equal(result_a.scheduler_state_dict, result_b2.scheduler_state_dict)
+
+
+# -- Phase 4I: progress_callback / should_stop --------------------------------
+
+
+def test_run_training_callback_and_should_stop_none_by_default_no_behavior_change() -> None:
+    """progress_callback/should_stop을 아예 넘기지 않는 것과 명시적으로
+    None을 넘기는 것이 동일한 결과를 내야 한다 (기존 caller 전부가
+    이 경로를 그대로 쓰므로, Phase 4I 도입으로 기존 동작이 바뀌면 안 됨)."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model_a = build_model(spec)
+    train_loader_a, val_loader_a = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=5, batch_size=8, learning_rate=1e-2)
+    torch.manual_seed(0)
+    result_a = run_training(model_a, train_loader_a, val_loader_a, config)
+
+    torch.manual_seed(0)
+    model_b = build_model(spec)
+    train_loader_b, val_loader_b = _make_loaders(spec, seed=0)
+    torch.manual_seed(0)
+    result_b = run_training(
+        model_b, train_loader_b, val_loader_b, config, progress_callback=None, should_stop=None
+    )
+
+    assert result_a.history.train_losses == result_b.history.train_losses
+    assert result_a.history.val_losses == result_b.history.val_losses
+    assert result_a.history.val_accuracies == result_b.history.val_accuracies
+    for name, tensor in result_a.best_state_dict.items():
+        assert torch.equal(tensor, result_b.best_state_dict[name])
+
+
+def test_run_training_progress_callback_called_once_per_completed_epoch_with_matching_metrics() -> None:
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=4, batch_size=8, learning_rate=1e-2)
+
+    progresses: list = []
+    result = run_training(model, train_loader, val_loader, config, progress_callback=progresses.append)
+    history = result.history
+
+    assert len(progresses) == config.epochs
+    for index, progress in enumerate(progresses):
+        assert progress.run_epoch == index + 1
+        assert progress.global_epoch == index + 1
+        assert progress.total_run_epochs == config.epochs
+        assert progress.train_loss == history.train_losses[index]
+        assert progress.val_loss == history.val_losses[index]
+        assert progress.val_accuracy == history.val_accuracies[index]
+    last = progresses[-1]
+    assert last.best_epoch == history.best_epoch
+    assert last.best_val_loss == history.best_val_loss
+    assert last.epochs_without_improvement == result.epochs_without_improvement
+    assert last.stopped_early == history.stopped_early
+
+
+def test_run_training_progress_callback_reports_global_epoch_on_resume() -> None:
+    """resume 시 progress.run_epoch는 이번 호출 기준(1부터)이지만
+    global_epoch은 절대 번호(이전 completed_epochs + run_epoch)여야 한다."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    first_config = TrainingConfig(epochs=3, batch_size=8, learning_rate=1e-2)
+    first = run_training(model, train_loader, val_loader, first_config)
+
+    progresses: list = []
+    second_config = TrainingConfig(epochs=2, batch_size=8, learning_rate=1e-2)
+    run_training(
+        model, train_loader, val_loader, second_config,
+        resume_state=_make_resume_state(first, first_config),
+        progress_callback=progresses.append,
+    )
+
+    assert [p.run_epoch for p in progresses] == [1, 2]
+    assert [p.global_epoch for p in progresses] == [4, 5]
+    assert [p.total_run_epochs for p in progresses] == [2, 2]
+
+
+def test_run_training_progress_callback_learning_rate_captured_before_scheduler_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """learning_rate는 그 epoch의 train_one_epoch()가 실제로 사용한 값(=
+    scheduler.step() 호출 전)이어야 한다. patience=2, val_loss를 계속
+    1.0으로 고정하면 4번째 step()에서 처음 LR이 줄어든다
+    (test_build_scheduler_reduces_lr_after_patience_bad_steps와 동일한 근거) --
+    그 4번째 epoch의 progress.learning_rate는 여전히 줄어들기 *전* 값(1.0)을
+    보고해야 하고, 그 이후(optimizer_state_dict)에는 줄어든 값(0.5)이 남아야 한다."""
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(
+        epochs=4, batch_size=8, learning_rate=1.0,
+        lr_scheduler="plateau", lr_scheduler_factor=0.5, lr_scheduler_patience=2,
+    )
+    fixed_val_results = iter([(1.0, 1.0)] * 4)
+    monkeypatch.setattr(
+        "image_ai_studio.training.loop.evaluate",
+        lambda model, loader, device="cpu": next(fixed_val_results),
+    )
+
+    progresses: list = []
+    result = run_training(model, train_loader, val_loader, config, progress_callback=progresses.append)
+
+    assert [p.learning_rate for p in progresses] == [1.0, 1.0, 1.0, 1.0]
+    assert result.optimizer_state_dict["param_groups"][0]["lr"] == 0.5
+
+
+def test_run_training_progress_callback_fires_even_on_early_stopping_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=10, batch_size=8, learning_rate=1e-2, early_stopping_patience=2)
+    fixed_val_results = iter([(1.0, 1.0), (1.0, 1.0), (1.0, 1.0), (0.5, 1.0)])
+    monkeypatch.setattr(
+        "image_ai_studio.training.loop.evaluate",
+        lambda model, loader, device="cpu": next(fixed_val_results),
+    )
+
+    progresses: list = []
+    result = run_training(model, train_loader, val_loader, config, progress_callback=progresses.append)
+
+    assert len(progresses) == 3 == len(result.history.train_losses)
+    assert progresses[-1].stopped_early is True
+    assert progresses[0].stopped_early is False
+    assert progresses[1].stopped_early is False
+
+
+def test_run_training_progress_callback_exception_propagates_and_stops_immediately() -> None:
+    """콜백이 예외를 던지면 그대로 전파되고(감싸지 않음), 그 epoch 이후로는
+    더 이상 학습이 진행되지 않는다. 검증 가능한 외부 상태(콜백 호출 횟수,
+    호출자가 들고 있는 model 참조)만 확인한다 -- 예외 시 TrainingResult가
+    반환되지 않으므로 내부 history 객체는 애초에 접근할 수 없다."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    initial_state = copy.deepcopy(model.state_dict())
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=5, batch_size=8, learning_rate=1e-2)
+
+    call_count = {"value": 0}
+
+    def failing_callback(progress) -> None:
+        call_count["value"] += 1
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        run_training(model, train_loader, val_loader, config, progress_callback=failing_callback)
+
+    assert call_count["value"] == 1
+    # model은 호출자가 넘긴 바로 그 참조이므로 예외 후에도 접근 가능하고,
+    # 첫 epoch만큼은 실제로 학습되어 초기 상태와 달라져 있어야 한다.
+    assert any(not torch.equal(initial_state[name], model.state_dict()[name]) for name in initial_state)
+
+
+def test_run_training_should_stop_set_inside_callback_prevents_next_epoch() -> None:
+    """콜백 안에서 동기적으로 stop 플래그를 세팅하면, should_stop()이 콜백
+    직후 같은 epoch 경계에서 바로 평가되어 다음 epoch이 시작되지 않아야
+    한다 (지연 없이 즉시 반영 -- 콜백이 should_stop보다 먼저 호출되는
+    순서 자체를 검증)."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=10, batch_size=8, learning_rate=1e-2)
+
+    stop_flag = {"value": False}
+
+    def callback(progress) -> None:
+        if progress.run_epoch == 3:
+            stop_flag["value"] = True
+
+    result = run_training(
+        model, train_loader, val_loader, config,
+        progress_callback=callback, should_stop=lambda: stop_flag["value"],
+    )
+
+    assert len(result.history.train_losses) == 3
+    assert result.history.stopped_by_user is True
+    assert result.history.stopped_early is False
+
+
+def test_run_training_should_stop_true_before_first_epoch_still_runs_one_epoch() -> None:
+    """should_stop이 처음부터(첫 콜백 전부터) True를 반환해도, epoch 시작
+    전에는 절대 평가되지 않으므로 최소 1개 epoch은 항상 완료된다
+    ("0 epoch 결과"는 불가능)."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=5, batch_size=8, learning_rate=1e-2)
+
+    result = run_training(model, train_loader, val_loader, config, should_stop=lambda: True)
+
+    assert len(result.history.train_losses) == 1
+    assert result.history.stopped_by_user is True
+
+
+def test_run_training_should_stop_not_evaluated_once_early_stopping_triggers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """early stopping이 우선한다: 이미 stopped_early=True로 끝난 epoch에서는
+    should_stop()을 평가하지 않는다. patience=2, val_loss=[1.0,1.0,1.0,0.5]면
+    epoch 3에서 early stopping이 발동하므로 should_stop()은 epoch 1, 2에서만
+    (2번) 평가되고, epoch 3에서는 호출되지 않아야 한다."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=10, batch_size=8, learning_rate=1e-2, early_stopping_patience=2)
+    fixed_val_results = iter([(1.0, 1.0), (1.0, 1.0), (1.0, 1.0), (0.5, 1.0)])
+    monkeypatch.setattr(
+        "image_ai_studio.training.loop.evaluate",
+        lambda model, loader, device="cpu": next(fixed_val_results),
+    )
+
+    should_stop_calls = {"value": 0}
+
+    def should_stop() -> bool:
+        should_stop_calls["value"] += 1
+        return False
+
+    result = run_training(model, train_loader, val_loader, config, should_stop=should_stop)
+
+    assert len(result.history.train_losses) == 3
+    assert result.history.stopped_early is True
+    assert result.history.stopped_by_user is False
+    assert should_stop_calls["value"] == 2
+
+
+def test_run_training_should_stop_not_evaluated_on_last_requested_epoch() -> None:
+    """이번 호출의 마지막 요청 epoch에서는 더 이상 건너뛸 epoch이 없으므로
+    should_stop()을 평가하지 않는다. config.epochs=3이면 epoch 1, 2에서만
+    (2번) 평가되고, epoch 3(마지막)에서는 호출되지 않는다 (should_stop은
+    매번 False를 반환하므로 3 epoch 전부 실행되고, 호출 횟수만으로 "마지막
+    epoch에서는 평가 자체가 없다"는 계약을 확인한다)."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=3, batch_size=8, learning_rate=1e-2)
+
+    should_stop_calls = {"value": 0}
+
+    def should_stop() -> bool:
+        should_stop_calls["value"] += 1
+        return False
+
+    result = run_training(model, train_loader, val_loader, config, should_stop=should_stop)
+
+    assert len(result.history.train_losses) == 3
+    assert should_stop_calls["value"] == 2
+    assert result.history.stopped_by_user is False
+
+
+def test_run_training_should_stop_not_evaluated_when_epochs_is_one() -> None:
+    """config.epochs=1이면 유일한 epoch이 곧 마지막 요청 epoch이므로
+    should_stop()은 절대 호출되지 않는다."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+
+    def should_stop() -> bool:
+        raise AssertionError("should_stop must not be called when config.epochs == 1")
+
+    result = run_training(model, train_loader, val_loader, config, should_stop=should_stop)
+
+    assert len(result.history.train_losses) == 1
+    assert result.history.stopped_by_user is False
+
+
+def test_training_resume_state_accepts_stopped_by_user_history() -> None:
+    """stopped_early와 달리 stopped_by_user=True인 history는 resume 대상으로
+    거부되지 않아야 한다 (사용자가 잠시 멈춘 것뿐이므로 resume이 항상
+    가능해야 함 -- Phase 4I의 핵심 목적)."""
+    history = TrainingHistory(
+        train_losses=[1.0], val_losses=[1.0], val_accuracies=[0.5],
+        best_epoch=1, best_val_loss=1.0, stopped_by_user=True,
+    )
+    resume_state = TrainingResumeState(
+        optimizer_state_dict={}, scheduler_state_dict=None,
+        history=history, epochs_without_improvement=0, best_state_dict={},
+        training_config=asdict(TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)),
+    )
+    assert resume_state.history.stopped_by_user is True
+
+
+def test_run_training_resume_resets_stopped_by_user() -> None:
+    """resume_state.history.stopped_by_user=True로 들어와도, 이번 호출은
+    아직 멈춘 적이 없으므로 즉시 False로 리셋되어야 한다 -- 그러지 않으면
+    이번 호출이 끝까지 다 돌았는데도(should_stop 없이) 이전 중단 상태가
+    잘못 남는다."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=5, batch_size=8, learning_rate=1e-2)
+
+    stop_flag = {"value": False}
+
+    def callback(progress) -> None:
+        if progress.run_epoch == 2:
+            stop_flag["value"] = True
+
+    first = run_training(
+        model, train_loader, val_loader, config,
+        progress_callback=callback, should_stop=lambda: stop_flag["value"],
+    )
+    assert first.history.stopped_by_user is True
+    assert len(first.history.train_losses) == 2
+
+    second = run_training(
+        model, train_loader, val_loader,
+        TrainingConfig(epochs=2, batch_size=8, learning_rate=1e-2),
+        resume_state=_make_resume_state(first, config),
+    )
+
+    assert second.history.stopped_by_user is False
+    assert len(second.history.train_losses) == 4
+
+
+def test_run_training_user_stop_then_resume_matches_continuous_run_exactly() -> None:
+    """stopped_by_user 경로의 checkpoint/resume도 stopped_early 경로
+    (test_run_training_resume_matches_continuous_run_exactly)와 동일한
+    exact-resume 계약을 만족해야 한다 -- 중단 방식만 config.epochs로 자르는
+    대신 should_stop 콜백으로 3 epoch 후 중단시킨다. Dropout이 포함된
+    모델을 써서(전역 CPU RNG 소비) RNG state 복원이 실제로 필요함을 함께
+    검증한다."""
+    seed = 20260803
+    spec = _dropout_mlp_classifier_spec()
+
+    def make_loaders() -> tuple[DataLoader, DataLoader, torch.Generator]:
+        train_dataset, val_dataset = make_train_val_datasets(
+            spec.input_shape, NUM_CLASSES, seed=seed, train_size=32, val_size=16
+        )
+        generator = torch.Generator().manual_seed(seed)
+        train_loader = DataLoader(
+            train_dataset, batch_size=8, shuffle=True, generator=generator, drop_last=True
+        )
+        val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
+        return train_loader, val_loader, generator
+
+    config_kwargs = dict(
+        batch_size=8, learning_rate=1e-2, optimizer="sgd", momentum=0.9,
+        lr_scheduler="plateau", lr_scheduler_factor=0.5, lr_scheduler_patience=1,
+    )
+
+    # (a) 연속 5 epoch (should_stop 없이)
+    torch.manual_seed(seed)
+    model_a = build_model(spec)
+    train_loader_a, val_loader_a, _ = make_loaders()
+    torch.manual_seed(seed)
+    result_a = run_training(model_a, train_loader_a, val_loader_a, TrainingConfig(epochs=5, **config_kwargs))
+
+    # (b) should_stop으로 3 epoch 후 중단 (config.epochs=10이지만 실제로는 3에서 멈춤)
+    torch.manual_seed(seed)
+    model_b = build_model(spec)
+    train_loader_b, val_loader_b, generator_b = make_loaders()
+    torch.manual_seed(seed)
+    first_config = TrainingConfig(epochs=10, **config_kwargs)
+
+    stop_flag = {"value": False}
+
+    def progress_callback(progress) -> None:
+        if progress.run_epoch == 3:
+            stop_flag["value"] = True
+
+    result_b1 = run_training(
+        model_b, train_loader_b, val_loader_b, first_config,
+        progress_callback=progress_callback, should_stop=lambda: stop_flag["value"],
+    )
+    assert len(result_b1.history.train_losses) == 3
+    assert result_b1.history.stopped_by_user is True
+    assert result_b1.history.stopped_early is False
+
+    # checkpoint 시점 상태를 caller가 직접 채취 (run_training()이 파일을 쓰지 않으므로)
+    loader_generator_state = generator_b.get_state().clone()
+    cpu_rng_state = torch.get_rng_state().clone()
+    resume_state = _make_resume_state(result_b1, first_config)
+
+    # "새 프로세스"를 흉내: 새 model/DataLoader/generator를 만들고 저장된 상태를 복원
+    model_b2 = build_model(spec)
+    model_b2.load_state_dict(model_b.state_dict())
+    train_dataset2, val_dataset2 = make_train_val_datasets(
+        spec.input_shape, NUM_CLASSES, seed=seed, train_size=32, val_size=16
+    )
+    restored_generator = torch.Generator()
+    restored_generator.set_state(loader_generator_state)
+    train_loader_b2 = DataLoader(
+        train_dataset2, batch_size=8, shuffle=True, generator=restored_generator, drop_last=True
+    )
+    val_loader_b2 = DataLoader(val_dataset2, batch_size=8, shuffle=False)
+    torch.set_rng_state(cpu_rng_state)
+
+    result_b2 = run_training(
+        model_b2, train_loader_b2, val_loader_b2, TrainingConfig(epochs=2, **config_kwargs),
+        resume_state=resume_state,
+    )
+
+    assert result_b2.history.stopped_by_user is False
+    assert result_b2.history.train_losses == result_a.history.train_losses
+    assert result_b2.history.val_losses == result_a.history.val_losses
+    assert result_b2.history.val_accuracies == result_a.history.val_accuracies
+    assert result_b2.history.best_epoch == result_a.history.best_epoch
+    assert result_b2.history.best_val_loss == result_a.history.best_val_loss
+    assert result_b2.epochs_without_improvement == result_a.epochs_without_improvement
+
+    for name, tensor in model_a.state_dict().items():
+        assert torch.equal(tensor, model_b2.state_dict()[name])
+    for name, tensor in result_a.best_state_dict.items():
+        assert torch.equal(tensor, result_b2.best_state_dict[name])
+
+    _assert_deep_equal(result_a.optimizer_state_dict, result_b2.optimizer_state_dict)
+    _assert_deep_equal(result_a.scheduler_state_dict, result_b2.scheduler_state_dict)
