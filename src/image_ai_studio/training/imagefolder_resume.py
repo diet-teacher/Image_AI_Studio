@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -103,11 +105,35 @@ def build_imagefolder_resume_metadata(model_spec: ModelSpec, splits: ImageFolder
     )
 
 
-def save_imagefolder_resume_metadata(metadata: ImageFolderResumeMetadata, path: str | Path) -> None:
-    """metadata를 JSON 파일로 저장. 상위 디렉터리 자동 생성."""
-    path = Path(path)
+def _atomic_write_text(text: str, path: Path) -> None:
+    """text를 path에 원자적으로 쓴다(Phase 4J, docs/
+    phase4j_epoch_checkpoint_design.md §7-2) -- checkpoint.py의
+    _atomic_torch_save()와 같은 계약(목적지와 같은 디렉터리에 임시
+    파일 생성 -> flush()/os.fsync() -> os.replace(), 실패 시 목적지
+    보존, 정리 실패가 원래 예외를 가리지 않음)을 텍스트 파일에 대해
+    수행한다."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(metadata), indent=2), encoding="utf-8")
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def save_imagefolder_resume_metadata(metadata: ImageFolderResumeMetadata, path: str | Path) -> None:
+    """metadata를 JSON 파일로 저장. 상위 디렉터리 자동 생성. 저장은
+    원자적이다(§7-2) -- 예외가 나면 기존 파일은 전혀 바뀌지 않는다."""
+    path = Path(path)
+    _atomic_write_text(json.dumps(asdict(metadata), indent=2), path)
 
 
 def load_imagefolder_resume_metadata(path: str | Path) -> ImageFolderResumeMetadata:

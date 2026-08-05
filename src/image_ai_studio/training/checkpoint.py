@@ -22,6 +22,8 @@ best_state_dict만 꺼내 쓰는 것도 정당한 용도이기 때문이다. res
 """
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import asdict
 from pathlib import Path
 
@@ -59,6 +61,33 @@ _REQUIRED_HISTORY_FIELDS = (
     "best_val_loss",
     "stopped_early",
 )
+
+
+def _atomic_torch_save(payload: dict[str, object], path: Path) -> None:
+    """payload를 path에 원자적으로 쓴다(Phase 4J, docs/
+    phase4j_epoch_checkpoint_design.md §7-2) -- 목적지와 같은 디렉터리에
+    tempfile.mkstemp()로 임시 파일을 만들고, torch.save() 후
+    flush()/os.fsync()로 디스크에 반영을 요청한 뒤 os.replace()로
+    교체한다(POSIX/Windows 양쪽에서 원자적). os.replace() 이전에
+    실패하면 목적지 파일은 전혀 건드려지지 않는다. os.replace() 자체가
+    실패하면 예외가 그대로 전파된다(재시도/폴백 없음). 어떤 예외든
+    임시 파일 삭제를 시도하지만, 그 정리가 실패해도 원래 예외를
+    가리지 않는다."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            torch.save(payload, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def save_state_dict(model: nn.Module, path: str | Path) -> None:
@@ -107,9 +136,13 @@ def save_training_checkpoint(
 
         loader_generator_state = train_loader.generator.get_state()
         cpu_rng_state = torch.get_rng_state()
+
+    저장은 원자적이다(Phase 4J, docs/phase4j_epoch_checkpoint_design.md
+    §7-2) -- 임시 파일에 다 쓴 뒤 os.replace()로 교체하므로, 이 함수가
+    예외를 던지면 `path`의 기존 내용은 전혀 바뀌지 않는다(재시도/
+    폴백 없이 예외가 그대로 전파된다).
     """
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "format_version": CHECKPOINT_FORMAT_VERSION,
         "model_state_dict": model.state_dict(),
@@ -122,7 +155,7 @@ def save_training_checkpoint(
         "loader_generator_state": loader_generator_state,
         "cpu_rng_state": cpu_rng_state,
     }
-    torch.save(payload, path)
+    _atomic_torch_save(payload, path)
 
 
 def load_training_checkpoint(path: str | Path, *, map_location: str = "cpu") -> dict:

@@ -101,8 +101,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "학습 종료 후 checkpoint를 저장할 경로. metadata는 항상 같은 이름 뒤에 "
-            "'.meta.json'을 붙인 경로로 자동 저장된다 (별도 플래그 없음)"
+            "checkpoint를 저장할 경로(학습 종료 시 항상 저장됨). metadata는 항상 같은 이름 뒤에 "
+            "'.meta.json'을 붙인 경로로 자동 저장된다 (별도 플래그 없음). fresh 학습이나 "
+            "--resume-from과 다른 경로로의 resume은 이 경로(와 metadata sidecar)가 완전히 "
+            "비어있어야 한다 -- 기존 checkpoint를 이어서 갱신하려면 --resume-from과 같은 "
+            "경로를 지정할 것"
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=None,
+        help=(
+            "global epoch이 이 값의 배수가 될 때마다 --checkpoint-out을 자동으로 갱신한다 "
+            "(1 이상의 정수, --checkpoint-out 필수). 생략하면 기존과 동일하게 학습 종료 시에만 저장된다"
         ),
     )
 
@@ -167,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
             checkpoint_out=args.checkpoint_out,
             export_torchscript=args.export_torchscript,
             seed=args.seed,
+            checkpoint_every=args.checkpoint_every,
         )
         result = run_imagefolder_training_workflow(request, progress_callback=_print_progress)
     except (ModelValidationError, TrainingConfigError, ValueError, OSError) as exc:

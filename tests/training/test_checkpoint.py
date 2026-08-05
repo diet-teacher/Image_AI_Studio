@@ -1,6 +1,7 @@
 """state_dict / full training checkpoint 저장/재로드 테스트."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ from image_ai_studio.model_definition.specs import (
 )
 from image_ai_studio.training.checkpoint import (
     CHECKPOINT_FORMAT_VERSION,
+    _atomic_torch_save,
     load_state_dict,
     load_training_checkpoint,
     require_compatible_resume_config,
@@ -458,6 +460,114 @@ def test_require_compatible_resume_config_rejects_mismatched_fields(
 
     with pytest.raises(ValueError, match="cannot resume"):
         require_compatible_resume_config(payload["training_config"], mismatched_config)
+
+
+# -- Phase 4J: atomic save -----------------------------------------------------
+
+
+def test_atomic_torch_save_creates_parent_directories(tmp_path: Path) -> None:
+    nested_path = tmp_path / "nested" / "dir" / "payload.pt"
+    _atomic_torch_save({"value": 1}, nested_path)
+
+    assert nested_path.exists()
+    assert torch.load(nested_path, weights_only=True) == {"value": 1}
+
+
+def test_atomic_torch_save_no_leftover_temp_files(tmp_path: Path) -> None:
+    path = tmp_path / "payload.pt"
+    _atomic_torch_save({"value": 1}, path)
+
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_atomic_torch_save_failure_before_replace_preserves_existing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """torch.save() 자체가 실패하면(os.replace() 이전) 기존 파일은 전혀
+    바뀌지 않고, 임시 파일도 남지 않아야 한다."""
+    path = tmp_path / "payload.pt"
+    _atomic_torch_save({"value": "original"}, path)
+    original_bytes = path.read_bytes()
+
+    def failing_torch_save(*args, **kwargs):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr("image_ai_studio.training.checkpoint.torch.save", failing_torch_save)
+
+    with pytest.raises(RuntimeError, match="disk full"):
+        _atomic_torch_save({"value": "new"}, path)
+
+    assert path.read_bytes() == original_bytes  # 기존 파일 보존
+    assert list(tmp_path.iterdir()) == [path]  # 임시 파일 미잔존
+
+
+def test_atomic_torch_save_os_replace_failure_propagates_and_preserves_existing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """os.replace() 자체가 실패해도(예: 권한 문제) 예외가 재시도/폴백 없이
+    그대로 전파되고, 기존 파일은 보존되어야 한다."""
+    path = tmp_path / "payload.pt"
+    _atomic_torch_save({"value": "original"}, path)
+    original_bytes = path.read_bytes()
+
+    def failing_replace(*args, **kwargs):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr("image_ai_studio.training.checkpoint.os.replace", failing_replace)
+
+    with pytest.raises(OSError, match="permission denied"):
+        _atomic_torch_save({"value": "new"}, path)
+
+    assert path.read_bytes() == original_bytes  # 기존 파일 보존
+    assert list(tmp_path.iterdir()) == [path]  # 임시 파일 미잔존
+
+
+def test_atomic_torch_save_cleanup_failure_does_not_mask_original_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """임시 파일 정리(unlink) 자체가 실패해도, 사용자에게 보이는 예외는
+    원래 저장 실패 예외여야 한다(정리 실패가 원래 예외를 가리면 안 됨)."""
+    path = tmp_path / "payload.pt"
+
+    def failing_torch_save(*args, **kwargs):
+        raise RuntimeError("original failure")
+
+    def failing_unlink(self, *args, **kwargs):
+        raise OSError("cleanup also failed")
+
+    monkeypatch.setattr("image_ai_studio.training.checkpoint.torch.save", failing_torch_save)
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+
+    with pytest.raises(RuntimeError, match="original failure"):
+        _atomic_torch_save({"value": "new"}, path)
+
+
+def test_save_training_checkpoint_atomic_failure_preserves_existing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """save_training_checkpoint()가 내부적으로 원자적 저장을 쓰므로,
+    저장 도중 실패해도 기존 checkpoint 파일이 손상되지 않아야 한다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+    checkpoint_path, result, model = _run_and_save_checkpoint(tmp_path, config)
+    original_bytes = checkpoint_path.read_bytes()
+
+    def failing_torch_save(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("image_ai_studio.training.checkpoint.torch.save", failing_torch_save)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        save_training_checkpoint(
+            checkpoint_path,
+            model=model,
+            training_result=result,
+            training_config=config,
+            loader_generator_state=torch.get_rng_state(),
+            cpu_rng_state=torch.get_rng_state(),
+        )
+
+    assert checkpoint_path.read_bytes() == original_bytes
+    assert {p.name for p in tmp_path.iterdir()} == {checkpoint_path.name}
 
 
 @pytest.mark.parametrize(

@@ -27,6 +27,7 @@ from image_ai_studio.model_definition.specs import (
 from image_ai_studio.training.checkpoint import load_training_checkpoint, save_training_checkpoint
 from image_ai_studio.training.config import TrainingConfig
 from image_ai_studio.training.imagefolder_resume import (
+    _atomic_write_text,
     build_imagefolder_resume_metadata,
     hash_model_spec,
     load_imagefolder_resume_metadata,
@@ -151,6 +152,68 @@ def test_build_imagefolder_resume_metadata_records_sizes_and_class_to_idx(tmp_pa
     assert metadata.train_size == 8
     assert metadata.val_size == 8
     assert metadata.test_size == 8
+
+
+# -- Phase 4J: atomic write ----------------------------------------------------
+
+
+def test_atomic_write_text_creates_parent_directories(tmp_path: Path) -> None:
+    nested_path = tmp_path / "nested" / "dir" / "sidecar.json"
+    _atomic_write_text('{"value": 1}', nested_path)
+
+    assert nested_path.read_text(encoding="utf-8") == '{"value": 1}'
+
+
+def test_atomic_write_text_no_leftover_temp_files(tmp_path: Path) -> None:
+    path = tmp_path / "sidecar.json"
+    _atomic_write_text('{"value": 1}', path)
+
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_save_imagefolder_resume_metadata_atomic_failure_preserves_existing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """save_imagefolder_resume_metadata()가 내부적으로 원자적 저장을
+    쓰므로, 저장 도중 실패(완전히 새 경로에서 metadata 쓰기가 실패하는
+    시나리오)해도 그 자리에 checkpoint가 아직 생기지 않은 상태(즉 아무
+    파일도 없는 상태)가 그대로 유지되어야 한다."""
+    dataset_root = tmp_path / "dataset"
+    _make_standard_dataset(dataset_root)
+    spec = _dropout_classifier_spec()
+    splits = make_imagefolder_datasets(INPUT_SHAPE, dataset_root)
+
+    metadata_path = tmp_path / "checkpoint.pt.meta.json"
+    metadata = build_imagefolder_resume_metadata(spec, splits)
+
+    def failing_replace(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("image_ai_studio.training.imagefolder_resume.os.replace", failing_replace)
+
+    with pytest.raises(OSError, match="disk full"):
+        save_imagefolder_resume_metadata(metadata, metadata_path)
+
+    assert not metadata_path.exists()
+    assert list(tmp_path.glob("*.tmp")) == []  # 임시 파일 미잔존
+
+
+def test_atomic_write_text_cleanup_failure_does_not_mask_original_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "sidecar.json"
+
+    def failing_replace(*args, **kwargs):
+        raise OSError("original failure")
+
+    def failing_unlink(self, *args, **kwargs):
+        raise OSError("cleanup also failed")
+
+    monkeypatch.setattr("image_ai_studio.training.imagefolder_resume.os.replace", failing_replace)
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+
+    with pytest.raises(OSError, match="original failure"):
+        _atomic_write_text('{"value": 1}', path)
 
 
 # -- load_imagefolder_resume_metadata() 에러 계약 --------------------------------

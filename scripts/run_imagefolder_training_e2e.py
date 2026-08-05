@@ -62,6 +62,7 @@ from image_ai_studio.parity.tensor_io import save_tensor
 from image_ai_studio.tools.run_and_compare import find_runner_binary, run_case
 from image_ai_studio.training.checkpoint import load_state_dict
 from image_ai_studio.training.config import TrainingConfig, TrainingConfigError
+from image_ai_studio.training.imagefolder_resume import metadata_path_for_checkpoint
 from image_ai_studio.training.imagefolder_workflow import (
     ImageFolderWorkflowRequest,
     ImageFolderWorkflowResult,
@@ -130,6 +131,14 @@ def main(argv: list[str] | None = None) -> int:
 
     fresh_config = TrainingConfig(epochs=FRESH_EPOCHS, batch_size=BATCH_SIZE, learning_rate=LEARNING_RATE)
     resume_config = TrainingConfig(epochs=RESUME_EPOCHS, batch_size=BATCH_SIZE, learning_rate=LEARNING_RATE)
+
+    # Phase 4J의 출력 경로 재사용 정책(docs/phase4j_epoch_checkpoint_design.md
+    # §6-5)은 fresh 학습이 기존 checkpoint_out(+metadata sidecar)을 재사용하는
+    # 것을 거부한다 -- 이 E2E는 CHECKPOINT_PATH를 고정 경로로 매번 재사용하므로,
+    # 이 스크립트를 여러 번 실행할 수 있도록 stage 1(fresh) 직전에만 이 두
+    # 파일을 지운다(다른 산출물은 건드리지 않음).
+    CHECKPOINT_PATH.unlink(missing_ok=True)
+    metadata_path_for_checkpoint(CHECKPOINT_PATH).unlink(missing_ok=True)
 
     fresh_result = _run_workflow_stage(
         f"Fresh training ({FRESH_EPOCHS} epochs) + checkpoint save",

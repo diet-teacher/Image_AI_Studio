@@ -24,8 +24,10 @@ ValueError의 서브클래스). TorchScript export 실패만 예외로 승격한
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import torch
 from torch import nn
@@ -51,9 +53,12 @@ from image_ai_studio.training.imagefolder_resume import (
     save_imagefolder_resume_metadata,
 )
 from image_ai_studio.training.loop import (
+    CheckpointHook,
+    EpochCheckpointView,
     ShouldStopCallback,
     TrainingHistory,
     TrainingProgressCallback,
+    TrainingResult,
     TrainingResumeState,
     evaluate,
     run_training,
@@ -75,7 +80,13 @@ _TORCHSCRIPT_METADATA_FILENAME = "model_metadata.json"
 class ImageFolderWorkflowRequest:
     """워크플로우 호출에 필요한 전부. `training_config`는 이미 검증된
     `TrainingConfig` 인스턴스를 그대로 받는다(호출자가 CLI argparse에서
-    조립하든, E2E가 고정 상수로 조립하든 이 dataclass는 신경 쓰지 않는다)."""
+    조립하든, E2E가 고정 상수로 조립하든 이 dataclass는 신경 쓰지 않는다).
+
+    checkpoint_every(Phase 4J, docs/phase4j_epoch_checkpoint_design.md
+    §6/§11)는 global epoch이 이 값의 배수가 될 때마다 `checkpoint_out`을
+    자동으로 갱신한다. `None`(기본값)이면 학습 도중 자동 저장을 하지
+    않고, 기존과 동일하게 학습 종료 시 최종 저장만 수행한다.
+    `checkpoint_every`를 켜려면 `checkpoint_out`이 함께 있어야 한다."""
 
     model_json_path: Path
     dataset_root: Path
@@ -85,6 +96,7 @@ class ImageFolderWorkflowRequest:
     checkpoint_out: Path | None = None
     export_torchscript: bool = True
     seed: int = SEED
+    checkpoint_every: int | None = None
 
 
 @dataclass
@@ -164,18 +176,140 @@ def _prepare_resume(
     return model, restored_generator, resume_state, payload["cpu_rng_state"]
 
 
+def _validate_checkpoint_every(value: int | None) -> None:
+    """checkpoint_every 유효성 검증(Phase 4J, §6-2/§11-2). `config.py`의
+    private `_require_positive_int()`는 재사용하지 않는다 -- 이 모듈
+    자체의 validator로 둔다."""
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"checkpoint_every must be an integer or None, got {value!r}")
+    if value < 1:
+        raise ValueError(f"checkpoint_every must be at least 1, got {value!r}")
+
+
+def _normalized_path(path: str | Path) -> str:
+    """두 경로가 같은 파일을 가리키는지 비교하기 위한 정규화(Phase 4J,
+    §11-2). Path.resolve()로 상대/절대 표기 차이를 없애고,
+    os.path.normcase()로 Windows의 대소문자 비구분 파일시스템에서의
+    오탐/누락을 줄인다(POSIX에서 normcase는 no-op)."""
+    return os.path.normcase(str(Path(path).resolve(strict=False)))
+
+
+def _is_in_place_resume(request: ImageFolderWorkflowRequest) -> bool:
+    """resume_from과 checkpoint_out이 정확히 같은 파일을 가리키면(Phase
+    4J, §6-4/§11-2) True -- 이 경우에만 기존 checkpoint_out 경로를
+    갱신하는 것이 허용된다. §7-3의 metadata_ready 초기값도 이 함수
+    하나를 그대로 재사용한다."""
+    if request.resume_from is None or request.checkpoint_out is None:
+        return False
+    return _normalized_path(request.resume_from) == _normalized_path(request.checkpoint_out)
+
+
+def _validate_checkpoint_output_paths(request: ImageFolderWorkflowRequest) -> None:
+    """출력 경로 재사용 정책(Phase 4J, §6-5): in-place resume(resume_from
+    == checkpoint_out)만 기존 checkpoint_out 경로를 갱신할 수 있다.
+    그 외(fresh 또는 다른 경로로의 resume)는 checkpoint_out과 그
+    metadata sidecar가 완전히 비어있는 새 경로여야 한다 -- 기존 파일이
+    있으면 학습을 시작하기 전에 거부한다(기존 파일을 지우거나 바꾸지
+    않는다)."""
+    if request.checkpoint_out is None:
+        return
+    if _is_in_place_resume(request):
+        return
+
+    checkpoint_path = Path(request.checkpoint_out)
+    metadata_path = metadata_path_for_checkpoint(checkpoint_path)
+    if checkpoint_path.exists():
+        raise ValueError(
+            f"{checkpoint_path} already exists -- a fresh training run (or a resume "
+            "that writes to a different path than --resume-from) must use a new, "
+            "unused checkpoint_out path. To continue training this exact checkpoint, "
+            "pass it as both --resume-from and --checkpoint-out."
+        )
+    if metadata_path.exists():
+        raise ValueError(
+            f"{metadata_path} already exists -- a fresh training run (or a resume "
+            "that writes to a different path than --resume-from) must use a new, "
+            "unused checkpoint_out path."
+        )
+
+
+def _make_checkpoint_hook(
+    request: ImageFolderWorkflowRequest,
+    ensure_checkpoint_metadata: Callable[[], None],
+) -> CheckpointHook:
+    """global epoch 기준 cadence로 동작하는 checkpoint_hook을 만든다
+    (Phase 4J, §11-3). `model_spec`/`splits`는 다시 캡처하지 않는다 --
+    `ensure_checkpoint_metadata`가 이미 그것들을 캡처했으므로 이 hook은
+    그 함수 하나만 공유해서 쓴다."""
+
+    def hook(view: EpochCheckpointView) -> None:
+        global_epoch = len(view.history.train_losses)
+        if global_epoch % request.checkpoint_every != 0:
+            return  # non-scheduled epoch -- state_dict()/RNG 조회를 전혀 하지 않는다
+
+        if view.loader_generator is None:
+            raise ValueError(
+                "auto checkpoint requires an explicit DataLoader generator for exact "
+                "resume, but loader_generator is None"
+            )
+
+        ensure_checkpoint_metadata()  # §7-3, checkpoint보다 먼저
+
+        training_result = TrainingResult(
+            history=view.history,
+            best_state_dict=view.best_state_dict,
+            optimizer_state_dict=view.optimizer.state_dict(),
+            scheduler_state_dict=(view.scheduler.state_dict() if view.scheduler is not None else None),
+            epochs_without_improvement=view.epochs_without_improvement,
+        )
+        save_training_checkpoint(  # 원자적(§7-2)
+            request.checkpoint_out,
+            model=view.model,
+            training_result=training_result,
+            training_config=request.training_config,
+            loader_generator_state=view.loader_generator.get_state(),
+            cpu_rng_state=torch.get_rng_state(),
+        )
+
+    return hook
+
+
 def run_imagefolder_training_workflow(
     request: ImageFolderWorkflowRequest,
     *,
     progress_callback: TrainingProgressCallback | None = None,
     should_stop: ShouldStopCallback | None = None,
 ) -> ImageFolderWorkflowResult:
+    _validate_checkpoint_every(request.checkpoint_every)
+    if request.checkpoint_every is not None and request.checkpoint_out is None:
+        raise ValueError("checkpoint_every requires checkpoint_out to be set")
+    _validate_checkpoint_output_paths(request)
+
     model_spec = load_model_spec(request.model_json_path)
     shape_trace = validate_model_spec(model_spec)
     final_shape = shape_trace[-1].output_shape
 
     splits = make_imagefolder_datasets(model_spec.input_shape, root=request.dataset_root)
     require_matching_num_classes(len(splits.classes), final_shape)
+
+    # metadata_ready/ensure_checkpoint_metadata는 이 workflow 호출 하나당
+    # 정확히 한 번 만들어지는 closure 상태다 -- scheduled checkpoint_hook과
+    # 아래의 학습 종료 후 최종 저장이 이 하나를 함께 공유해서, metadata
+    # sidecar를 이번 실행 동안 최대 한 번만 쓴다(Phase 4J, §7-3/§11-3).
+    # in-place resume은 _prepare_resume()이 이미 metadata를 로드/검증했으므로
+    # True로 시작해 절대 다시 쓰지 않는다.
+    metadata_ready = _is_in_place_resume(request)
+
+    def ensure_checkpoint_metadata() -> None:
+        nonlocal metadata_ready
+        if metadata_ready:
+            return
+        metadata_path = metadata_path_for_checkpoint(request.checkpoint_out)
+        current_metadata = build_imagefolder_resume_metadata(model_spec, splits)
+        save_imagefolder_resume_metadata(current_metadata, metadata_path)  # 원자적(§7-2)
+        metadata_ready = True
 
     model, loader_generator, resume_state, cpu_rng_state = _prepare_resume(request, model_spec, splits)
 
@@ -197,9 +331,12 @@ def run_imagefolder_training_workflow(
     if cpu_rng_state is not None:
         torch.set_rng_state(cpu_rng_state)
 
+    checkpoint_hook = (
+        _make_checkpoint_hook(request, ensure_checkpoint_metadata) if request.checkpoint_every is not None else None
+    )
     training_result = run_training(
         model, train_loader, val_loader, request.training_config, device="cpu", resume_state=resume_state,
-        progress_callback=progress_callback, should_stop=should_stop,
+        progress_callback=progress_callback, should_stop=should_stop, checkpoint_hook=checkpoint_hook,
     )
     # checkpoint 저장에 쓸 RNG snapshot -- 이후 코드(TorchScript export의
     # set_seed() 등)가 전역 RNG를 다시 바꾸기 전에, 학습이 실제로 끝난
@@ -220,22 +357,25 @@ def run_imagefolder_training_workflow(
     # checkpoint는 `model`(현재/마지막 epoch 가중치)이 아직 어떤 방식으로도
     # best 가중치로 대체되지 않은 이 시점에 저장한다 -- 아래 best_model
     # 생성(별도 인스턴스) 이전에 두어야, best_state_dict를 현재 모델로
-    # 착각해서 저장하는 버그가 애초에 발생할 수 없다.
+    # 착각해서 저장하는 버그가 애초에 발생할 수 없다. 학습 도중
+    # checkpoint_hook이 이미 몇 번 저장했더라도, 이 최종 저장은 항상
+    # 실행된다(Phase 4J, §6-4) -- should_stop() 평가 이후의 정확한
+    # stopped_by_user 값을 반영하는 저장은 이 최종 저장뿐이기 때문이다
+    # (마지막 epoch이 scheduled epoch였다면 같은 global epoch이 두 번
+    # 저장되는 것은 의도된 동작이다, §9-4).
     checkpoint_path: Path | None = None
     checkpoint_metadata_path: Path | None = None
     if request.checkpoint_out is not None:
         checkpoint_path = request.checkpoint_out
-        save_training_checkpoint(
+        checkpoint_metadata_path = metadata_path_for_checkpoint(checkpoint_path)
+        ensure_checkpoint_metadata()  # §7-3 -- 이미 준비됐으면(scheduled 저장이 있었으면) 아무 것도 안 함
+        save_training_checkpoint(  # 원자적(§7-2)
             checkpoint_path,
             model=model,
             training_result=training_result,
             training_config=request.training_config,
             loader_generator_state=loader_generator_state_after,
             cpu_rng_state=cpu_rng_state_after,
-        )
-        checkpoint_metadata_path = metadata_path_for_checkpoint(checkpoint_path)
-        save_imagefolder_resume_metadata(
-            build_imagefolder_resume_metadata(model_spec, splits), checkpoint_metadata_path
         )
 
     # run_training()은 best_state_dict를 메모리로만 반환한다 -- 여기서 새

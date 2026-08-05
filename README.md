@@ -667,6 +667,82 @@ result = run_training(
 
 ---
 
+## Phase 4J: Epoch-end Automatic Checkpointing and Recovery
+
+`run_training()`에 epoch 경계 `checkpoint_hook`을 추가하고,
+`scripts/train_imagefolder.py`에 `--checkpoint-every N`을 노출해서
+학습 도중 주기적으로 checkpoint를 자동 저장할 수 있게 했습니다.
+Phase 4F까지는 학습이 끝난 뒤 딱 한 번만 checkpoint를 저장했는데,
+epoch 수가 많은 학습 중 중간에 실패/중단되면 그 지점까지의 진행이
+전부 사라졌습니다.
+
+```bash
+python scripts/train_imagefolder.py \
+    --model-json m.json --dataset-root d --output-dir out \
+    --epochs 20 --checkpoint-out out/checkpoint.pt --checkpoint-every 5
+```
+
+* **`--checkpoint-every N`**: global epoch(resume을 포함한 절대 epoch
+  번호, `len(history.train_losses)`)이 `N`의 배수가 될 때마다
+  `--checkpoint-out` 경로를 자동으로 갱신합니다. **기본값은 꺼짐**
+  (`None`)이라 생략하면 Phase 4I까지와 완전히 동일하게 학습 종료
+  시에만 저장됩니다. `--checkpoint-out` 없이 이 옵션만 주면
+  오류입니다. cadence는 이번 호출 안에서의 hook 호출 횟수가 아니라
+  **global epoch 기준**이라, 예를 들어 기존 checkpoint가 global epoch
+  7까지 진행된 상태에서 `--checkpoint-every 5`로 3 epoch를 추가하면
+  다음 자동 저장은 global epoch 10에서 발생합니다(12가 아님).
+* **최종 checkpoint는 항상 저장됩니다**: `--checkpoint-every`를 켜지
+  않았거나, 켰지만 마지막 epoch가 마침 그 주기에 맞지 않았어도,
+  `--checkpoint-out`이 주어지면 학습이 정상 종료된 뒤 항상 한 번 더
+  저장합니다. **마지막 epoch가 마침 자동 저장 주기와 겹치면, 같은
+  global epoch가 두 번 저장될 수 있습니다** -- 이는 의도된 동작입니다.
+  사용자가 학습 도중 멈춘 경우(Phase 4I `should_stop`) 자동 저장은
+  항상 `stopped_by_user=False`로 저장되고(`should_stop` 평가 이전에
+  실행되므로), 이 최종 저장만이 정확한 `stopped_by_user=True`를
+  반영합니다.
+* **checkpoint/metadata 저장은 원자적입니다**: 각 파일은 임시 파일에
+  완전히 쓴 뒤 `os.replace()`로 교체합니다. 기존 파일이 있는 경우
+  저장 실패 시 기존 버전이 보존되며, 새 경로에서는 반쯤 쓰인 파일이
+  남지 않습니다. 저장 실패(디스크 가득 참, 권한 문제 등)는 재시도나
+  폴백 없이 예외로 그대로 전파됩니다 -- 학습이 실패로 처리됩니다.
+* **출력 경로 재사용 정책(breaking change)**: `--resume-from`과
+  `--checkpoint-out`이 **정확히 같은 경로**를 가리키는 경우(in-place
+  resume)만 기존 checkpoint 파일을 계속 갱신할 수 있습니다. 그 외의
+  모든 경우(fresh 학습, 또는 `--resume-from`과 다른 경로로의 resume)는
+  `--checkpoint-out`이 checkpoint 파일과 그 metadata sidecar
+  (`<checkpoint>.meta.json`) 둘 다 **완전히 존재하지 않는 새 경로**여야
+  합니다 -- 있으면 학습을 시작하기도 전에 명확한 오류로 거부되고
+  기존 파일은 전혀 바뀌지 않습니다. 기존 checkpoint를 이어서 계속
+  갱신하려면 `--resume-from`과 `--checkpoint-out`에 같은 경로를
+  넘기세요. **경로를 덮어쓰도록 강제하는 옵션(예: `--overwrite-checkpoint`)은
+  아직 없습니다** -- 다른 경로에 저장하고 싶으면 새 파일명을 쓰세요.
+* **`--checkpoint-out`은 항상 "최신" 하나만 관리합니다**: epoch별로
+  별도 파일을 남기지 않고, 매 저장이 같은 경로를 원자적으로 교체합니다.
+* **custom callback을 쓸 때 주의**: `progress_callback`/`should_stop`을
+  직접 구현해 넘긴다면, PyTorch RNG를 소비하거나(`torch.rand()` 등)
+  model/optimizer/scheduler/DataLoader generator를 변경하면 안 됩니다.
+  `checkpoint_hook`(자동 저장)이 이 콜백들보다 먼저 실행되므로, 이
+  계약을 어기면 저장된 checkpoint가 실제로 다음 epoch가 시작할 때의
+  상태와 달라져 **exact-resume이 깨질 수 있습니다**. `scripts/
+  train_imagefolder.py`가 기본 제공하는 `_print_progress()`/자동 저장
+  hook은 이 계약을 지킵니다.
+
+`run_training()` 직접 호출자는 새 키워드 전용 파라미터
+`checkpoint_hook: Callable[[EpochCheckpointView], None] | None = None`을
+쓸 수 있습니다(기본값 `None`이면 기존 동작과 완전히 동일). epoch 처리
+순서는 `train → validate → history 기록 → best/카운터 갱신 →
+scheduler.step() → early stopping 판정 → checkpoint_hook →
+progress_callback → should_stop 평가`입니다. `EpochCheckpointView`는
+model/history/optimizer/scheduler/loader_generator의 살아있는
+참조만 담는 synchronous ephemeral view라, hook 호출이 반환된 뒤에는
+보관하거나 비동기로 넘기면 안 됩니다.
+
+설계 배경, 여러 차례의 설계 리뷰에서 정리된 정책(metadata 준비 시점,
+출력 경로 재사용 정책 전환 이유, RNG-purity 계약)은
+`docs/phase4j_epoch_checkpoint_design.md`를 참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
@@ -699,6 +775,9 @@ result = run_training(
 * `run_training()`의 epoch 경계 progress callback + 협조적(cooperative)
   stop(`should_stop`), `TrainingHistory.stopped_by_user` 기록, resume
   계속 가능 (Phase 4I)
+* `run_training()`의 epoch 경계 `checkpoint_hook` + `--checkpoint-every N`
+  (global epoch 기준 자동 저장), checkpoint/metadata 원자적 저장,
+  in-place resume이 아닌 경로의 기존 checkpoint 재사용 거부 (Phase 4J)
 * TorchScript 배포, C++(LibTorch) CPU/CUDA 추론
 * Python/C++ parity 검증 (Phase 0~4E 배포 경로; Phase 4F는 export/parity
   코드를 변경하지 않았고, 기존 parity E2E를 재실행해 회귀 없음을 확인함
@@ -724,7 +803,10 @@ result = run_training(
   lr_scheduler/lr_scheduler_factor/lr_scheduler_patience/batch_size는
   checkpoint와 반드시 일치해야 함), CUDA RNG state 저장(학습이 CPU
   전용으로 고정되어 있어 검증 불가), batch-level(worker/sampler
-  iterator) resume, epoch 중간/자동 checkpoint, distributed checkpoint
+  iterator) resume, distributed checkpoint
+* 기존 `--checkpoint-out` 경로를 명시적으로 덮어쓰도록 강제하는 옵션
+  (예: `--overwrite-checkpoint`) -- in-place resume(`--resume-from`과
+  `--checkpoint-out`이 같은 경로) 외에는 항상 새 경로가 필요함 (Phase 4J)
 * mixed precision, multi-GPU/distributed training
 * 일반 DAG(`GraphSpec`/`NodeSpec`/`EdgeSpec`), long skip connection,
   중첩 `BranchSpec`

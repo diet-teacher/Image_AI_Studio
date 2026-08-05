@@ -8,6 +8,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -21,6 +22,8 @@ from image_ai_studio.model_definition.serialization import save_model_spec  # no
 from image_ai_studio.model_definition.specs import FlattenSpec, LinearSpec, ModelSpec, ReLUSpec  # noqa: E402
 from image_ai_studio.training.checkpoint import load_training_checkpoint  # noqa: E402
 from image_ai_studio.training.imagefolder_resume import metadata_path_for_checkpoint  # noqa: E402
+from image_ai_studio.training.imagefolder_workflow import ImageFolderWorkflowResult  # noqa: E402
+from image_ai_studio.training.loop import TrainingHistory  # noqa: E402
 
 INPUT_SHAPE = (3, 8, 8)
 _CLASS_COLORS = {"cat": (250, 250, 250), "dog": (5, 5, 5)}
@@ -314,3 +317,203 @@ def test_resume_via_main_prints_only_newly_completed_epochs_with_global_epoch_nu
 
     # (6) 중복 없음
     assert len(epoch_numbers) == len(set(epoch_numbers))
+
+
+# -- Phase 4J: --checkpoint-every ---------------------------------------------
+
+
+def test_checkpoint_every_forwards_exact_value_to_workflow_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLI가 `--checkpoint-every`/`--checkpoint-out` argparse 값을
+    `ImageFolderWorkflowRequest`에 정확히 실어 보내는지 직접 증명한다.
+    final post-hoc checkpoint는 `checkpoint_every`를 workflow에 전달하지
+    않아도(즉 배선이 끊어져도) 만들어지므로, 실제 checkpoint 파일 존재
+    여부만으로는 forwarding을 증명하지 못한다 -- 여기서는
+    `run_imagefolder_training_workflow`를 monkeypatch로 가짜 구현으로
+    바꾸고, CLI가 실제로 넘긴 `ImageFolderWorkflowRequest` 객체를
+    캡처해서 필드 값을 직접 검사한다."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, "cli_checkpoint_every_forward_model")
+    ckpt = tmp_path / "checkpoint.pt"
+
+    captured: dict = {}
+
+    def fake_workflow(request, *, progress_callback=None, should_stop=None):
+        captured["request"] = request
+        history = TrainingHistory(
+            train_losses=[0.5], val_losses=[0.5], val_accuracies=[0.5],
+            best_epoch=1, best_val_loss=0.5,
+        )
+        return ImageFolderWorkflowResult(
+            history=history,
+            test_loss=0.5,
+            test_accuracy=0.5,
+            best_model_state_dict_path=tmp_path / "best_model_state_dict.pt",
+            training_history_path=tmp_path / "training_history.json",
+            class_mapping_path=tmp_path / "class_mapping.json",
+            test_result_path=tmp_path / "test_result.json",
+            checkpoint_path=request.checkpoint_out,
+            checkpoint_metadata_path=None,
+            torchscript_model_path=None,
+            torchscript_metadata_path=None,
+        )
+
+    monkeypatch.setattr(cli, "run_imagefolder_training_workflow", fake_workflow)
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "3",
+            "--batch-size", "4",
+            "--checkpoint-out", str(ckpt),
+            "--checkpoint-every", "5",
+            "--no-export-torchscript",
+        ]
+    )
+
+    assert exit_code == 0
+    assert "request" in captured  # fake_workflow가 실제로 호출됐는지 먼저 확인
+    assert captured["request"].checkpoint_every == 5
+    assert captured["request"].checkpoint_out == ckpt
+
+
+def test_checkpoint_every_via_main_produces_final_checkpoint_end_to_end(tmp_path: Path) -> None:
+    """실제 workflow를 그대로 실행해 --checkpoint-every가 있어도 학습이
+    정상적으로 끝나고 최종 checkpoint가 만들어짐을 확인하는 end-to-end
+    회귀 테스트(forwarding 자체의 증명은 위 request 캡처 테스트가
+    담당)."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, "cli_checkpoint_every_model")
+    ckpt = tmp_path / "checkpoint.pt"
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "3",
+            "--batch-size", "4",
+            "--checkpoint-out", str(ckpt),
+            "--checkpoint-every", "1",
+            "--no-export-torchscript",
+        ]
+    )
+
+    assert exit_code == 0
+    assert ckpt.exists()
+    assert metadata_path_for_checkpoint(ckpt).exists()
+    payload = load_training_checkpoint(ckpt)
+    assert len(payload["history"]["train_losses"]) == 3
+
+
+def test_checkpoint_every_without_checkpoint_out_fails_cleanly(tmp_path: Path, capsys) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, "cli_checkpoint_every_no_out_model")
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "2",
+            "--checkpoint-every", "1",
+            "--no-export-torchscript",
+        ]
+    )
+
+    assert exit_code == 1
+    stderr = capsys.readouterr().err
+    assert "checkpoint_every" in stderr
+    assert "checkpoint_out" in stderr
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_checkpoint_every_invalid_value_fails_cleanly(tmp_path: Path, value: str, capsys) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, "cli_checkpoint_every_invalid_model")
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "2",
+            "--checkpoint-out", str(tmp_path / "checkpoint.pt"),
+            "--checkpoint-every", value,
+            "--no-export-torchscript",
+        ]
+    )
+
+    assert exit_code == 1
+    stderr = capsys.readouterr().err
+    assert "at least 1" in stderr
+
+
+def test_checkpoint_every_non_integer_value_fails_argparse_parsing(tmp_path: Path, capsys) -> None:
+    """`--checkpoint-every 1.5`는 workflow 검증(_validate_checkpoint_every())
+    이전에, argparse의 `type=int` 변환 단계에서 이미 거부된다 -- argparse는
+    파싱 오류에 SystemExit(2)를 던진다(workflow의 ValueError 경로와는
+    다른 실패 지점)."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, "cli_checkpoint_every_non_integer_model")
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "--model-json", str(model_json_path),
+                "--dataset-root", str(tmp_path),
+                "--output-dir", str(tmp_path / "out"),
+                "--epochs", "2",
+                "--checkpoint-out", str(tmp_path / "checkpoint.pt"),
+                "--checkpoint-every", "1.5",
+                "--no-export-torchscript",
+            ]
+        )
+
+    assert exc_info.value.code == 2
+    stderr = capsys.readouterr().err
+    assert "--checkpoint-every" in stderr
+
+
+def test_fresh_run_reusing_existing_checkpoint_out_fails_cleanly_and_keeps_existing_file(
+    tmp_path: Path, capsys
+) -> None:
+    """Phase 4J §6-5 정책의 CLI 레벨 회귀 테스트: fresh 학습이 이미
+    checkpoint가 있는 --checkpoint-out 경로를 가리키면 exit code 1 +
+    기존 파일은 그대로 남아야 한다."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, "cli_reuse_checkpoint_out_model")
+    ckpt = tmp_path / "checkpoint.pt"
+
+    exit_code_1 = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out1"),
+            "--epochs", "1",
+            "--checkpoint-out", str(ckpt),
+            "--no-export-torchscript",
+        ]
+    )
+    assert exit_code_1 == 0
+    original_bytes = ckpt.read_bytes()
+    capsys.readouterr()  # 1회차 stdout/stderr 버퍼 소비
+
+    exit_code_2 = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out2"),
+            "--epochs", "1",
+            "--checkpoint-out", str(ckpt),
+            "--no-export-torchscript",
+        ]
+    )
+
+    assert exit_code_2 == 1
+    assert ckpt.read_bytes() == original_bytes
+    stderr = capsys.readouterr().err
+    assert "already exists" in stderr

@@ -18,6 +18,7 @@ from image_ai_studio.model_definition.specs import DropoutSpec, FlattenSpec, Lin
 from image_ai_studio.training.config import TrainingConfig
 from image_ai_studio.training.dataset import make_train_val_datasets
 from image_ai_studio.training.loop import (
+    EpochCheckpointView,
     TrainingHistory,
     TrainingResult,
     TrainingResumeState,
@@ -851,6 +852,528 @@ def test_run_training_resume_matches_continuous_run_exactly() -> None:
     for name, tensor in result_a.best_state_dict.items():
         assert torch.equal(tensor, result_b2.best_state_dict[name])
 
+    _assert_deep_equal(result_a.optimizer_state_dict, result_b2.optimizer_state_dict)
+    _assert_deep_equal(result_a.scheduler_state_dict, result_b2.scheduler_state_dict)
+
+
+# -- Phase 4J: checkpoint_hook / EpochCheckpointView ---------------------------
+
+
+def test_run_training_checkpoint_hook_none_no_behavior_change() -> None:
+    """checkpoint_hook=None(기본값)이면 checkpoint_hook을 아예 넘기지 않는
+    것과 동일한 결과를 내야 한다 -- history 전체, 최종 model, best_state_dict,
+    optimizer/scheduler state, epochs_without_improvement까지 observable
+    training result 전부를 비교한다(early stopping/should_stop이 관여할
+    여지가 있는 필드도 포함)."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model_a = build_model(spec)
+    train_loader_a, val_loader_a = _make_loaders(spec, seed=0)
+    config = TrainingConfig(
+        epochs=5, batch_size=8, learning_rate=1e-2, lr_scheduler="plateau",
+        lr_scheduler_factor=0.5, lr_scheduler_patience=1,
+    )
+    torch.manual_seed(0)
+    result_a = run_training(model_a, train_loader_a, val_loader_a, config)
+
+    torch.manual_seed(0)
+    model_b = build_model(spec)
+    train_loader_b, val_loader_b = _make_loaders(spec, seed=0)
+    torch.manual_seed(0)
+    result_b = run_training(model_b, train_loader_b, val_loader_b, config, checkpoint_hook=None)
+
+    assert result_a.history.train_losses == result_b.history.train_losses
+    assert result_a.history.val_losses == result_b.history.val_losses
+    assert result_a.history.val_accuracies == result_b.history.val_accuracies
+    assert result_a.history.best_epoch == result_b.history.best_epoch
+    assert result_a.history.stopped_early == result_b.history.stopped_early
+    assert result_a.history.stopped_by_user == result_b.history.stopped_by_user
+    assert result_a.epochs_without_improvement == result_b.epochs_without_improvement
+    for name, tensor in model_a.state_dict().items():
+        assert torch.equal(tensor, model_b.state_dict()[name])
+    for name, tensor in result_a.best_state_dict.items():
+        assert torch.equal(tensor, result_b.best_state_dict[name])
+    _assert_deep_equal(result_a.optimizer_state_dict, result_b.optimizer_state_dict)
+    _assert_deep_equal(result_a.scheduler_state_dict, result_b.scheduler_state_dict)
+
+
+def test_run_training_checkpoint_hook_called_once_per_completed_epoch() -> None:
+    """EpochCheckpointView는 hook 호출 범위에서만 유효한 ephemeral view라
+    view 객체 자체를 hook 밖으로 들고 나오면 안 된다 -- hook 안에서
+    `len(view.history.train_losses)`(global epoch)라는 immutable 파생
+    값만 기록해 매 epoch 정확히 한 번씩 호출됐는지 확인한다."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=4, batch_size=8, learning_rate=1e-2)
+
+    global_epochs: list[int] = []
+
+    def hook(view: EpochCheckpointView) -> None:
+        global_epochs.append(len(view.history.train_losses))
+
+    result = run_training(model, train_loader, val_loader, config, checkpoint_hook=hook)
+
+    assert global_epochs == [1, 2, 3, 4]
+    assert len(global_epochs) == config.epochs == len(result.history.train_losses)
+
+
+def test_run_training_checkpoint_hook_non_scheduled_epoch_skips_state_dict_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EpochCheckpointView는 살아있는 참조만 담으므로, view 생성 자체와
+    hook 호출 사이의 core 코드(train_one_epoch/evaluate/history 기록/
+    scheduler.step()/view 조립)는 optimizer.state_dict()를 전혀 호출하지
+    않아야 한다 -- hook이 스스로 "non-scheduled epoch"라 판단해 즉시
+    반환한 경우, 그 사실만으로 (a) 실제로 .state_dict()가 호출되지
+    않았음과 (b) view 생성 과정 자체도 이를 호출하지 않았음을
+    torch.optim.Adam.state_dict()에 실제 spy를 걸어 증명한다(hook 내부
+    카운터만으로는 core/view 쪽의 실수를 검출하지 못하므로)."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=4, batch_size=8, learning_rate=1e-2)
+
+    call_count = {"value": 0}
+    original_state_dict = torch.optim.Adam.state_dict
+
+    def spying_state_dict(self, *args, **kwargs):
+        call_count["value"] += 1
+        return original_state_dict(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.optim.Adam, "state_dict", spying_state_dict)
+
+    # 각 hook 호출 "직전"(count_before)과 "직후"(count_after)의 누적 호출
+    # 횟수를 기록한다. count_before[i]가 직전 epoch의 count_after와 다르면,
+    # 그 사이(core 코드 + view 생성)에서 몰래 state_dict()가 호출됐다는
+    # 뜻이다.
+    records: list[tuple[int, int]] = []
+
+    def selective_hook(view: EpochCheckpointView) -> None:
+        count_before = call_count["value"]
+        global_epoch = len(view.history.train_losses)
+        if global_epoch % 2 == 0:  # scheduled epoch만 명시적으로 조회
+            view.optimizer.state_dict()
+        records.append((count_before, call_count["value"]))
+
+    run_training(model, train_loader, val_loader, config, checkpoint_hook=selective_hook)
+
+    assert len(records) == config.epochs
+    # scheduled epoch(2, 4)에서만 hook 자신이 정확히 1번 호출.
+    assert [after - before for before, after in records] == [0, 1, 0, 1]
+    # 연속된 hook 호출 사이(core 코드 + 다음 view 생성)에는 호출이 전혀
+    # 없어야 한다 -- 이전 hook이 끝난 시점의 누적 값과 다음 hook 진입
+    # 시점의 누적 값이 정확히 같아야 함.
+    for previous, current in zip(records, records[1:]):
+        assert previous[1] == current[0]
+    # 학습 종료 후 TrainingResult 조립 시 발생하는 최종 1회 호출까지 포함해
+    # 총 호출 횟수는 "scheduled 2회 + 최종 1회" = 3이어야 한다(hook 구간
+    # 호출과 명확히 구분).
+    assert call_count["value"] == records[-1][1] + 1 == 3
+
+
+def test_run_training_checkpoint_hook_non_scheduled_epoch_skips_scheduler_state_dict_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """위 optimizer 테스트(test_run_training_checkpoint_hook_non_scheduled_epoch_skips_state_dict_calls)와
+    동일한 수준으로 scheduler에 대해서도 재확인한다 -- 단순히 총 호출
+    횟수만 보지 않고, 각 hook 진입 전후의 누적 호출 수를 기록해 (a)
+    scheduled epoch(2, 4)에서만 hook 자신이 정확히 1번 호출하고,
+    non-scheduled epoch(1, 3)에서는 증가가 없으며, (b) 연속된 hook 호출
+    사이(core 코드 + 다음 view 생성)에서는 몰래 호출되지 않고, (c)
+    학습 종료 후 TrainingResult 조립 시 최종 1회만 추가로 발생함을
+    각각 검증한다."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(
+        epochs=4, batch_size=8, learning_rate=1e-2,
+        lr_scheduler="plateau", lr_scheduler_factor=0.5, lr_scheduler_patience=1,
+    )
+
+    call_count = {"value": 0}
+    original_state_dict = torch.optim.lr_scheduler.ReduceLROnPlateau.state_dict
+
+    def spying_state_dict(self, *args, **kwargs):
+        call_count["value"] += 1
+        return original_state_dict(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.optim.lr_scheduler.ReduceLROnPlateau, "state_dict", spying_state_dict)
+
+    records: list[tuple[int, int]] = []
+
+    def selective_hook(view: EpochCheckpointView) -> None:
+        count_before = call_count["value"]
+        global_epoch = len(view.history.train_losses)
+        if global_epoch % 2 == 0:  # scheduled epoch만 명시적으로 조회
+            view.scheduler.state_dict()
+        records.append((count_before, call_count["value"]))
+
+    run_training(model, train_loader, val_loader, config, checkpoint_hook=selective_hook)
+
+    assert len(records) == config.epochs
+    # epoch 1, 3(non-scheduled)에서는 증가량 0, epoch 2, 4(scheduled)에서는 증가량 1.
+    assert [after - before for before, after in records] == [0, 1, 0, 1]
+    # 연속된 hook 호출 사이(core 코드 + 다음 view 생성)에는 호출이 전혀
+    # 없어야 한다 -- 이전 hook이 끝난 시점의 누적 값과 다음 hook 진입
+    # 시점의 누적 값이 정확히 같아야 함.
+    for previous, current in zip(records, records[1:]):
+        assert previous[1] == current[0]
+    # 학습 종료 후 TrainingResult 조립 시 발생하는 최종 1회 호출까지 포함해
+    # 총 호출 횟수는 "scheduled 2회 + 최종 1회" = 3이어야 한다.
+    assert call_count["value"] == records[-1][1] + 1 == 3
+
+
+def test_run_training_checkpoint_hook_view_matches_epoch_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """evaluate()를 monkeypatch해 val_loss 개선/비개선 순서를 결정론적으로
+    고정하고(1.0, 0.8, 0.9, 1.1 -> best는 epoch 1, 2에서만 갱신), 각 hook
+    호출 시점의 EpochCheckpointView가 정확한 global_epoch/
+    epochs_without_improvement/best_epoch/best_state_dict를 담고 있는지
+    직접 검증한다. train_one_epoch()도 monkeypatch해 매 epoch 모델
+    파라미터 전체를 epoch 번호(1.0, 2.0, 3.0, 4.0)로 채워, best_state_dict
+    snapshot이 실제로 어느 epoch의 값인지 명확히 구분한다(test_loop.py의
+    test_run_training_early_stopping_preserves_best_epoch_parameters와
+    동일한 기법)."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=4, batch_size=8, learning_rate=1e-2)
+
+    call_count = {"value": 0}
+
+    def fake_train_one_epoch(model, loader, optimizer, device="cpu"):
+        call_count["value"] += 1
+        epoch_value = float(call_count["value"])
+        for param in model.parameters():
+            param.data.fill_(epoch_value)
+        return epoch_value
+
+    fixed_val_results = iter([(1.0, 1.0), (0.8, 1.0), (0.9, 1.0), (1.1, 1.0)])
+    monkeypatch.setattr("image_ai_studio.training.loop.train_one_epoch", fake_train_one_epoch)
+    monkeypatch.setattr(
+        "image_ai_studio.training.loop.evaluate",
+        lambda model, loader, device="cpu": next(fixed_val_results),
+    )
+
+    recorded: list[dict] = []
+
+    def hook(view: EpochCheckpointView) -> None:
+        recorded.append(
+            {
+                "global_epoch": len(view.history.train_losses),
+                "epochs_without_improvement": view.epochs_without_improvement,
+                "best_epoch": view.history.best_epoch,
+                "best_state_dict": {name: tensor.clone() for name, tensor in view.best_state_dict.items()},
+            }
+        )
+
+    result = run_training(model, train_loader, val_loader, config, checkpoint_hook=hook)
+    history = result.history
+
+    assert [r["global_epoch"] for r in recorded] == [1, 2, 3, 4]
+    assert [r["epochs_without_improvement"] for r in recorded] == [0, 0, 1, 2]
+    assert [r["best_epoch"] for r in recorded] == [1, 2, 2, 2]
+    expected_best_param_value = [1.0, 2.0, 2.0, 2.0]
+    for record, expected_value in zip(recorded, expected_best_param_value):
+        for tensor in record["best_state_dict"].values():
+            assert torch.all(tensor == expected_value)
+
+    assert history.best_epoch == 2
+    assert history.best_val_loss == 0.8
+    # 마지막 hook 호출의 best_state_dict는 최종 best_state_dict와 일치해야 한다.
+    last_best = recorded[-1]["best_state_dict"]
+    for name, tensor in result.best_state_dict.items():
+        assert torch.equal(tensor, last_best[name])
+
+
+def test_run_training_checkpoint_hook_view_is_ephemeral_live_reference() -> None:
+    """view.model/view.history는 매 호출마다 run_training() 내부의 같은
+    객체를 가리키는 살아있는 참조여야 한다(identity 기반, 매 epoch 새로
+    복사되지 않음). view는 hook 호출 범위에서만 유효한 ephemeral view라는
+    계약이 있으므로, view.model/view.history 객체 자체를 hook 밖의
+    리스트에 보관하지 않는다 -- 대신 hook 내부에서 identity 비교 결과
+    (bool)와 `id(view.history)`처럼 이후에도 안전하게 재사용 가능한
+    immutable 값만 기록한다."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=3, batch_size=8, learning_rate=1e-2)
+
+    model_identity_results: list[bool] = []
+    history_ids: list[int] = []
+
+    def hook(view: EpochCheckpointView) -> None:
+        model_identity_results.append(view.model is model)
+        history_ids.append(id(view.history))
+
+    run_training(model, train_loader, val_loader, config, checkpoint_hook=hook)
+
+    assert len(model_identity_results) == config.epochs
+    assert all(model_identity_results)
+    assert len(set(history_ids)) == 1  # 매 호출이 같은 history 객체를 가리킴
+
+
+def test_run_training_checkpoint_hook_called_before_progress_callback() -> None:
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=3, batch_size=8, learning_rate=1e-2)
+
+    call_order: list[str] = []
+
+    run_training(
+        model, train_loader, val_loader, config,
+        checkpoint_hook=lambda view: call_order.append("hook"),
+        progress_callback=lambda progress: call_order.append("progress"),
+    )
+
+    assert call_order == ["hook", "progress"] * config.epochs
+
+
+def test_run_training_checkpoint_hook_runs_before_progress_callback_exception() -> None:
+    """progress_callback이 예외를 던져도, 그 직전에 이미 실행된
+    checkpoint_hook의 side effect는 그대로 남아 있어야 한다(§3-1의
+    "hook을 먼저 실행하는 이유")."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=5, batch_size=8, learning_rate=1e-2)
+
+    hook_calls = {"value": 0}
+
+    def hook(view: EpochCheckpointView) -> None:
+        hook_calls["value"] += 1
+
+    def failing_progress_callback(progress) -> None:
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        run_training(
+            model, train_loader, val_loader, config,
+            checkpoint_hook=hook, progress_callback=failing_progress_callback,
+        )
+
+    assert hook_calls["value"] == 1
+
+
+def test_run_training_checkpoint_hook_stopped_by_user_always_false_in_view() -> None:
+    """hook은 should_stop() 평가 이전에 실행되므로, view.history.stopped_by_user는
+    should_stop이 True를 반환해 학습이 멈추는 epoch에서도 항상 False로
+    보여야 한다."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=10, batch_size=8, learning_rate=1e-2)
+
+    seen_stopped_by_user: list[bool] = []
+    stop_flag = {"value": False}
+
+    def hook(view: EpochCheckpointView) -> None:
+        seen_stopped_by_user.append(view.history.stopped_by_user)
+        if len(view.history.train_losses) == 3:
+            stop_flag["value"] = True
+
+    result = run_training(
+        model, train_loader, val_loader, config,
+        checkpoint_hook=hook, should_stop=lambda: stop_flag["value"],
+    )
+
+    assert result.history.stopped_by_user is True
+    assert all(value is False for value in seen_stopped_by_user)
+
+
+def test_run_training_checkpoint_hook_loader_generator_matches_train_loader() -> None:
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=2, batch_size=8, learning_rate=1e-2)
+
+    seen_generators = []
+
+    def hook(view: EpochCheckpointView) -> None:
+        seen_generators.append(view.loader_generator)
+
+    run_training(model, train_loader, val_loader, config, checkpoint_hook=hook)
+
+    assert all(generator is train_loader.generator for generator in seen_generators)
+    assert train_loader.generator is not None
+
+
+def test_run_training_checkpoint_hook_loader_generator_none_when_loader_has_no_generator() -> None:
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_dataset, val_dataset = make_train_val_datasets(
+        spec.input_shape, NUM_CLASSES, seed=0, train_size=32, val_size=16
+    )
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=False, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+
+    seen_generators = []
+    run_training(
+        model, train_loader, val_loader, config,
+        checkpoint_hook=lambda view: seen_generators.append(view.loader_generator),
+    )
+
+    assert seen_generators == [None]
+
+
+def test_run_training_checkpoint_hook_early_stopping_epoch_reports_stopped_early_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=10, batch_size=8, learning_rate=1e-2, early_stopping_patience=2)
+    fixed_val_results = iter([(1.0, 1.0), (1.0, 1.0), (1.0, 1.0), (0.5, 1.0)])
+    monkeypatch.setattr(
+        "image_ai_studio.training.loop.evaluate",
+        lambda model, loader, device="cpu": next(fixed_val_results),
+    )
+
+    seen_stopped_early: list[bool] = []
+    run_training(
+        model, train_loader, val_loader, config,
+        checkpoint_hook=lambda view: seen_stopped_early.append(view.history.stopped_early),
+    )
+
+    assert seen_stopped_early == [False, False, True]
+
+
+def test_run_training_checkpoint_hook_exception_propagates_and_no_result_returned() -> None:
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=5, batch_size=8, learning_rate=1e-2)
+
+    def failing_hook(view: EpochCheckpointView) -> None:
+        raise RuntimeError("checkpoint save failed")
+
+    with pytest.raises(RuntimeError, match="checkpoint save failed"):
+        run_training(model, train_loader, val_loader, config, checkpoint_hook=failing_hook)
+
+
+def test_run_training_checkpoint_hook_called_exactly_once_when_epochs_is_one() -> None:
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+
+    call_count = {"value": 0}
+    run_training(
+        model, train_loader, val_loader, config,
+        checkpoint_hook=lambda view: call_count.__setitem__("value", call_count["value"] + 1),
+    )
+
+    assert call_count["value"] == 1
+
+
+def test_run_training_checkpoint_hook_captured_resume_state_matches_continuous_run() -> None:
+    """자동 checkpoint(hook)에서 캡처한 상태로 resume한 결과가 continuous
+    run과 값 기준으로 정확히 일치해야 한다. hook은 view를 읽기만 하는
+    순수 구현이고, progress_callback/should_stop은 쓰지 않는다(§3-5
+    전제)."""
+    seed = 20260804
+    spec = _dropout_mlp_classifier_spec()
+
+    def make_loaders() -> tuple[DataLoader, DataLoader, torch.Generator]:
+        train_dataset, val_dataset = make_train_val_datasets(
+            spec.input_shape, NUM_CLASSES, seed=seed, train_size=32, val_size=16
+        )
+        generator = torch.Generator().manual_seed(seed)
+        train_loader = DataLoader(
+            train_dataset, batch_size=8, shuffle=True, generator=generator, drop_last=True
+        )
+        val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
+        return train_loader, val_loader, generator
+
+    config_kwargs = dict(
+        batch_size=8, learning_rate=1e-2, optimizer="sgd", momentum=0.9,
+        lr_scheduler="plateau", lr_scheduler_factor=0.5, lr_scheduler_patience=1,
+    )
+
+    # (a) 연속 5 epoch
+    torch.manual_seed(seed)
+    model_a = build_model(spec)
+    train_loader_a, val_loader_a, _ = make_loaders()
+    torch.manual_seed(seed)
+    result_a = run_training(model_a, train_loader_a, val_loader_a, TrainingConfig(epochs=5, **config_kwargs))
+
+    # (b) 3 epoch 실행, checkpoint_hook으로 매 epoch 상태를 캡처(마지막 캡처만 사용)
+    torch.manual_seed(seed)
+    model_b = build_model(spec)
+    train_loader_b, val_loader_b, _ = make_loaders()
+    torch.manual_seed(seed)
+    first_config = TrainingConfig(epochs=3, **config_kwargs)
+
+    captured: dict = {}
+
+    def capture_hook(view: EpochCheckpointView) -> None:
+        # config가 scheduler를 켰고 train_loader가 generator를 갖고
+        # 있으므로, 이 두 필드가 None이면 캡처 로직 자체가 잘못된
+        # 것이다 -- .state_dict()/.get_state()를 부르기 전에 명시적으로
+        # 확인한다.
+        assert view.scheduler is not None
+        assert view.loader_generator is not None
+        captured["history"] = copy.deepcopy(view.history)
+        captured["best_state_dict"] = copy.deepcopy(view.best_state_dict)
+        captured["epochs_without_improvement"] = view.epochs_without_improvement
+        captured["optimizer_state_dict"] = copy.deepcopy(view.optimizer.state_dict())
+        captured["scheduler_state_dict"] = copy.deepcopy(view.scheduler.state_dict())
+        captured["loader_generator_state"] = view.loader_generator.get_state().clone()
+        captured["cpu_rng_state"] = torch.get_rng_state().clone()
+
+    run_training(model_b, train_loader_b, val_loader_b, first_config, checkpoint_hook=capture_hook)
+
+    resume_state = TrainingResumeState(
+        optimizer_state_dict=captured["optimizer_state_dict"],
+        scheduler_state_dict=captured["scheduler_state_dict"],
+        history=captured["history"],
+        epochs_without_improvement=captured["epochs_without_improvement"],
+        best_state_dict=captured["best_state_dict"],
+        training_config=asdict(first_config),
+    )
+
+    model_b2 = build_model(spec)
+    model_b2.load_state_dict(model_b.state_dict())
+    train_dataset2, val_dataset2 = make_train_val_datasets(
+        spec.input_shape, NUM_CLASSES, seed=seed, train_size=32, val_size=16
+    )
+    restored_generator = torch.Generator()
+    restored_generator.set_state(captured["loader_generator_state"])
+    train_loader_b2 = DataLoader(
+        train_dataset2, batch_size=8, shuffle=True, generator=restored_generator, drop_last=True
+    )
+    val_loader_b2 = DataLoader(val_dataset2, batch_size=8, shuffle=False)
+    torch.set_rng_state(captured["cpu_rng_state"])
+
+    result_b2 = run_training(
+        model_b2, train_loader_b2, val_loader_b2, TrainingConfig(epochs=2, **config_kwargs),
+        resume_state=resume_state,
+    )
+
+    assert result_b2.history.train_losses == result_a.history.train_losses
+    assert result_b2.history.val_losses == result_a.history.val_losses
+    assert result_b2.history.val_accuracies == result_a.history.val_accuracies
+    assert result_b2.history.best_epoch == result_a.history.best_epoch
+    assert result_b2.epochs_without_improvement == result_a.epochs_without_improvement
+    for name, tensor in model_a.state_dict().items():
+        assert torch.equal(tensor, model_b2.state_dict()[name])
+    for name, tensor in result_a.best_state_dict.items():
+        assert torch.equal(tensor, result_b2.best_state_dict[name])
     _assert_deep_equal(result_a.optimizer_state_dict, result_b2.optimizer_state_dict)
     _assert_deep_equal(result_a.scheduler_state_dict, result_b2.scheduler_state_dict)
 

@@ -25,8 +25,16 @@ from image_ai_studio.model_definition.specs import (
 from image_ai_studio.parity.compare_outputs import CPU_FP32_ATOL, CPU_FP32_RTOL, compare_outputs
 from image_ai_studio.training.checkpoint import load_state_dict, load_training_checkpoint
 from image_ai_studio.training.config import TrainingConfig
+from image_ai_studio.training.imagefolder_resume import (
+    load_imagefolder_resume_metadata,
+    metadata_path_for_checkpoint,
+)
 from image_ai_studio.training.imagefolder_workflow import (
     ImageFolderWorkflowRequest,
+    _is_in_place_resume,
+    _normalized_path,
+    _validate_checkpoint_every,
+    _validate_checkpoint_output_paths,
     run_imagefolder_training_workflow,
 )
 from image_ai_studio.training.loop import run_training
@@ -570,3 +578,573 @@ def test_workflow_user_stopped_checkpoint_is_resumable(tmp_path: Path) -> None:
 
     assert len(second.history.train_losses) == 3
     assert second.history.stopped_by_user is False
+
+
+# -- Phase 4J: checkpoint_every validation -------------------------------------
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5])
+def test_validate_checkpoint_every_rejects_invalid_values(value: object) -> None:
+    with pytest.raises(ValueError):
+        _validate_checkpoint_every(value)
+
+
+def test_validate_checkpoint_every_accepts_none_and_positive_int() -> None:
+    _validate_checkpoint_every(None)
+    _validate_checkpoint_every(1)
+    _validate_checkpoint_every(5)
+
+
+def test_workflow_checkpoint_every_without_checkpoint_out_raises(tmp_path: Path) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=2, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path / "out",
+        export_torchscript=False,
+        seed=SEED,
+        checkpoint_every=1,
+    )
+    with pytest.raises(ValueError, match="checkpoint_every"):
+        run_imagefolder_training_workflow(request)
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5])
+def test_workflow_checkpoint_every_invalid_value_raises(tmp_path: Path, value: object) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=2, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path / "out",
+        checkpoint_out=tmp_path / "checkpoint.pt",
+        export_torchscript=False,
+        seed=SEED,
+        checkpoint_every=value,
+    )
+    with pytest.raises(ValueError):
+        run_imagefolder_training_workflow(request)
+
+
+# -- Phase 4J: checkpoint_every cadence (global epoch 기준) --------------------
+
+
+def _spy_save_training_checkpoint(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """save_training_checkpoint 호출마다 그 시점의 global epoch(=
+    training_result.history의 길이)을 기록하는 spy를 설치한다."""
+    import image_ai_studio.training.imagefolder_workflow as workflow_module
+
+    recorded: list[int] = []
+    original = workflow_module.save_training_checkpoint
+
+    def spy(*args, **kwargs):
+        training_result = kwargs["training_result"]
+        recorded.append(len(training_result.history.train_losses))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(workflow_module, "save_training_checkpoint", spy)
+    return recorded
+
+
+def test_workflow_checkpoint_every_none_saves_only_once_at_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    recorded = _spy_save_training_checkpoint(monkeypatch)
+
+    request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=3, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path / "out",
+        checkpoint_out=tmp_path / "checkpoint.pt",
+        export_torchscript=False,
+        seed=SEED,
+    )
+    run_imagefolder_training_workflow(request)
+
+    assert recorded == [3]
+
+
+def test_workflow_checkpoint_every_fresh_records_scheduled_and_final_global_epochs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fresh 5 epoch, checkpoint_every=2 -> scheduled 저장이 global epoch
+    2, 4에서, 최종 저장이 5에서 발생해야 한다."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    recorded = _spy_save_training_checkpoint(monkeypatch)
+
+    request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=5, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path / "out",
+        checkpoint_out=tmp_path / "checkpoint.pt",
+        export_torchscript=False,
+        seed=SEED,
+        checkpoint_every=2,
+    )
+    run_imagefolder_training_workflow(request)
+
+    assert recorded == [2, 4, 5]
+
+
+def test_workflow_checkpoint_every_in_place_resume_uses_global_epoch_cadence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """기존 global epoch 7에서 checkpoint_every=5로 3 epoch를 추가하면,
+    scheduled 저장과 최종 저장이 둘 다 global epoch 10에서 발생해야
+    한다(cadence가 hook 호출 횟수가 아니라 global epoch 기준임을
+    증명) -- 총 2번 호출."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    checkpoint_path = tmp_path / "checkpoint.pt"
+
+    seed_request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=7, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path / "seed_out",
+        checkpoint_out=checkpoint_path,
+        export_torchscript=False,
+        seed=SEED,
+    )
+    seeded = run_imagefolder_training_workflow(seed_request)
+    assert len(seeded.history.train_losses) == 7
+
+    recorded = _spy_save_training_checkpoint(monkeypatch)
+    resume_request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=3, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path / "resume_out",
+        resume_from=checkpoint_path,
+        checkpoint_out=checkpoint_path,
+        export_torchscript=False,
+        seed=SEED,
+        checkpoint_every=5,
+    )
+    result = run_imagefolder_training_workflow(resume_request)
+
+    assert len(result.history.train_losses) == 10
+    assert recorded == [10, 10]
+
+
+# -- Phase 4J: 출력 경로 재사용 정책 --------------------------------------------
+
+
+def test_fresh_training_rejects_existing_checkpoint_out(tmp_path: Path) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    checkpoint_path = tmp_path / "checkpoint.pt"
+
+    first_request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path / "o1",
+        checkpoint_out=checkpoint_path,
+        export_torchscript=False,
+        seed=SEED,
+    )
+    run_imagefolder_training_workflow(first_request)
+    original_bytes = checkpoint_path.read_bytes()
+
+    second_request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path / "o2",
+        checkpoint_out=checkpoint_path,
+        export_torchscript=False,
+        seed=SEED,
+    )
+    with pytest.raises(ValueError, match="already exists"):
+        run_imagefolder_training_workflow(second_request)
+
+    assert checkpoint_path.read_bytes() == original_bytes
+
+
+def test_fresh_training_rejects_existing_metadata_sidecar_only(tmp_path: Path) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    sidecar_path = metadata_path_for_checkpoint(checkpoint_path)
+    sidecar_path.write_text('{"stale": true}', encoding="utf-8")
+    original_bytes = sidecar_path.read_bytes()
+
+    request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path / "out",
+        checkpoint_out=checkpoint_path,
+        export_torchscript=False,
+        seed=SEED,
+    )
+    with pytest.raises(ValueError, match="already exists"):
+        run_imagefolder_training_workflow(request)
+
+    assert sidecar_path.read_bytes() == original_bytes
+    assert not checkpoint_path.exists()
+
+
+def test_fresh_training_completely_new_path_saves_metadata_before_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    sidecar_path = metadata_path_for_checkpoint(checkpoint_path)
+
+    import image_ai_studio.training.imagefolder_workflow as workflow_module
+
+    original_save_checkpoint = workflow_module.save_training_checkpoint
+    metadata_existed_before_checkpoint_save = {"value": None}
+
+    def spy_save_checkpoint(*args, **kwargs):
+        metadata_existed_before_checkpoint_save["value"] = sidecar_path.exists()
+        return original_save_checkpoint(*args, **kwargs)
+
+    monkeypatch.setattr(workflow_module, "save_training_checkpoint", spy_save_checkpoint)
+
+    request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path / "out",
+        checkpoint_out=checkpoint_path,
+        export_torchscript=False,
+        seed=SEED,
+    )
+    run_imagefolder_training_workflow(request)
+
+    assert metadata_existed_before_checkpoint_save["value"] is True
+    assert checkpoint_path.exists()
+    assert sidecar_path.exists()
+
+
+def test_resume_to_different_output_rejects_existing_checkpoint_at_output(tmp_path: Path) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    resume_source = tmp_path / "source.pt"
+    other_output = tmp_path / "other.pt"
+
+    run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path, dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+            output_dir=tmp_path / "o1", checkpoint_out=resume_source,
+            export_torchscript=False, seed=SEED,
+        )
+    )
+    run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path, dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+            output_dir=tmp_path / "o2", checkpoint_out=other_output,
+            export_torchscript=False, seed=SEED,
+        )
+    )
+    resume_source_bytes_before = resume_source.read_bytes()
+
+    with pytest.raises(ValueError, match="already exists"):
+        run_imagefolder_training_workflow(
+            ImageFolderWorkflowRequest(
+                model_json_path=model_json_path, dataset_root=tmp_path,
+                training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+                output_dir=tmp_path / "o3", resume_from=resume_source, checkpoint_out=other_output,
+                export_torchscript=False, seed=SEED,
+            )
+        )
+
+    assert resume_source.read_bytes() == resume_source_bytes_before
+
+
+def test_resume_to_different_output_rejects_existing_metadata_sidecar_only(tmp_path: Path) -> None:
+    """`resume_from != checkpoint_out`이고 출력 경로에 checkpoint(.pt)는
+    없지만 metadata sidecar만 남아 있는 경우도 §6-5 정책에 따라
+    학습을 시작하기 전에 거부돼야 한다."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    resume_source = tmp_path / "source.pt"
+    other_output = tmp_path / "other.pt"
+
+    run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path, dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+            output_dir=tmp_path / "o1", checkpoint_out=resume_source,
+            export_torchscript=False, seed=SEED,
+        )
+    )
+    resume_source_bytes_before = resume_source.read_bytes()
+    resume_source_metadata_bytes_before = metadata_path_for_checkpoint(resume_source).read_bytes()
+
+    other_sidecar = metadata_path_for_checkpoint(other_output)
+    other_sidecar.write_text('{"stale": true}', encoding="utf-8")
+    other_sidecar_bytes_before = other_sidecar.read_bytes()
+    assert not other_output.exists()
+
+    with pytest.raises(ValueError, match="already exists"):
+        run_imagefolder_training_workflow(
+            ImageFolderWorkflowRequest(
+                model_json_path=model_json_path, dataset_root=tmp_path,
+                training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+                output_dir=tmp_path / "o2", resume_from=resume_source, checkpoint_out=other_output,
+                export_torchscript=False, seed=SEED,
+            )
+        )
+
+    # 학습이 시작되기도 전에 거부되므로 output checkpoint는 생성되지 않고,
+    # source(resume_from)/other 경로의 sidecar 둘 다 전혀 바뀌지 않는다.
+    assert not other_output.exists()
+    assert other_sidecar.read_bytes() == other_sidecar_bytes_before
+    assert resume_source.read_bytes() == resume_source_bytes_before
+    assert metadata_path_for_checkpoint(resume_source).read_bytes() == resume_source_metadata_bytes_before
+
+
+def test_resume_to_different_new_output_succeeds_and_metadata_matches_source(tmp_path: Path) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    resume_source = tmp_path / "source.pt"
+    new_output = tmp_path / "new_output.pt"
+
+    run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path, dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=2, batch_size=4, learning_rate=1e-2),
+            output_dir=tmp_path / "o1", checkpoint_out=resume_source,
+            export_torchscript=False, seed=SEED,
+        )
+    )
+    source_metadata = load_imagefolder_resume_metadata(metadata_path_for_checkpoint(resume_source))
+
+    result = run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path, dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+            output_dir=tmp_path / "o2", resume_from=resume_source, checkpoint_out=new_output,
+            export_torchscript=False, seed=SEED,
+        )
+    )
+
+    assert result.checkpoint_path == new_output
+    assert new_output.exists()
+    new_output_metadata = load_imagefolder_resume_metadata(metadata_path_for_checkpoint(new_output))
+    assert new_output_metadata == source_metadata
+
+
+def test_normalized_path_recognizes_relative_and_absolute_as_same_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    absolute = tmp_path / "checkpoint.pt"
+    relative = Path("checkpoint.pt")
+
+    assert _normalized_path(absolute) == _normalized_path(relative)
+
+
+def test_is_in_place_resume_true_only_when_paths_match(tmp_path: Path) -> None:
+    a = tmp_path / "a.pt"
+    b = tmp_path / "b.pt"
+    request_same = ImageFolderWorkflowRequest(
+        model_json_path=tmp_path / "m.json", dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path, resume_from=a, checkpoint_out=a,
+    )
+    request_different = ImageFolderWorkflowRequest(
+        model_json_path=tmp_path / "m.json", dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path, resume_from=a, checkpoint_out=b,
+    )
+    request_fresh = ImageFolderWorkflowRequest(
+        model_json_path=tmp_path / "m.json", dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path, checkpoint_out=a,
+    )
+
+    assert _is_in_place_resume(request_same) is True
+    assert _is_in_place_resume(request_different) is False
+    assert _is_in_place_resume(request_fresh) is False
+
+
+def test_validate_checkpoint_output_paths_allows_in_place_resume_without_checking_existence(
+    tmp_path: Path,
+) -> None:
+    """resume_from == checkpoint_out면 파일이 이미 존재해도(당연히 존재해야
+    하므로) 이 검증은 그냥 통과해야 한다 -- 실제 검증은 _prepare_resume()이
+    담당."""
+    path = tmp_path / "checkpoint.pt"
+    path.write_bytes(b"not a real checkpoint")
+    request = ImageFolderWorkflowRequest(
+        model_json_path=tmp_path / "m.json", dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path, resume_from=path, checkpoint_out=path,
+    )
+    _validate_checkpoint_output_paths(request)  # raise 없이 통과해야 함
+
+
+def test_metadata_write_success_checkpoint_save_failure_leaves_metadata_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """완전히 새 출력 경로에서 metadata 저장은 성공하고 그 직후
+    checkpoint 저장이 실패하면, 디스크에는 metadata만 남고 checkpoint는
+    생기지 않아야 한다."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    sidecar_path = metadata_path_for_checkpoint(checkpoint_path)
+
+    import image_ai_studio.training.imagefolder_workflow as workflow_module
+
+    def failing_save_checkpoint(*args, **kwargs):
+        raise RuntimeError("simulated disk failure")
+
+    monkeypatch.setattr(workflow_module, "save_training_checkpoint", failing_save_checkpoint)
+
+    request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path / "out",
+        checkpoint_out=checkpoint_path,
+        export_torchscript=False,
+        seed=SEED,
+    )
+    with pytest.raises(RuntimeError, match="simulated disk failure"):
+        run_imagefolder_training_workflow(request)
+
+    assert sidecar_path.exists()
+    assert not checkpoint_path.exists()
+
+
+def test_resume_from_metadata_only_state_fails_with_clear_missing_checkpoint_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """위 상태(metadata만 있고 checkpoint 없음)에서 그 경로로 resume을
+    시도하면 load_training_checkpoint()가 존재 확인 없이 곧바로
+    torch.load()를 호출하므로 FileNotFoundError로 명확히 실패해야 한다
+    (test_train_imagefolder_cli.py의
+    test_resume_with_metadata_but_missing_checkpoint_file_fails_cleanly와
+    동일한 근거)."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    checkpoint_path = tmp_path / "checkpoint.pt"
+
+    import image_ai_studio.training.imagefolder_workflow as workflow_module
+
+    def failing_save_checkpoint(*args, **kwargs):
+        raise RuntimeError("simulated disk failure")
+
+    # save_training_checkpoint 실패 patch는 "metadata만 남기고 checkpoint
+    # 없음" 상태를 만드는 이 블록 안에서만 적용한다 -- 그 상태를 만든 뒤
+    # 이어지는 resume 시도는 patch가 걸리지 않은 원래 동작(실제
+    # load_training_checkpoint())으로 검증해야 하므로 monkeypatch.undo()
+    # 대신 범위가 명확한 context manager를 쓴다.
+    with monkeypatch.context() as m:
+        m.setattr(workflow_module, "save_training_checkpoint", failing_save_checkpoint)
+        with pytest.raises(RuntimeError, match="simulated disk failure"):
+            run_imagefolder_training_workflow(
+                ImageFolderWorkflowRequest(
+                    model_json_path=model_json_path, dataset_root=tmp_path,
+                    training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+                    output_dir=tmp_path / "out", checkpoint_out=checkpoint_path,
+                    export_torchscript=False, seed=SEED,
+                )
+            )
+
+    assert metadata_path_for_checkpoint(checkpoint_path).exists()
+    assert not checkpoint_path.exists()
+
+    with pytest.raises(FileNotFoundError, match=r"checkpoint\.pt"):
+        run_imagefolder_training_workflow(
+            ImageFolderWorkflowRequest(
+                model_json_path=model_json_path, dataset_root=tmp_path,
+                training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+                output_dir=tmp_path / "out2", resume_from=checkpoint_path,
+                export_torchscript=False, seed=SEED,
+            )
+        )
+
+
+# -- Phase 4J: metadata_ready 공유(최대 한 번만 준비) --------------------------
+
+
+def _spy_save_metadata(monkeypatch: pytest.MonkeyPatch) -> list[None]:
+    import image_ai_studio.training.imagefolder_workflow as workflow_module
+
+    calls: list[None] = []
+    original = workflow_module.save_imagefolder_resume_metadata
+
+    def spy(*args, **kwargs):
+        calls.append(None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(workflow_module, "save_imagefolder_resume_metadata", spy)
+    return calls
+
+
+def test_fresh_checkpoint_every_one_writes_metadata_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fresh 5 epoch, checkpoint_every=1 -> scheduled 저장 5번 + 최종
+    저장 1번 = 6번의 checkpoint 저장 기회가 있지만, metadata는 정확히
+    1번만 저장돼야 한다."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    metadata_calls = _spy_save_metadata(monkeypatch)
+    checkpoint_calls = _spy_save_training_checkpoint(monkeypatch)
+
+    request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=5, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path / "out",
+        checkpoint_out=tmp_path / "checkpoint.pt",
+        export_torchscript=False,
+        seed=SEED,
+        checkpoint_every=1,
+    )
+    run_imagefolder_training_workflow(request)
+
+    assert len(checkpoint_calls) == 6
+    assert len(metadata_calls) == 1
+
+
+def test_in_place_resume_never_rewrites_metadata_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    sidecar_path = metadata_path_for_checkpoint(checkpoint_path)
+
+    run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path, dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=3, batch_size=4, learning_rate=1e-2),
+            output_dir=tmp_path / "o1", checkpoint_out=checkpoint_path,
+            export_torchscript=False, seed=SEED,
+        )
+    )
+    content_before = sidecar_path.read_bytes()
+
+    metadata_calls = _spy_save_metadata(monkeypatch)
+    run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path, dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=3, batch_size=4, learning_rate=1e-2),
+            output_dir=tmp_path / "o2", resume_from=checkpoint_path, checkpoint_out=checkpoint_path,
+            export_torchscript=False, seed=SEED, checkpoint_every=1,
+        )
+    )
+
+    # save_imagefolder_resume_metadata()가 한 번도 호출되지 않았다는 사실
+    # 자체가 "재작성되지 않음"을 직접 증명한다 -- 파일시스템 timestamp
+    # 정밀도 차이로 flaky해질 수 있는 mtime 비교에는 의존하지 않는다.
+    assert len(metadata_calls) == 0
+    assert sidecar_path.read_bytes() == content_before

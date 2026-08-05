@@ -195,13 +195,78 @@ callback에서 예외를 던지지 말고 ShouldStopCallback을 쓸 것을 권�
 그래야 run_training()이 정상적인 TrainingResult를 반환하고, 상위
 workflow(예: run_imagefolder_training_workflow())가 checkpoint_out 등
 기존 artifact 후처리를 계속 수행할 수 있다(docs/
-phase4i_training_progress_and_stop_design.md §5)."""
+phase4i_training_progress_and_stop_design.md §5).
+
+side-effect 계약(Phase 4J, docs/phase4j_epoch_checkpoint_design.md §3-5):
+관찰/출력/UI 전달 전용이다 -- PyTorch CPU RNG를 소비하면 안 되고
+(torch.rand()/torch.randn() 등 호출 금지), model/optimizer/scheduler/
+DataLoader generator를 변경하면 안 된다(closure나 전역 변수로 이
+객체들에 접근할 수 있더라도 마찬가지). checkpoint_hook이 이 callback
+보다 먼저 실행되므로(Phase 4J), 이 계약을 어기면 그 순간 저장된
+checkpoint가 실제로 다음 epoch가 시작할 때의 상태와 달라져
+exact-resume이 깨질 수 있다."""
 
 ShouldStopCallback = Callable[[], bool]
 """인자 없이 bool을 반환하는 아무 callable이나 가능하다 (예:
 threading.Event().is_set). 이번 호출의 마지막 요청 epoch거나
 config.epochs == 1이면 절대 평가되지 않는다(docs/
-phase4i_training_progress_and_stop_design.md §7 "특수 사례")."""
+phase4i_training_progress_and_stop_design.md §7 "특수 사례").
+
+side-effect 계약(Phase 4J, docs/phase4j_epoch_checkpoint_design.md §3-5):
+외부 stop flag를 읽어 bool을 반환하는 용도로만 쓴다 -- PyTorch RNG를
+소비하면 안 되고, model/optimizer/scheduler/DataLoader generator를
+변경하면 안 되며, 반환값 외의 학습 상태 side effect를 만들면 안 된다.
+TrainingProgressCallback과 같은 이유(exact-resume)로 이 계약이
+요구된다."""
+
+
+@dataclass(frozen=True)
+class EpochCheckpointView:
+    """checkpoint_hook 호출 동안만 유효한 읽기 전용 뷰(synchronous
+    ephemeral view) -- 독립 snapshot이 아니다.
+
+    model/history/optimizer/scheduler/loader_generator는 전부
+    run_training() 내부의 살아있는 참조다. hook은 이 view가 유효한
+    동안(자기 자신의 동기 호출 범위 안)에서 필요한 조회와 직렬화를
+    전부 끝내야 하고, 이 view나 그 어떤 참조도 나중에 쓰려고
+    보관하면 안 된다. 비동기/백그라운드 저장에는 쓸 수 없다.
+
+    optimizer/scheduler/loader_generator는 읽기 전용으로만 접근해야
+    한다 -- 이 객체들을 변형하면(특히 loader_generator) exact-resume이
+    깨진다. hook은 또한 학습에 사용되는 RNG를 소비해서도 안 된다
+    (torch.rand()/torch.randn() 등 호출 금지) -- .state_dict()/
+    .get_state()/torch.get_rng_state() 같은 읽기 전용 호출 자체는
+    RNG를 소비하지 않으므로 허용되지만, 그 밖의 RNG 소비 연산은
+    다음 epoch가 시작할 때의 실제 상태와 checkpoint에 저장된 상태를
+    어긋나게 만든다(docs/phase4j_epoch_checkpoint_design.md §3-5,
+    exact-resume 계약의 일부).
+
+    best_state_dict/epochs_without_improvement는 run_training()이
+    이미 매 epoch 유지하는 값이라 담는 데 추가 비용이 없다.
+    """
+
+    model: nn.Module
+    history: TrainingHistory
+    best_state_dict: dict[str, torch.Tensor]
+    optimizer: torch.optim.Optimizer
+    scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau | None
+    epochs_without_improvement: int
+    loader_generator: torch.Generator | None
+
+
+CheckpointHook = Callable[[EpochCheckpointView], None]
+"""완료된 epoch마다(있으면) 정확히 한 번 호출된다 -- 호출 자체는
+저렴하고(view는 살아있는 참조만 담아 조립 비용이 거의 없다), 무거운
+계산(state_dict 조회, RNG 조회, 디스크 I/O)은 hook이 scheduled epoch로
+판단한 뒤에만 수행해야 한다. progress_callback/should_stop보다 먼저
+호출된다(docs/phase4j_epoch_checkpoint_design.md §3-1).
+
+side-effect 계약(§3-5, EpochCheckpointView 계약과 통합): view의 상태를
+읽고 동기적으로 저장하는 용도로만 쓴다 -- model/optimizer/scheduler/
+loader_generator를 변경하면 안 되고, torch.get_rng_state()/
+generator.get_state()/.state_dict() 같은 읽기 전용 호출 외에 학습에
+사용되는 RNG를 소비하는 연산을 호출하면 안 된다. hook이 예외를 던지면
+run_training()이 그대로 전파한다(감싸지 않음)."""
 
 
 @dataclass
@@ -280,6 +345,7 @@ def run_training(
     *,
     progress_callback: TrainingProgressCallback | None = None,
     should_stop: ShouldStopCallback | None = None,
+    checkpoint_hook: CheckpointHook | None = None,
 ) -> TrainingResult:
     """train_one_epoch/evaluate를 config.epochs만큼 반복하는 얇은 조립 함수.
 
@@ -331,9 +397,10 @@ def run_training(
 
     매 epoch의 순서는 train -> validation -> history 기록 -> best
     model/개선 카운터 갱신 -> scheduler.step(val_loss) -> early stopping
-    조건 확인 -> progress_callback 호출 -> (early stopping이 아니고
-    다음 epoch가 남아 있을 때만) should_stop() 평가다(Phase 4I, docs/
-    phase4i_training_progress_and_stop_design.md §4/§7). 즉 마지막으로
+    조건 확인 -> checkpoint_hook 호출 -> progress_callback 호출 ->
+    (early stopping이 아니고 다음 epoch가 남아 있을 때만) should_stop()
+    평가다(Phase 4I/4J, docs/phase4i_training_progress_and_stop_design.md
+    §4/§7, docs/phase4j_epoch_checkpoint_design.md §3-1). 즉 마지막으로
     실행된 epoch에서 scheduler가 LR을 바꿨더라도, 그 직후 early
     stopping으로 멈추면 바뀐 LR은 실제로 쓰이지 않을 수 있다 -- 이는
     의도된 동작이다(다음 epoch이 없으므로 바뀐 LR을 쓸 기회 자체가
@@ -369,6 +436,19 @@ def run_training(
     `stopped_by_user`는 `False`로 남는다. early stopping과
     `stopped_by_user`는 동시에 True가 될 수 없다(early stopping이
     항상 우선).
+
+    checkpoint_hook(Phase 4J, docs/phase4j_epoch_checkpoint_design.md
+    §3/§4)이 주어지면, 완료된 epoch마다(early stopping으로 끝난 epoch
+    포함) `scheduler.step()`과 early stopping 판정 이후, progress_callback
+    보다 먼저 정확히 한 번 `EpochCheckpointView`를 만들어 호출한다.
+    이 시점에는 아직 should_stop()을 평가하지 않았으므로 view가 담는
+    `history.stopped_by_user`는 항상 `False`다. hook이 예외를 던지면
+    그대로 전파한다(감싸지 않음) -- progress_callback과 같은 이유로
+    `TrainingResult`는 반환되지 않는다. `checkpoint_hook=None`(기본값)이면
+    이 호출 자체가 없으므로 기존 동작과 완전히 동일하다.
+    `loader_generator`는 `train_loader.generator`를 그대로 전달한다
+    (DataLoader가 생성자에서 받은 값을 그대로 보관하는 attribute이며,
+    전달하지 않았으면 `None`이다).
     """
     if resume_state is not None:
         # resume 관련 사전 검증은 optimizer/scheduler를 만들기 **전에** 끝낸다 --
@@ -454,6 +534,19 @@ def run_training(
             and epochs_without_improvement >= config.early_stopping_patience
         ):
             history.stopped_early = True
+
+        if checkpoint_hook is not None:
+            checkpoint_hook(
+                EpochCheckpointView(
+                    model=model,
+                    history=history,
+                    best_state_dict=best_state_dict,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    epochs_without_improvement=epochs_without_improvement,
+                    loader_generator=train_loader.generator,
+                )
+            )
 
         if progress_callback is not None:
             progress_callback(
