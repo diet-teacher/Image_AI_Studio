@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -517,3 +518,427 @@ def test_fresh_run_reusing_existing_checkpoint_out_fails_cleanly_and_keeps_exist
     assert ckpt.read_bytes() == original_bytes
     stderr = capsys.readouterr().err
     assert "already exists" in stderr
+
+
+# -- Phase 4K: Graceful SIGINT and Cooperative Training Stop ------------------
+#
+# docs/phase4k_graceful_interruption_design.md 기준. 실제 OS signal은 전혀
+# 보내지 않는다 -- controller 테스트는 handle_signal()을 직접 호출하고, CLI
+# 배선 테스트는 cli.signal.getsignal/cli.signal.signal을 완전한 fake로
+# 대체해 실제 pytest 프로세스의 SIGINT handler를 건드리지 않는다(§13-2).
+
+
+def _make_fake_result(checkpoint_path: Path | None = None) -> ImageFolderWorkflowResult:
+    """main()의 결과 출력 코드가 접근하는 최소한의 필드만 채운 fake
+    ImageFolderWorkflowResult. 실제 파일을 만들지 않는다 -- main()은 경로
+    문자열을 출력만 할 뿐 파일을 다시 읽지 않는다."""
+    history = TrainingHistory(
+        train_losses=[0.5], val_losses=[0.5], val_accuracies=[0.5],
+        best_epoch=1, best_val_loss=0.5,
+    )
+    return ImageFolderWorkflowResult(
+        history=history,
+        test_loss=0.5,
+        test_accuracy=0.5,
+        best_model_state_dict_path=Path("best_model_state_dict.pt"),
+        training_history_path=Path("training_history.json"),
+        class_mapping_path=Path("class_mapping.json"),
+        test_result_path=Path("test_result.json"),
+        checkpoint_path=checkpoint_path,
+        checkpoint_metadata_path=None,
+        torchscript_model_path=None,
+        torchscript_metadata_path=None,
+    )
+
+
+def _install_fake_signal_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[tuple[object, object]], dict[str, object], object]:
+    """cli.signal.getsignal()/cli.signal.signal()을 완전한 fake로 대체한다
+    (docs/phase4k_graceful_interruption_design.md §13-2). fake 안에서 진짜
+    signal.signal()을 호출해 위임하는 방식은 절대 쓰지 않는다 -- 그러면
+    pytest 프로세스 자체의 실제 SIGINT handler가 바뀌어버린다. 반환값은
+    (signal_calls, current_handler, previous_handler) -- signal_calls는
+    (sig, handler) 튜플의 설치/복원 호출 기록, current_handler는 fake가
+    추적하는 "현재 설치된 handler" 가변 상태, previous_handler는 설치
+    이전 상태를 나타내는 sentinel이다."""
+    previous_handler = object()
+    current_handler: dict[str, object] = {"value": previous_handler}
+    signal_calls: list[tuple[object, object]] = []
+
+    def fake_getsignal(sig):
+        assert sig == cli.signal.SIGINT
+        return current_handler["value"]
+
+    def fake_signal(sig, handler):
+        assert sig == cli.signal.SIGINT
+        signal_calls.append((sig, handler))
+        previous = current_handler["value"]
+        current_handler["value"] = handler
+        return previous
+
+    monkeypatch.setattr(cli.signal, "getsignal", fake_getsignal)
+    monkeypatch.setattr(cli.signal, "signal", fake_signal)
+    return signal_calls, current_handler, previous_handler
+
+
+# -- controller 단위 테스트 ----------------------------------------------------
+
+
+def test_sigint_controller_initial_should_stop_is_false() -> None:
+    controller = cli._SigintStopController()
+    assert controller.should_stop() is False
+
+
+def test_sigint_controller_first_signal_sets_should_stop_true() -> None:
+    controller = cli._SigintStopController()
+    controller.handle_signal(cli.signal.SIGINT, None)
+    assert controller.should_stop() is True
+
+
+def test_sigint_controller_first_signal_writes_message_once_to_stderr_fd(capfd) -> None:
+    """os.write(2, ...)는 Python의 sys.stderr 텍스트 스트림을 거치지 않고
+    파일 디스크립터에 직접 쓰므로, capsys가 아니라 fd 레벨까지 캡처하는
+    capfd로 검증한다(설계 문서 §13-1)."""
+    controller = cli._SigintStopController()
+    controller.handle_signal(cli.signal.SIGINT, None)
+
+    captured = capfd.readouterr()
+    assert captured.err.count("Interrupt requested.") == 1
+    assert "Training will stop at the next safe epoch boundary." in captured.err
+    assert "Press Ctrl+C again to terminate immediately." in captured.err
+
+
+def test_sigint_controller_second_signal_raises_keyboard_interrupt_without_repeating_message(capfd) -> None:
+    controller = cli._SigintStopController()
+    controller.handle_signal(cli.signal.SIGINT, None)
+    capfd.readouterr()  # 1차 안내 메시지 버퍼 소비
+
+    with pytest.raises(KeyboardInterrupt):
+        controller.handle_signal(cli.signal.SIGINT, None)
+
+    captured = capfd.readouterr()
+    assert captured.err == ""  # 2차 호출은 안내를 다시 출력하지 않음
+
+
+def test_sigint_controller_should_stop_remains_true_after_multiple_reads() -> None:
+    controller = cli._SigintStopController()
+    controller.handle_signal(cli.signal.SIGINT, None)
+    assert [controller.should_stop() for _ in range(5)] == [True] * 5
+
+
+def test_sigint_controller_first_signal_does_not_consume_torch_rng() -> None:
+    torch.manual_seed(0)
+    before = torch.get_rng_state().clone()
+    controller = cli._SigintStopController()
+    controller.handle_signal(cli.signal.SIGINT, None)
+    after = torch.get_rng_state()
+    assert torch.equal(before, after)
+
+
+def test_sigint_controller_oswrite_failure_does_not_propagate_and_should_stop_still_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failing_write(fd, data):
+        raise OSError("stderr is closed")
+
+    monkeypatch.setattr(cli.os, "write", failing_write)
+
+    controller = cli._SigintStopController()
+    controller.handle_signal(cli.signal.SIGINT, None)  # 예외가 전파되면 안 됨
+
+    assert controller.should_stop() is True
+
+
+def test_sigint_controller_oswrite_called_exactly_once_on_first_signal_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """호출 횟수/인자만 검증하는 테스트이므로 실제 fd에 쓰지 않는다 --
+    실제 stderr 출력 관찰은 별도의 capfd 테스트
+    (test_sigint_controller_first_signal_writes_message_once_to_stderr_fd)가
+    이미 담당하므로 여기서 중복 I/O를 만들지 않는다."""
+    calls: list[tuple[int, bytes]] = []
+
+    def spying_write(fd, data):
+        calls.append((fd, data))
+        return len(data)
+
+    monkeypatch.setattr(cli.os, "write", spying_write)
+
+    controller = cli._SigintStopController()
+    controller.handle_signal(cli.signal.SIGINT, None)
+    assert len(calls) == 1
+    assert calls[0][0] == 2
+    assert calls[0][1] == cli._INTERRUPT_MESSAGE_BYTES
+
+    with pytest.raises(KeyboardInterrupt):
+        controller.handle_signal(cli.signal.SIGINT, None)
+    assert len(calls) == 1  # 2차 호출에서는 os.write가 다시 호출되지 않음
+
+
+def test_sigint_controller_constructor_takes_no_arguments() -> None:
+    """controller가 model/optimizer/generator 등 학습 객체에 대한 참조를
+    전혀 갖지 않는 구조임을 생성자 시그니처 자체로 보장한다."""
+    import inspect
+
+    signature = inspect.signature(cli._SigintStopController.__init__)
+    assert list(signature.parameters) == ["self"]
+
+
+# -- CLI signal 배선 테스트 ------------------------------------------------------
+
+
+def test_cli_first_sigint_makes_should_stop_return_true_and_restores_handler_on_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # workflow는 fake로 대체하므로 실제 dataset 폴더를 만들 필요가 없다
+    # (dataset 로딩/검증은 run_imagefolder_training_workflow() 내부에서만
+    # 일어나고, 이 테스트는 그 호출 자체를 가짜로 바꾼다).
+    model_json_path = _write_model_json(tmp_path, "cli_sigint_wiring_model")
+    signal_calls, current_handler, previous_handler = _install_fake_signal_module(monkeypatch)
+
+    captured: dict = {}
+
+    def fake_workflow(request, *, progress_callback=None, should_stop=None):
+        captured["should_stop"] = should_stop
+        assert callable(should_stop)
+        assert should_stop() is False
+        installed_handler = signal_calls[0][1]
+        installed_handler(cli.signal.SIGINT, None)
+        assert should_stop() is True
+        return _make_fake_result()
+
+    monkeypatch.setattr(cli, "run_imagefolder_training_workflow", fake_workflow)
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "1",
+            "--no-export-torchscript",
+        ]
+    )
+
+    assert exit_code == 0
+    assert "should_stop" in captured
+    assert len(signal_calls) == 2  # 설치 1회 + 복원 1회
+    assert current_handler["value"] is previous_handler
+
+
+def test_cli_handler_restored_after_workflow_value_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model_json_path = _write_model_json(tmp_path, "cli_sigint_value_error_model")
+    signal_calls, current_handler, previous_handler = _install_fake_signal_module(monkeypatch)
+
+    def fake_workflow(request, *, progress_callback=None, should_stop=None):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(cli, "run_imagefolder_training_workflow", fake_workflow)
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "1",
+        ]
+    )
+
+    assert exit_code == 1
+    assert current_handler["value"] is previous_handler
+    # 설치 1회(controller.handle_signal) + 복원 1회(previous_handler) -- 그 외
+    # 불필요한 추가 설치/복원 호출이 없어야 한다.
+    assert len(signal_calls) == 2
+    assert callable(signal_calls[0][1])
+    assert signal_calls[1][1] is previous_handler
+
+
+def test_cli_handler_restored_after_workflow_os_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model_json_path = _write_model_json(tmp_path, "cli_sigint_os_error_model")
+    signal_calls, current_handler, previous_handler = _install_fake_signal_module(monkeypatch)
+
+    def fake_workflow(request, *, progress_callback=None, should_stop=None):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cli, "run_imagefolder_training_workflow", fake_workflow)
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "1",
+        ]
+    )
+
+    assert exit_code == 1
+    assert current_handler["value"] is previous_handler
+    assert len(signal_calls) == 2
+    assert callable(signal_calls[0][1])
+    assert signal_calls[1][1] is previous_handler
+
+
+def test_cli_handler_restored_after_workflow_keyboard_interrupt_and_exit_code_130(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """두 번째 SIGINT의 escalation을 흉내낸다 -- workflow 호출 도중
+    KeyboardInterrupt가 발생해도 handler가 먼저 복원되고, exit code는
+    130이어야 한다."""
+    model_json_path = _write_model_json(tmp_path, "cli_sigint_keyboard_interrupt_model")
+    signal_calls, current_handler, previous_handler = _install_fake_signal_module(monkeypatch)
+
+    def fake_workflow(request, *, progress_callback=None, should_stop=None):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(cli, "run_imagefolder_training_workflow", fake_workflow)
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "1",
+        ]
+    )
+
+    assert exit_code == 130
+    assert current_handler["value"] is previous_handler
+    assert len(signal_calls) == 2
+    assert callable(signal_calls[0][1])
+    assert signal_calls[1][1] is previous_handler
+    stderr = capsys.readouterr().err
+    assert "Interrupted" in stderr
+
+
+def test_cli_handler_install_failure_returns_exit_1_and_never_calls_workflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    model_json_path = _write_model_json(tmp_path, "cli_sigint_install_failure_model")
+
+    signal_attempts: list[tuple[object, object]] = []
+
+    def failing_getsignal(sig):
+        return object()
+
+    def failing_signal(sig, handler):
+        signal_attempts.append((sig, handler))
+        raise ValueError("signal only works in main thread of the main interpreter")
+
+    monkeypatch.setattr(cli.signal, "getsignal", failing_getsignal)
+    monkeypatch.setattr(cli.signal, "signal", failing_signal)
+
+    workflow_calls = []
+
+    def fake_workflow(request, *, progress_callback=None, should_stop=None):
+        workflow_calls.append(request)
+        return _make_fake_result()
+
+    monkeypatch.setattr(cli, "run_imagefolder_training_workflow", fake_workflow)
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "1",
+        ]
+    )
+
+    assert exit_code == 1
+    stderr = capsys.readouterr().err
+    assert "main thread" in stderr
+    assert workflow_calls == []
+    # signal.signal 호출은 실패한 설치 시도 1회뿐 -- 설치가 실패했으므로
+    # 복원 시도(2번째 호출)는 있으면 안 된다.
+    assert len(signal_attempts) == 1
+    assert signal_attempts[0][1] is not None  # controller.handle_signal을 넘기려 시도했음
+
+
+def test_cli_checkpoint_out_none_should_stop_wiring_still_works(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # workflow는 fake로 대체하므로 실제 dataset 폴더가 필요 없다.
+    model_json_path = _write_model_json(tmp_path, "cli_sigint_no_checkpoint_out_model")
+    signal_calls, current_handler, previous_handler = _install_fake_signal_module(monkeypatch)
+
+    def fake_workflow(request, *, progress_callback=None, should_stop=None):
+        assert request.checkpoint_out is None
+        installed_handler = signal_calls[0][1]
+        installed_handler(cli.signal.SIGINT, None)
+        assert should_stop() is True
+        return _make_fake_result(checkpoint_path=None)
+
+    monkeypatch.setattr(cli, "run_imagefolder_training_workflow", fake_workflow)
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "1",
+        ]
+    )
+
+    assert exit_code == 0
+    assert current_handler["value"] is previous_handler
+    assert len(signal_calls) == 2
+    assert callable(signal_calls[0][1])
+    assert signal_calls[1][1] is previous_handler
+
+
+# -- main() 전체 KeyboardInterrupt -> exit code 130 --------------------------
+
+
+def test_cli_keyboard_interrupt_during_parse_args_returns_130(
+    monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    def failing_parse_args(argv=None):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(cli, "parse_args", failing_parse_args)
+
+    exit_code = cli.main([])
+
+    assert exit_code == 130
+    stderr = capsys.readouterr().err
+    assert "Interrupted" in stderr
+
+
+def test_cli_keyboard_interrupt_after_workflow_return_during_result_output_returns_130(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """workflow가 정상 반환된 뒤(handler가 이미 복원된 상태) 결과 출력
+    코드(history = result.history)에서 KeyboardInterrupt가 발생해도
+    exit code 130으로 수렴해야 한다(설계 문서 §9-3)."""
+    model_json_path = _write_model_json(tmp_path, "cli_sigint_post_return_model")
+    _, current_handler, previous_handler = _install_fake_signal_module(monkeypatch)
+
+    class _ResultWithFailingHistoryAccess:
+        @property
+        def history(self):
+            raise KeyboardInterrupt()
+
+    def fake_workflow(request, *, progress_callback=None, should_stop=None):
+        return _ResultWithFailingHistoryAccess()
+
+    monkeypatch.setattr(cli, "run_imagefolder_training_workflow", fake_workflow)
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "1",
+        ]
+    )
+
+    assert exit_code == 130
+    # workflow가 이미 정상 반환된 뒤이므로, 이 시점에는 handler가 이미
+    # 복원되어 있어야 한다.
+    assert current_handler["value"] is previous_handler
+    stderr = capsys.readouterr().err
+    assert "Interrupted" in stderr

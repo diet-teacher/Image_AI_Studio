@@ -39,10 +39,18 @@ export는 기본으로 포함되며 `--no-export-torchscript`로 끌 수 있다.
 `--seed`는 resume 시 사실상 무시된다 -- model은 곧바로 checkpoint의
 model_state_dict로 덮어써지고, DataLoader shuffle 순서와 CPU RNG는
 checkpoint에 저장된 상태로 복원되기 때문이다(--seed 값과 무관).
+
+Ctrl+C(SIGINT, Phase 4K): 첫 번째 Ctrl+C는 현재 epoch가
+끝난 뒤 다음 유효한 epoch 경계에서 학습을 안전하게 중단한다(정상 종료,
+exit code 0). 두 번째 Ctrl+C는 즉시 강제 종료한다(exit code 130). 자세한
+계약은 docs/phase4k_graceful_interruption_design.md와 README.md의
+"Ctrl+C" 절을 참고.
 """
 from __future__ import annotations
 
 import argparse
+import os
+import signal
 import sys
 from pathlib import Path
 
@@ -148,68 +156,140 @@ def _print_progress(progress: TrainingProgress) -> None:
     )
 
 
+# Phase 4K: signal handler 안에서는 동적 문자열 조합/인코딩을 하지 않는다
+# (docs/phase4k_graceful_interruption_design.md §5-2) -- 미리 인코딩해 둔
+# 고정 bytes를 os.write()로 그대로 내보낸다.
+_INTERRUPT_MESSAGE_BYTES = (
+    b"\nInterrupt requested. Training will stop at the next safe epoch boundary.\n"
+    b"If training has already finished, remaining output work will complete normally.\n"
+    b"Press Ctrl+C again to terminate immediately.\n"
+)
+
+
+class _SigintStopController:
+    """SIGINT(Ctrl+C)를 run_imagefolder_training_workflow()의 should_stop=
+    콜백으로 변환하는 CLI 전용 private controller(Phase 4K, docs/
+    phase4k_graceful_interruption_design.md). signal.signal()의 handler로도,
+    should_stop=으로도 동시에 바인딩된다.
+
+    handle_signal()은 bool 대입과 고정 bytes의 저수준 stderr 출력
+    (os.write(2, ...))만 수행한다 -- checkpoint/artifact 파일 I/O,
+    PyTorch/model/optimizer/generator 접근, logging/동적 formatting은
+    전부 하지 않는다(Phase 4I §3-5/Phase 4J §3-5의 RNG/state-purity 계약과
+    동일한 이유 + §5-1/§5-2의 텍스트 스트림 재진입 회피 근거). 첫 번째
+    호출은 flag를 먼저 설정한 뒤 안내 출력을 시도하므로, 출력이 실패해도
+    should_stop()은 항상 True를 반환한다. os.write()의 partial write를
+    재시도하는 루프는 두지 않는다(§5-2) -- 실패 시 OSError만 무시하고,
+    그 밖의 예외는 숨기지 않는다."""
+
+    def __init__(self) -> None:
+        self._interrupt_requested = False
+
+    def should_stop(self) -> bool:
+        return self._interrupt_requested
+
+    def handle_signal(self, signum: int, frame: object) -> None:
+        if not self._interrupt_requested:
+            self._interrupt_requested = True
+            try:
+                os.write(2, _INTERRUPT_MESSAGE_BYTES)
+            except OSError:
+                pass
+            return
+        signal.default_int_handler(signum, frame)
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
-
-    print("ImageFolder Training")
-    print(f"Model JSON: {args.model_json}")
-    print(f"Dataset root: {args.dataset_root}")
-    print(f"Output dir: {args.output_dir}")
-    print(f"Resume from: {args.resume_from if args.resume_from is not None else '(none, fresh training)'}")
-    print(f"Checkpoint out: {args.checkpoint_out if args.checkpoint_out is not None else '(none, not saved)'}")
-
+    # Phase 4K: main() 실행 전체(인자 파싱부터 결과 출력까지)에서 발생하는
+    # KeyboardInterrupt를 exit code 130으로 명시적으로 통제한다(docs/
+    # phase4k_graceful_interruption_design.md §9-3) -- 별도 private
+    # _main()을 새로 만들지 않고 기존 본문 전체를 한 단계 더 감싸는 구조.
     try:
-        training_config = TrainingConfig(
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            learning_rate=args.learning_rate,
-            optimizer=args.optimizer,
-            momentum=args.momentum,
-            lr_scheduler=args.lr_scheduler,
-            lr_scheduler_factor=args.lr_scheduler_factor,
-            lr_scheduler_patience=args.lr_scheduler_patience,
-            early_stopping_patience=args.early_stopping_patience,
-        )
-        request = ImageFolderWorkflowRequest(
-            model_json_path=args.model_json,
-            dataset_root=args.dataset_root,
-            training_config=training_config,
-            output_dir=args.output_dir,
-            resume_from=args.resume_from,
-            checkpoint_out=args.checkpoint_out,
-            export_torchscript=args.export_torchscript,
-            seed=args.seed,
-            checkpoint_every=args.checkpoint_every,
-        )
-        result = run_imagefolder_training_workflow(request, progress_callback=_print_progress)
-    except (ModelValidationError, TrainingConfigError, ValueError, OSError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
+        args = parse_args(argv)
 
-    history = result.history
-    print(f"  stopped_early={history.stopped_early}")
-    print(f"  stopped_by_user={history.stopped_by_user}")
-    print(f"Best epoch: {history.best_epoch} (val_loss={history.best_val_loss:.4f})")
-    print(f"Test: loss={result.test_loss:.4f} accuracy={result.test_accuracy:.4f}")
+        print("ImageFolder Training")
+        print(f"Model JSON: {args.model_json}")
+        print(f"Dataset root: {args.dataset_root}")
+        print(f"Output dir: {args.output_dir}")
+        print(f"Resume from: {args.resume_from if args.resume_from is not None else '(none, fresh training)'}")
+        print(f"Checkpoint out: {args.checkpoint_out if args.checkpoint_out is not None else '(none, not saved)'}")
 
-    print("Artifacts:")
-    print(f"  best model:      {result.best_model_state_dict_path}")
-    print(f"  training history:{result.training_history_path}")
-    print(f"  class mapping:   {result.class_mapping_path}")
-    print(f"  test result:     {result.test_result_path}")
-    if result.checkpoint_path is not None:
-        print(f"  checkpoint:      {result.checkpoint_path}")
-        print(f"  checkpoint meta: {result.checkpoint_metadata_path}")
-        if history.stopped_early:
-            print(
-                "  note: stopped_early=True -- weights/history can still be loaded, but this "
-                "checkpoint cannot be used to resume training further."
+        try:
+            training_config = TrainingConfig(
+                epochs=args.epochs,
+                batch_size=args.batch_size,
+                learning_rate=args.learning_rate,
+                optimizer=args.optimizer,
+                momentum=args.momentum,
+                lr_scheduler=args.lr_scheduler,
+                lr_scheduler_factor=args.lr_scheduler_factor,
+                lr_scheduler_patience=args.lr_scheduler_patience,
+                early_stopping_patience=args.early_stopping_patience,
             )
-    if result.torchscript_model_path is not None:
-        print(f"  TorchScript:     {result.torchscript_model_path}")
-        print(f"  TorchScript meta:{result.torchscript_metadata_path}")
+            request = ImageFolderWorkflowRequest(
+                model_json_path=args.model_json,
+                dataset_root=args.dataset_root,
+                training_config=training_config,
+                output_dir=args.output_dir,
+                resume_from=args.resume_from,
+                checkpoint_out=args.checkpoint_out,
+                export_torchscript=args.export_torchscript,
+                seed=args.seed,
+                checkpoint_every=args.checkpoint_every,
+            )
 
-    return 0
+            # Phase 4K: 첫 번째 Ctrl+C를 cooperative stop request로 변환하는
+            # controller를 SIGINT handler로 설치한다. 설치가 (메인 스레드
+            # 제약 등으로) 실패하면 조용히 넘어가지 않고 명확한 ValueError로
+            # 다시 던져 아래 기존 오류 처리 경로(exit code 1)를 그대로 탄다.
+            controller = _SigintStopController()
+            try:
+                previous_handler = signal.getsignal(signal.SIGINT)
+                signal.signal(signal.SIGINT, controller.handle_signal)
+            except ValueError as exc:
+                raise ValueError(
+                    "graceful SIGINT handling requires the CLI to run in the main thread"
+                ) from exc
+
+            try:
+                result = run_imagefolder_training_workflow(
+                    request,
+                    progress_callback=_print_progress,
+                    should_stop=controller.should_stop,
+                )
+            finally:
+                signal.signal(signal.SIGINT, previous_handler)
+        except (ModelValidationError, TrainingConfigError, ValueError, OSError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+
+        history = result.history
+        print(f"  stopped_early={history.stopped_early}")
+        print(f"  stopped_by_user={history.stopped_by_user}")
+        print(f"Best epoch: {history.best_epoch} (val_loss={history.best_val_loss:.4f})")
+        print(f"Test: loss={result.test_loss:.4f} accuracy={result.test_accuracy:.4f}")
+
+        print("Artifacts:")
+        print(f"  best model:      {result.best_model_state_dict_path}")
+        print(f"  training history:{result.training_history_path}")
+        print(f"  class mapping:   {result.class_mapping_path}")
+        print(f"  test result:     {result.test_result_path}")
+        if result.checkpoint_path is not None:
+            print(f"  checkpoint:      {result.checkpoint_path}")
+            print(f"  checkpoint meta: {result.checkpoint_metadata_path}")
+            if history.stopped_early:
+                print(
+                    "  note: stopped_early=True -- weights/history can still be loaded, but this "
+                    "checkpoint cannot be used to resume training further."
+                )
+        if result.torchscript_model_path is not None:
+            print(f"  TorchScript:     {result.torchscript_model_path}")
+            print(f"  TorchScript meta:{result.torchscript_metadata_path}")
+
+        return 0
+    except KeyboardInterrupt:
+        print("Interrupted. Exiting without completing remaining work.", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

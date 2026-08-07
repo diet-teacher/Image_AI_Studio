@@ -659,8 +659,9 @@ result = run_training(
   전체를 사후 재출력하지 않는 의도된 동작 변경입니다. 새 CLI 플래그(중단
   요청용)는 추가하지 않았습니다 -- `should_stop`은 core API 계약이고,
   CLI에서 실제로 중단을 트리거하는 방법(시그널/파일/등)은 이번 Phase
-  범위 밖입니다. `scripts/run_imagefolder_training_e2e.py`는 변경하지
-  않았습니다.
+  범위 밖입니다(Ctrl+C를 이 `should_stop`에 연결하는 실제 트리거는
+  Phase 4K에서 구현됐습니다 -- 위 "Phase 4K" 절 참고).
+  `scripts/run_imagefolder_training_e2e.py`는 변경하지 않았습니다.
 
 설계 배경, 3라운드 리뷰에서 수정된 논리적 충돌, 17개 동작 계약 테스트
 목록은 `docs/phase4i_training_progress_and_stop_design.md`를 참고하세요.
@@ -743,6 +744,77 @@ model/history/optimizer/scheduler/loader_generator의 살아있는
 
 ---
 
+## Phase 4K: Graceful SIGINT and Cooperative Training Stop
+
+`scripts/train_imagefolder.py` 실행 중 Ctrl+C(SIGINT)를 즉시 강제 종료로
+처리하지 않고, Phase 4I의 `should_stop`/Phase 4J의 checkpoint 저장 경로에
+연결된 cooperative stop으로 바꿨습니다. 단일 Ctrl+C graceful stop 경로는
+실제 Windows 터미널에서 수동 acceptance까지 완료했습니다(상세 결과는
+`docs/phase4k_graceful_interruption_design.md` §14 참고).
+
+**첫 번째 Ctrl+C**:
+
+* stop request를 설정합니다(예외를 던지지 않음).
+* 다음으로 실제 평가되는 epoch 경계(`should_stop()` 호출 지점)에서 학습을
+  안전하게 중단합니다 -- 현재 실행 중인 epoch는 항상 끝까지 완료됩니다.
+* `training_history.json`/`class_mapping.json`/`best_model_state_dict.pt`/
+  `test_result.json`(+TorchScript export) 등 final artifact를 정상적으로
+  저장합니다.
+* `--checkpoint-out`이 있으면 final checkpoint도 저장되고, 여기에
+  `stopped_by_user=True`가 기록됩니다.
+* 성공적으로 완료되면 **exit code 0**입니다(cooperative stop은 정상 종료
+  경로입니다).
+* **이번 호출의 마지막 요청 epoch 중에는 `should_stop()` 자체가 평가되지
+  않으므로**(Phase 4I의 기존 규칙), 그 시점에 Ctrl+C를 눌러도
+  `stopped_by_user=False`로 남을 수 있습니다 -- 어차피 더 이상 건너뛸
+  epoch가 없어 학습이 그대로 끝나기 때문입니다.
+* 안내 메시지("Interrupt requested. Training will stop at the next safe
+  epoch boundary. ...")는 첫 번째 Ctrl+C에서 저수준 stderr 출력을 **한
+  번 시도**합니다 -- 매우 드물게(stderr가 닫힌 파이프인 경우 등) 출력이
+  실패하거나 아주 긴 C/CUDA 호출 도중이라 지연될 수 있지만, 그런 경우에도
+  stop request 자체는 정상적으로 설정됩니다.
+
+**두 번째 Ctrl+C**:
+
+* 그 자리에서 즉시 `KeyboardInterrupt`가 발생해 강제 종료합니다.
+* **exit code 130**입니다.
+* 남은 artifact 저장이나 final checkpoint 저장은 보장되지 않습니다.
+* **마지막으로 원자적 저장이 완료된 유효한 checkpoint는 보존됩니다** --
+  기존 checkpoint 파일과 새로 쓰던 파일의 일부가 섞인 상태로 노출되는
+  일은 없습니다(checkpoint/metadata 저장은 임시 파일에 다 쓴 뒤
+  `os.replace()`로 교체하는 원자적 저장이라, Phase 4J부터 이미 이
+  보호를 제공합니다).
+* `training_history.json`/`test_result.json`/TorchScript export처럼
+  원자적 저장을 쓰지 않는 산출물은 두 번째 Ctrl+C 도중이면 불완전한
+  상태로 남을 수 있습니다.
+
+**exit code 요약**:
+
+```text
+정상 완료                              0
+첫 번째 Ctrl+C cooperative stop 성공   0
+검증/저장/일반 오류                    1
+두 번째 Ctrl+C / KeyboardInterrupt     130
+```
+
+**`--checkpoint-every`와의 관계**: `--checkpoint-every`는 graceful stop의
+필수 옵션이 **아닙니다**. 켜져 있지 않아도 첫 번째 Ctrl+C가 정상적으로
+처리되면 final checkpoint는 항상 저장됩니다. `--checkpoint-every`가 실제로
+값을 더하는 상황은 **두 번째 Ctrl+C, 프로세스 crash처럼 final save
+자체에 도달하지 못하는 비정상 종료**뿐입니다 -- 그런 경우에 대비해 학습
+도중 가장 최근에 완료된 epoch까지의 상태를 미리 보존해 둡니다.
+
+**Python `signal`의 한계**: 매우 긴 C/CUDA 호출(예: 하나의 큰 저장 작업이나
+CUDA 동기화) 도중에는 Python 레벨 SIGINT handler 실행 자체가 그 호출이
+끝날 때까지 지연될 수 있습니다 -- 안내 메시지가 바로 뜨지 않는다고 Ctrl+C를
+반복해서 누르면, 그 반복 입력이 두 번째 Ctrl+C로 해석되어 의도치 않게
+강제 종료될 수 있습니다.
+
+설계 배경과 시나리오별 상세 동작표는
+`docs/phase4k_graceful_interruption_design.md`를 참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
@@ -778,6 +850,9 @@ model/history/optimizer/scheduler/loader_generator의 살아있는
 * `run_training()`의 epoch 경계 `checkpoint_hook` + `--checkpoint-every N`
   (global epoch 기준 자동 저장), checkpoint/metadata 원자적 저장,
   in-place resume이 아닌 경로의 기존 checkpoint 재사용 거부 (Phase 4J)
+* `scripts/train_imagefolder.py`의 Ctrl+C(SIGINT) graceful cooperative
+  stop -- 첫 번째 Ctrl+C는 다음 epoch 경계에서 안전하게 중단(exit 0),
+  두 번째 Ctrl+C는 즉시 강제 종료(exit 130) (Phase 4K)
 * TorchScript 배포, C++(LibTorch) CPU/CUDA 추론
 * Python/C++ parity 검증 (Phase 0~4E 배포 경로; Phase 4F는 export/parity
   코드를 변경하지 않았고, 기존 parity E2E를 재실행해 회귀 없음을 확인함
@@ -807,6 +882,9 @@ model/history/optimizer/scheduler/loader_generator의 살아있는
 * 기존 `--checkpoint-out` 경로를 명시적으로 덮어쓰도록 강제하는 옵션
   (예: `--overwrite-checkpoint`) -- in-place resume(`--resume-from`과
   `--checkpoint-out`이 같은 경로) 외에는 항상 새 경로가 필요함 (Phase 4J)
+* `SIGTERM`/`SIGHUP` graceful shutdown, batch 중간 cancellation, GUI stop
+  button(Ctrl+C cooperative stop 자체는 Phase 4K에서 지원 -- 위 "Phase 4K"
+  절 참고)
 * mixed precision, multi-GPU/distributed training
 * 일반 DAG(`GraphSpec`/`NodeSpec`/`EdgeSpec`), long skip connection,
   중첩 `BranchSpec`
