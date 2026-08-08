@@ -16,11 +16,23 @@ from image_ai_studio.training.config import TrainingConfig, require_compatible_r
 
 
 def _build_optimizer(model: nn.Module, config: TrainingConfig) -> torch.optim.Optimizer:
-    """config.optimizer에 따라 Adam 또는 SGD를 생성. TrainingConfig.__post_init__이
-    이미 "adam"/"sgd" 외의 값을 거부하므로 그 외 분기는 없다."""
+    """config.optimizer에 따라 Adam, AdamW, 또는 SGD를 생성. TrainingConfig.__post_init__이
+    이미 "adam"/"sgd"/"adamw" 외의 값을 거부하므로 그 외 분기는 없다.
+    weight_decay는 세 optimizer 모두에 공통으로 전달한다 (Phase 4L)."""
     if config.optimizer == "sgd":
-        return torch.optim.SGD(model.parameters(), lr=config.learning_rate, momentum=config.momentum)
-    return torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+        return torch.optim.SGD(
+            model.parameters(),
+            lr=config.learning_rate,
+            momentum=config.momentum,
+            weight_decay=config.weight_decay,
+        )
+    if config.optimizer == "adamw":
+        return torch.optim.AdamW(
+            model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+        )
+    return torch.optim.Adam(
+        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+    )
 
 
 def _build_scheduler(

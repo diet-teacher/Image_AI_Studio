@@ -520,6 +520,107 @@ def test_fresh_run_reusing_existing_checkpoint_out_fails_cleanly_and_keeps_exist
     assert "already exists" in stderr
 
 
+# -- Phase 4L: --weight-decay / --optimizer adamw ------------------------------
+
+
+def test_weight_decay_forwards_exact_value_to_workflow_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLI가 `--weight-decay` argparse 값을 TrainingConfig 경유로
+    `ImageFolderWorkflowRequest.training_config`에 정확히 실어 보내는지
+    직접 증명한다 (--checkpoint-every 배선 테스트와 동일한 request 캡처
+    패턴)."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, "cli_weight_decay_forward_model")
+
+    captured: dict = {}
+
+    def fake_workflow(request, *, progress_callback=None, should_stop=None):
+        captured["request"] = request
+        history = TrainingHistory(
+            train_losses=[0.5], val_losses=[0.5], val_accuracies=[0.5],
+            best_epoch=1, best_val_loss=0.5,
+        )
+        return ImageFolderWorkflowResult(
+            history=history,
+            test_loss=0.5,
+            test_accuracy=0.5,
+            best_model_state_dict_path=tmp_path / "best_model_state_dict.pt",
+            training_history_path=tmp_path / "training_history.json",
+            class_mapping_path=tmp_path / "class_mapping.json",
+            test_result_path=tmp_path / "test_result.json",
+            checkpoint_path=None,
+            checkpoint_metadata_path=None,
+            torchscript_model_path=None,
+            torchscript_metadata_path=None,
+        )
+
+    monkeypatch.setattr(cli, "run_imagefolder_training_workflow", fake_workflow)
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "1",
+            "--batch-size", "4",
+            "--optimizer", "adamw",
+            "--weight-decay", "0.25",
+            "--no-export-torchscript",
+        ]
+    )
+
+    assert exit_code == 0
+    assert "request" in captured
+    assert captured["request"].training_config.optimizer == "adamw"
+    assert captured["request"].training_config.weight_decay == 0.25
+
+
+def test_weight_decay_defaults_to_zero_when_flag_omitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, "cli_weight_decay_default_model")
+
+    captured: dict = {}
+
+    def fake_workflow(request, *, progress_callback=None, should_stop=None):
+        captured["request"] = request
+        history = TrainingHistory(
+            train_losses=[0.5], val_losses=[0.5], val_accuracies=[0.5],
+            best_epoch=1, best_val_loss=0.5,
+        )
+        return ImageFolderWorkflowResult(
+            history=history,
+            test_loss=0.5,
+            test_accuracy=0.5,
+            best_model_state_dict_path=tmp_path / "best_model_state_dict.pt",
+            training_history_path=tmp_path / "training_history.json",
+            class_mapping_path=tmp_path / "class_mapping.json",
+            test_result_path=tmp_path / "test_result.json",
+            checkpoint_path=None,
+            checkpoint_metadata_path=None,
+            torchscript_model_path=None,
+            torchscript_metadata_path=None,
+        )
+
+    monkeypatch.setattr(cli, "run_imagefolder_training_workflow", fake_workflow)
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "1",
+            "--batch-size", "4",
+            "--no-export-torchscript",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["request"].training_config.weight_decay == 0.0
+
+
 # -- Phase 4K: Graceful SIGINT and Cooperative Training Stop ------------------
 #
 # docs/phase4k_graceful_interruption_design.md 기준. 실제 OS signal은 전혀

@@ -383,8 +383,9 @@ TorchScript export/C++ CPU·CUDA parity까지 PASS 확인. Early
 stopping의 정확한 중단 시점(off-by-one 경계)과 `ReduceLROnPlateau`가
 실제로 LR을 줄이는 호출 순번은 결정론적 unit test로 별도 고정했습니다.
 
-loss function 선택, Adam betas/weight decay, `"plateau"` 외 scheduler,
-full checkpoint/resume은 이번 Phase에서도 지원하지 않습니다.
+loss function 선택, Adam betas, `"plateau"` 외 scheduler, full
+checkpoint/resume은 이번 Phase에서도 지원하지 않습니다(weight decay와
+AdamW는 Phase 4L에서 추가됐습니다 -- 아래 "Phase 4L" 절 참고).
 
 설계 배경과 상세 검증 결과는
 `docs/phase4e_training_config_design.md`를 참고하세요.
@@ -815,14 +816,54 @@ CUDA 동기화) 도중에는 Python 레벨 SIGINT handler 실행 자체가 그 �
 
 ---
 
+## Phase 4L: Optimizer Regularization Extension (weight decay / AdamW)
+
+Phase 4E 이후 미지원으로 남아 있던 weight decay(L2 정규화)와 AdamW
+optimizer를 `TrainingConfig`/`_build_optimizer()`의 기존 확장 지점
+안에서 추가했습니다.
+
+* `TrainingConfig.optimizer`: `"adam"`(기본값) | `"sgd"` | `"adamw"`(신규)
+* `TrainingConfig.weight_decay`: `float`, 기본값 `0.0` -- Adam/SGD/AdamW
+  공통 적용. 음수/`NaN`/`±inf`/bool은 거부하지만 **임의의 상한은 두지
+  않습니다**(실제 값이 학습에 적절한지는 사용자의 hyperparameter 선택
+  책임).
+* `scripts/train_imagefolder.py`에 `--weight-decay FLOAT`(기본값 `0.0`)
+  플래그를 추가하고, `--optimizer` 선택지에 `adamw`를 추가했습니다.
+* **resume 호환성**: `weight_decay`도 다른 optimizer 관련 필드와 동일하게
+  resume 시 반드시 일치해야 하지만, **오직 이 필드에 한해** Phase 4L
+  이전에 저장된 checkpoint(`weight_decay` 키 자체가 없음)는
+  `weight_decay=0.0`으로 학습된 것으로 간주합니다 -- 그래서 새 config도
+  `weight_decay=0.0`이면 그대로 resume할 수 있고, `weight_decay>0.0`으로
+  resume하려 하면 값이 실제로 달라지므로 거부됩니다. 다른 필드가
+  누락된 경우는 기존과 동일하게 항상 거부합니다.
+* `src/image_ai_studio/training/checkpoint.py`/`imagefolder_workflow.py`는
+  이번 Phase에서 수정하지 않았습니다 -- `training_config`를 그대로
+  저장/전달하는 기존 구조 덕분에 새 필드가 checkpoint에 자동으로
+  포함됩니다.
+
+실제로 검증됨: `optimizer="adamw"` + `weight_decay>0` 조합에서도 continuous
+run과 resume run이 model parameter/optimizer state/scheduler state 전부
+tensor-level로 정확히 일치하는 회귀 테스트로 고정했습니다. 기존
+`optimizer="adam"`(기본값, `weight_decay=0.0`) 4개 E2E 앵커 수치는 변경
+없이 그대로입니다.
+
+gradient clipping, loss function 선택, `"plateau"` 외 scheduler, Adam
+betas/eps, SGD dampening/nesterov, GPU/device 노출, mixed precision은
+이번 Phase에서도 지원하지 않습니다.
+
+설계 배경과 상세 계약은 `docs/phase4l_optimizer_regularization_design.md`를
+참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
   직렬화)
 * `ResidualBlock` (Phase 2)
 * `Branch` Add / channel `Concat` + `Identity` skip path (Phase 3)
-* Classification 학습, loss=CrossEntropyLoss 고정, optimizer는 Adam/SGD
-  선택 가능 (Phase 4E)
+* Classification 학습, loss=CrossEntropyLoss 고정, optimizer는 Adam/SGD/
+  AdamW 선택 가능, weight decay(L2 정규화) 공통 적용 (Phase 4E, Phase 4L)
 * LR scheduler `ReduceLROnPlateau` 선택, early stopping patience 지정,
   `TrainingHistory.stopped_early` 기록 (Phase 4E)
 * Synthetic train/validation 데이터셋 (Phase 4A/4B, 오프라인)
@@ -853,6 +894,9 @@ CUDA 동기화) 도중에는 Python 레벨 SIGINT handler 실행 자체가 그 �
 * `scripts/train_imagefolder.py`의 Ctrl+C(SIGINT) graceful cooperative
   stop -- 첫 번째 Ctrl+C는 다음 epoch 경계에서 안전하게 중단(exit 0),
   두 번째 Ctrl+C는 즉시 강제 종료(exit 130) (Phase 4K)
+* `--weight-decay`(상한 없이 0 이상, 기본값 0.0)와 `--optimizer adamw`,
+  Phase 4L 이전 checkpoint에 대한 `weight_decay` 전용 하위 호환 resume
+  규칙 (Phase 4L)
 * TorchScript 배포, C++(LibTorch) CPU/CUDA 추론
 * Python/C++ parity 검증 (Phase 0~4E 배포 경로; Phase 4F는 export/parity
   코드를 변경하지 않았고, 기존 parity E2E를 재실행해 회귀 없음을 확인함
@@ -871,12 +915,15 @@ CUDA 동기화) 도중에는 Python 레벨 SIGINT handler 실행 자체가 그 �
   각각 별도 함수로 연결되어 있고, 둘을 묶는 공통 factory/registry는
   아직 없음), Oxford-IIIT Pet 등 다른 dataset의 실제 연동
 * class imbalance 처리, weighted sampler
-* loss function 선택 (CrossEntropyLoss 고정), Adam betas/weight decay,
+* loss function 선택 (CrossEntropyLoss 고정), Adam betas/eps,
   SGD dampening/nesterov, `"plateau"` 외 LR scheduler(StepLR/
-  CosineAnnealingLR 등), scheduler threshold/cooldown/min_lr
+  CosineAnnealingLR 등), scheduler threshold/cooldown/min_lr,
+  gradient clipping
 * resume 시 config 자유 변경 (optimizer/learning_rate/momentum/
-  lr_scheduler/lr_scheduler_factor/lr_scheduler_patience/batch_size는
-  checkpoint와 반드시 일치해야 함), CUDA RNG state 저장(학습이 CPU
+  weight_decay/lr_scheduler/lr_scheduler_factor/lr_scheduler_patience/
+  batch_size는 checkpoint와 반드시 일치해야 함 -- weight_decay만 Phase 4L
+  이전 checkpoint에 한해 누락 시 0.0으로 간주하는 좁은 예외가 있음), CUDA
+  RNG state 저장(학습이 CPU
   전용으로 고정되어 있어 검증 불가), batch-level(worker/sampler
   iterator) resume, distributed checkpoint
 * 기존 `--checkpoint-out` 경로를 명시적으로 덮어쓰도록 강제하는 옵션

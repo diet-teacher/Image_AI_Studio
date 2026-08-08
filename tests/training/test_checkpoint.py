@@ -443,6 +443,7 @@ def test_require_compatible_resume_config_allows_epochs_and_early_stopping_to_di
         {"optimizer": "sgd"},
         {"learning_rate": 1e-4},
         {"momentum": 0.5},
+        {"weight_decay": 0.3},
         {"batch_size": 4},
         {"lr_scheduler": "plateau"},
     ],

@@ -70,6 +70,12 @@ def test_rejects_unknown_optimizer() -> None:
         TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, optimizer="rmsprop")
 
 
+def test_accepts_adamw_optimizer() -> None:
+    """Phase 4L: AdamW 추가."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, optimizer="adamw")
+    assert config.optimizer == "adamw"
+
+
 # -- Phase 4E: momentum (optimizer와 무관하게 항상 검증) ----------------------
 
 
@@ -94,6 +100,47 @@ def test_momentum_is_validated_even_when_optimizer_is_adam() -> None:
     동일하게 적용된다 -- TrainingConfig가 항상 일관된 값을 갖도록 함."""
     with pytest.raises(TrainingConfigError, match="momentum"):
         TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, optimizer="adam", momentum=2.0)
+
+
+# -- Phase 4L: weight_decay (optimizer와 무관하게 항상 검증, 상한 없음) -------
+
+
+def test_weight_decay_defaults_to_zero() -> None:
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3)
+    assert config.weight_decay == 0.0
+
+
+def test_accepts_zero_weight_decay() -> None:
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, weight_decay=0.0)
+    assert config.weight_decay == 0.0
+
+
+@pytest.mark.parametrize("weight_decay", [1e-4, 0.5, 1.0, 5.0])
+def test_accepts_positive_weight_decay_with_no_upper_bound(weight_decay: float) -> None:
+    """임의의 상한을 두지 않는다 -- 1.0 이상의 값도 허용해야 한다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, weight_decay=weight_decay)
+    assert config.weight_decay == weight_decay
+
+
+def test_rejects_negative_weight_decay() -> None:
+    with pytest.raises(TrainingConfigError, match="weight_decay"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, weight_decay=-0.1)
+
+
+@pytest.mark.parametrize("weight_decay", [float("nan"), float("inf"), float("-inf")])
+def test_rejects_non_finite_weight_decay(weight_decay: float) -> None:
+    with pytest.raises(TrainingConfigError, match="weight_decay"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, weight_decay=weight_decay)
+
+
+def test_rejects_bool_weight_decay() -> None:
+    with pytest.raises(TrainingConfigError, match="weight_decay"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, weight_decay=True)  # type: ignore[arg-type]
+
+
+def test_weight_decay_is_validated_even_when_optimizer_is_adam() -> None:
+    with pytest.raises(TrainingConfigError, match="weight_decay"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, optimizer="adam", weight_decay=-1.0)
 
 
 # -- Phase 4E: lr_scheduler ---------------------------------------------------
@@ -154,3 +201,42 @@ def test_require_compatible_resume_config_rejects_non_dict_checkpoint_config() -
     아니라 명확한 ValueError를 내야 한다."""
     with pytest.raises(ValueError, match="training_config must be a dict"):
         require_compatible_resume_config(None, TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3))
+
+
+def _base_checkpoint_config_without_weight_decay() -> dict:
+    """Phase 4L 이전에 저장된 checkpoint의 training_config를 흉내낸다 --
+    weight_decay 키가 아예 없다."""
+    return {
+        "optimizer": "adam",
+        "learning_rate": 1e-3,
+        "momentum": 0.9,
+        "lr_scheduler": None,
+        "lr_scheduler_factor": 0.1,
+        "lr_scheduler_patience": 1,
+        "batch_size": 8,
+    }
+
+
+def test_require_compatible_resume_config_allows_missing_weight_decay_when_resume_config_is_zero() -> None:
+    """Phase 4L: weight_decay 키가 없는 과거 checkpoint는 weight_decay=0.0으로
+    학습된 것으로 간주하므로, 새 config도 0.0이면 resume이 허용되어야 한다."""
+    checkpoint_config = _base_checkpoint_config_without_weight_decay()
+    original = dict(checkpoint_config)
+    resume_config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, weight_decay=0.0)
+
+    require_compatible_resume_config(checkpoint_config, resume_config)
+
+    assert checkpoint_config == original  # checkpoint_config 자체는 mutate되지 않는다
+
+
+def test_require_compatible_resume_config_rejects_missing_weight_decay_when_resume_config_is_nonzero() -> None:
+    """weight_decay 키가 없는 과거 checkpoint(=0.0으로 간주)를 weight_decay>0.0
+    으로 resume하려 하면 값이 실제로 달라지므로 거부해야 한다."""
+    checkpoint_config = _base_checkpoint_config_without_weight_decay()
+    original = dict(checkpoint_config)
+    resume_config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, weight_decay=0.1)
+
+    with pytest.raises(ValueError, match="weight_decay"):
+        require_compatible_resume_config(checkpoint_config, resume_config)
+
+    assert checkpoint_config == original  # checkpoint_config 자체는 mutate되지 않는다

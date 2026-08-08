@@ -81,8 +81,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
 
-    parser.add_argument("--optimizer", choices=["adam", "sgd"], default="adam")
+    parser.add_argument("--optimizer", choices=["adam", "sgd", "adamw"], default="adam")
     parser.add_argument("--momentum", type=float, default=0.9, help="optimizer=sgd일 때만 사용")
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=0.0,
+        help="L2 정규화 계수 (Adam/SGD/AdamW 공통 적용, 기본값 0.0 = 미적용)",
+    )
     parser.add_argument(
         "--lr-scheduler",
         choices=["plateau"],
@@ -221,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:
                 learning_rate=args.learning_rate,
                 optimizer=args.optimizer,
                 momentum=args.momentum,
+                weight_decay=args.weight_decay,
                 lr_scheduler=args.lr_scheduler,
                 lr_scheduler_factor=args.lr_scheduler_factor,
                 lr_scheduler_patience=args.lr_scheduler_patience,

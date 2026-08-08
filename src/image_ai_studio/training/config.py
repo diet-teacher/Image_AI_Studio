@@ -2,12 +2,15 @@
 전용, 선택 registry 없음). Phase 4E부터 optimizer(Adam/SGD)와 LR scheduler
 (없음/ReduceLROnPlateau), early stopping을 이 dataclass에서 선택할 수 있다
 -- 실제 생성은 registry가 아니라 loop.py의 private helper(_build_optimizer/
-_build_scheduler)가 담당한다 (선택지가 2개/1개뿐이라 registry는 과설계)."""
+_build_scheduler)가 담당한다 (선택지가 2개/1개뿐이라 registry는 과설계).
+Phase 4L부터 optimizer에 AdamW가 추가되고, weight_decay(Adam/SGD/AdamW
+공통 적용)를 선택할 수 있다."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
-OPTIMIZER_CHOICES = ("adam", "sgd")
+OPTIMIZER_CHOICES = ("adam", "sgd", "adamw")
 LR_SCHEDULER_CHOICES = ("plateau",)
 
 # Phase 4F: resume 시 checkpoint와 반드시 일치해야 하는 필드.
@@ -25,6 +28,7 @@ RESUME_CONFIG_FIELDS = (
     "optimizer",
     "learning_rate",
     "momentum",
+    "weight_decay",
     "lr_scheduler",
     "lr_scheduler_factor",
     "lr_scheduler_patience",
@@ -62,6 +66,16 @@ def _require_one_of(name: str, value: object, choices: tuple[str, ...]) -> None:
         raise TrainingConfigError(f"'{name}' must be one of {choices}, got {value!r}")
 
 
+def _require_non_negative_finite_float(name: str, value: object) -> None:
+    """0 이상의 유한한 실수만 허용 (weight_decay -- 상한은 두지 않는다,
+    실제 값이 학습에 적절한지는 사용자의 hyperparameter 선택 책임)."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise TrainingConfigError(f"'{name}' must be a number, got {value!r}")
+    value = float(value)
+    if not math.isfinite(value) or value < 0.0:
+        raise TrainingConfigError(f"'{name}' must be a finite number >= 0.0, got {value!r}")
+
+
 @dataclass
 class TrainingConfig:
     """epochs/batch_size/learning_rate는 필수. optimizer/scheduler/early
@@ -72,8 +86,9 @@ class TrainingConfig:
     batch_size: int
     learning_rate: float
 
-    optimizer: str = "adam"  # "adam" | "sgd"
-    momentum: float = 0.9  # optimizer="sgd"일 때만 사용 (Adam이어도 항상 유효 범위 검증)
+    optimizer: str = "adam"  # "adam" | "sgd" | "adamw"
+    momentum: float = 0.9  # optimizer="sgd"일 때만 사용 (Adam/AdamW여도 항상 유효 범위 검증)
+    weight_decay: float = 0.0  # Adam/SGD/AdamW 공통 적용 (Phase 4L)
 
     lr_scheduler: str | None = None  # None | "plateau"
     lr_scheduler_factor: float = 0.1  # lr_scheduler="plateau"일 때만 사용
@@ -92,6 +107,8 @@ class TrainingConfig:
         # (GUI에서 momentum을 먼저 조절하고 optimizer를 나중에 바꾸는 순서도
         # 자연스럽게 허용됨).
         _require_fraction("momentum", self.momentum, low_inclusive=True)
+        # optimizer와 무관하게 항상 검증 (momentum과 같은 이유).
+        _require_non_negative_finite_float("weight_decay", self.weight_decay)
 
         if self.lr_scheduler is not None:
             _require_one_of("lr_scheduler", self.lr_scheduler, LR_SCHEDULER_CHOICES)
@@ -125,18 +142,28 @@ def require_compatible_resume_config(checkpoint_config: dict, resume_config: Tra
     가장 먼저 검사한다 -- 그러지 않으면 아래 `in checkpoint_config`에서
     TypeError가 나서, 이 함수가 항상 명확한 ValueError만 낸다는 계약이
     깨진다.
+
+    weight_decay는 예외: Phase 4L 이전에 저장된 checkpoint에는 이 키가
+    없을 수 있으므로, 그런 경우에는 checkpoint가 weight_decay=0.0으로
+    학습된 것으로 간주한다 (checkpoint_config 자체는 mutate하지 않는다).
+    다른 필드가 누락된 경우는 기존과 동일하게 항상 거부한다 -- 이 예외를
+    다른 필드로 일반화하지 말 것.
     """
     if not isinstance(checkpoint_config, dict):
         raise ValueError(
             f"checkpoint training_config must be a dict, got {type(checkpoint_config).__name__}"
         )
 
-    missing = [name for name in RESUME_CONFIG_FIELDS if name not in checkpoint_config]
+    strictly_required_fields = [name for name in RESUME_CONFIG_FIELDS if name != "weight_decay"]
+    missing = [name for name in strictly_required_fields if name not in checkpoint_config]
     if missing:
         raise ValueError(f"checkpoint training_config is missing required field(s): {missing}")
 
     for field_name in RESUME_CONFIG_FIELDS:
-        saved_value = checkpoint_config[field_name]
+        if field_name == "weight_decay" and field_name not in checkpoint_config:
+            saved_value = 0.0
+        else:
+            saved_value = checkpoint_config[field_name]
         new_value = getattr(resume_config, field_name)
         if saved_value != new_value:
             raise ValueError(

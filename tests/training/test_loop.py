@@ -261,6 +261,41 @@ def test_build_optimizer_sgd_config_returns_sgd_with_matching_momentum() -> None
     assert optimizer.param_groups[0]["momentum"] == 0.77
 
 
+def test_build_optimizer_adamw_config_returns_adamw() -> None:
+    """Phase 4L: optimizer="adamw"는 torch.optim.AdamW 인스턴스를 반환해야 한다."""
+    model = build_model(_mlp_classifier_spec())
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=2e-3, optimizer="adamw")
+
+    optimizer = _build_optimizer(model, config)
+
+    assert isinstance(optimizer, torch.optim.AdamW)
+    assert optimizer.param_groups[0]["lr"] == 2e-3
+
+
+@pytest.mark.parametrize("optimizer_name", ["adam", "sgd", "adamw"])
+def test_build_optimizer_passes_weight_decay_to_param_groups(optimizer_name: str) -> None:
+    """Phase 4L: weight_decay는 Adam/SGD/AdamW 세 optimizer 모두에 동일하게 전달된다."""
+    model = build_model(_mlp_classifier_spec())
+    config = TrainingConfig(
+        epochs=1, batch_size=8, learning_rate=1e-3, optimizer=optimizer_name, weight_decay=0.37
+    )
+
+    optimizer = _build_optimizer(model, config)
+
+    assert optimizer.param_groups[0]["weight_decay"] == 0.37
+
+
+def test_build_optimizer_default_weight_decay_is_zero_in_param_groups() -> None:
+    """weight_decay를 지정하지 않으면(기본값 0.0) 기존 동작과 동일하게
+    param_groups에도 0.0이 반영되어야 한다."""
+    model = build_model(_mlp_classifier_spec())
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3)
+
+    optimizer = _build_optimizer(model, config)
+
+    assert optimizer.param_groups[0]["weight_decay"] == 0.0
+
+
 def test_build_scheduler_returns_none_when_not_configured() -> None:
     model = build_model(_mlp_classifier_spec())
     config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3)
@@ -824,6 +859,82 @@ def test_run_training_resume_matches_continuous_run_exactly() -> None:
     # "새 프로세스"를 흉내: 새 model/DataLoader/generator를 만들고 저장된 상태를 복원
     model_b2 = build_model(spec)
     model_b2.load_state_dict(model_b.state_dict())  # 3 epoch 완료 시점의 "현재" model
+    train_dataset2, val_dataset2 = make_train_val_datasets(
+        spec.input_shape, NUM_CLASSES, seed=seed, train_size=32, val_size=16
+    )
+    restored_generator = torch.Generator()
+    restored_generator.set_state(loader_generator_state)
+    train_loader_b2 = DataLoader(
+        train_dataset2, batch_size=8, shuffle=True, generator=restored_generator, drop_last=True
+    )
+    val_loader_b2 = DataLoader(val_dataset2, batch_size=8, shuffle=False)
+    torch.set_rng_state(cpu_rng_state)
+
+    result_b2 = run_training(
+        model_b2, train_loader_b2, val_loader_b2, TrainingConfig(epochs=2, **config_kwargs),
+        resume_state=resume_state,
+    )
+
+    assert result_b2.history.train_losses == result_a.history.train_losses
+    assert result_b2.history.val_losses == result_a.history.val_losses
+    assert result_b2.history.val_accuracies == result_a.history.val_accuracies
+    assert result_b2.history.best_epoch == result_a.history.best_epoch
+    assert result_b2.history.best_val_loss == result_a.history.best_val_loss
+    assert result_b2.epochs_without_improvement == result_a.epochs_without_improvement
+
+    for name, tensor in model_a.state_dict().items():
+        assert torch.equal(tensor, model_b2.state_dict()[name])
+    for name, tensor in result_a.best_state_dict.items():
+        assert torch.equal(tensor, result_b2.best_state_dict[name])
+
+    _assert_deep_equal(result_a.optimizer_state_dict, result_b2.optimizer_state_dict)
+    _assert_deep_equal(result_a.scheduler_state_dict, result_b2.scheduler_state_dict)
+
+
+def test_run_training_resume_matches_continuous_run_exactly_with_adamw_weight_decay() -> None:
+    """Phase 4L: optimizer="adamw" + weight_decay>0 조합에서도 exact-resume
+    계약(test_run_training_resume_matches_continuous_run_exactly와 동일한
+    근거)이 깨지지 않아야 한다."""
+    seed = 20260801
+    spec = _dropout_mlp_classifier_spec()
+
+    def make_loaders() -> tuple[DataLoader, DataLoader, torch.Generator]:
+        train_dataset, val_dataset = make_train_val_datasets(
+            spec.input_shape, NUM_CLASSES, seed=seed, train_size=32, val_size=16
+        )
+        generator = torch.Generator().manual_seed(seed)
+        train_loader = DataLoader(
+            train_dataset, batch_size=8, shuffle=True, generator=generator, drop_last=True
+        )
+        val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
+        return train_loader, val_loader, generator
+
+    config_kwargs = dict(
+        batch_size=8, learning_rate=1e-2, optimizer="adamw", weight_decay=0.05,
+        lr_scheduler="plateau", lr_scheduler_factor=0.5, lr_scheduler_patience=1,
+    )
+
+    # (a) 연속 5 epoch
+    torch.manual_seed(seed)
+    model_a = build_model(spec)
+    train_loader_a, val_loader_a, _ = make_loaders()
+    torch.manual_seed(seed)
+    result_a = run_training(model_a, train_loader_a, val_loader_a, TrainingConfig(epochs=5, **config_kwargs))
+
+    # (b) 3 epoch 실행
+    torch.manual_seed(seed)
+    model_b = build_model(spec)
+    train_loader_b, val_loader_b, generator_b = make_loaders()
+    torch.manual_seed(seed)
+    first_config = TrainingConfig(epochs=3, **config_kwargs)
+    result_b1 = run_training(model_b, train_loader_b, val_loader_b, first_config)
+
+    loader_generator_state = generator_b.get_state().clone()
+    cpu_rng_state = torch.get_rng_state().clone()
+    resume_state = _make_resume_state(result_b1, first_config)
+
+    model_b2 = build_model(spec)
+    model_b2.load_state_dict(model_b.state_dict())
     train_dataset2, val_dataset2 = make_train_val_datasets(
         spec.input_shape, NUM_CLASSES, seed=seed, train_size=32, val_size=16
     )
