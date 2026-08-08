@@ -4,7 +4,9 @@
 -- 실제 생성은 registry가 아니라 loop.py의 private helper(_build_optimizer/
 _build_scheduler)가 담당한다 (선택지가 2개/1개뿐이라 registry는 과설계).
 Phase 4L부터 optimizer에 AdamW가 추가되고, weight_decay(Adam/SGD/AdamW
-공통 적용)를 선택할 수 있다."""
+공통 적용)를 선택할 수 있다. Phase 4M부터 gradient norm clipping
+(gradient_clip_norm)을 선택할 수 있다 -- optimizer의 param_groups와
+무관한 순수 runtime 파라미터라 RESUME_CONFIG_FIELDS에 포함되지 않는다."""
 from __future__ import annotations
 
 import math
@@ -90,6 +92,19 @@ def _require_non_negative_finite_float(name: str, value: object) -> None:
         raise TrainingConfigError(f"'{name}' must be a finite number >= 0.0, got {value!r}")
 
 
+def _require_positive_finite_float(name: str, value: object) -> None:
+    """0보다 큰 유한한 실수만 허용 (gradient_clip_norm -- 상한은 두지
+    않는다). _require_positive_float()와 달리 math.isfinite()로 NaN/+inf도
+    명시적으로 거부한다 -- NaN <= 0.0과 inf <= 0.0이 파이썬에서 둘 다
+    False라서, `float(value) <= 0.0`만 검사하는 _require_positive_float()는
+    이 두 값을 조용히 통과시킨다(이 helper가 그 함수를 대체하지 않는 이유)."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise TrainingConfigError(f"'{name}' must be a number, got {value!r}")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise TrainingConfigError(f"'{name}' must be a finite positive number, got {value!r}")
+
+
 @dataclass
 class TrainingConfig:
     """epochs/batch_size/learning_rate는 필수. optimizer/scheduler/early
@@ -103,6 +118,8 @@ class TrainingConfig:
     optimizer: str = "adam"  # "adam" | "sgd" | "adamw"
     momentum: float = 0.9  # optimizer="sgd"일 때만 사용 (Adam/AdamW여도 항상 유효 범위 검증)
     weight_decay: float = 0.0  # Adam/SGD/AdamW 공통 적용 (Phase 4L)
+
+    gradient_clip_norm: float | None = None  # None => clipping 비활성화 (Phase 4M)
 
     lr_scheduler: str | None = None  # None | "plateau"
     lr_scheduler_factor: float = 0.1  # lr_scheduler="plateau"일 때만 사용
@@ -123,6 +140,9 @@ class TrainingConfig:
         _require_fraction("momentum", self.momentum, low_inclusive=True)
         # optimizer와 무관하게 항상 검증 (momentum과 같은 이유).
         _require_non_negative_finite_float("weight_decay", self.weight_decay)
+
+        if self.gradient_clip_norm is not None:
+            _require_positive_finite_float("gradient_clip_norm", self.gradient_clip_norm)
 
         if self.lr_scheduler is not None:
             _require_one_of("lr_scheduler", self.lr_scheduler, LR_SCHEDULER_CHOICES)

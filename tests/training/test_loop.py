@@ -436,7 +436,7 @@ def test_run_training_early_stopping_preserves_best_epoch_parameters(
 
     call_count = {"value": 0}
 
-    def fake_train_one_epoch(model, loader, optimizer, device="cpu"):
+    def fake_train_one_epoch(model, loader, optimizer, device="cpu", gradient_clip_norm=None):
         call_count["value"] += 1
         epoch_value = float(call_count["value"])
         for param in model.parameters():
@@ -967,6 +967,193 @@ def test_run_training_resume_matches_continuous_run_exactly_with_adamw_weight_de
     _assert_deep_equal(result_a.scheduler_state_dict, result_b2.scheduler_state_dict)
 
 
+# -- Phase 4M: gradient_clip_norm ----------------------------------------------
+
+
+def _total_grad_norm(model: torch.nn.Module) -> float:
+    """optimizer.step() 이후에도 .grad는 다음 zero_grad() 전까지 그대로
+    남아있으므로, train_one_epoch()가 반환된 직후(loader에 batch가 정확히
+    1개뿐이라 그게 곧 "마지막으로 step() 직전에 쓰인 gradient") 이 값을 읽으면
+    실제로 clipping이 적용됐는지 production API를 바꾸지 않고도 직접 검증할
+    수 있다."""
+    total_sq = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            total_sq += p.grad.detach().float().norm(2).item() ** 2
+    return total_sq**0.5
+
+
+def _single_batch_loader(spec: ModelSpec, batch_size: int = 8, scale: float = 1.0) -> DataLoader:
+    """batch가 정확히 1개인 DataLoader -- scale을 키우면 backward() 직후의
+    gradient가 커지도록 만들어, clipping이 실제로 norm을 줄이는지(대조군
+    없이는 "원래도 작아서 우연히 통과"와 구분되지 않으므로) 검증할 수 있다."""
+    torch.manual_seed(0)
+    images = torch.randn(batch_size, *spec.input_shape) * scale
+    labels = torch.randint(0, NUM_CLASSES, (batch_size,))
+    dataset = TensorDataset(images, labels)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+
+def test_train_one_epoch_clips_gradient_norm_to_max_norm() -> None:
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    loader = _single_batch_loader(spec, scale=1000.0)
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+
+    train_one_epoch(model, loader, optimizer, gradient_clip_norm=1e-3)
+
+    assert _total_grad_norm(model) <= 1e-3 + 1e-6  # 부동소수 오차만 허용
+
+
+def test_train_one_epoch_without_clipping_leaves_gradient_norm_unbounded() -> None:
+    """위 테스트와 동일한 입력(scale=1000.0)을 clipping 없이 실행하면
+    gradient norm이 max_norm(1e-3)보다 훨씬 커야 한다 -- 대조군 없이는
+    위 테스트가 "원래도 norm이 작아서 우연히 통과"인지 구분할 수 없다."""
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    loader = _single_batch_loader(spec, scale=1000.0)
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+
+    train_one_epoch(model, loader, optimizer, gradient_clip_norm=None)
+
+    assert _total_grad_norm(model) > 1e-3
+
+
+def test_train_one_epoch_default_gradient_clip_norm_matches_explicit_none() -> None:
+    """gradient_clip_norm 생략(기본값)과 명시적 None이 완전히 동일한 결과를
+    내야 한다 -- clipping 비활성화 시 기존 계산 경로가 그대로 사용된다는
+    회귀 계약."""
+    spec = _mlp_classifier_spec()
+
+    torch.manual_seed(0)
+    model_a = build_model(spec)
+    loader_a = _single_batch_loader(spec, scale=1.0)
+    optimizer_a = torch.optim.SGD(model_a.parameters(), lr=1e-2)
+    loss_a = train_one_epoch(model_a, loader_a, optimizer_a)  # 인자 생략
+
+    torch.manual_seed(0)
+    model_b = build_model(spec)
+    loader_b = _single_batch_loader(spec, scale=1.0)
+    optimizer_b = torch.optim.SGD(model_b.parameters(), lr=1e-2)
+    loss_b = train_one_epoch(model_b, loader_b, optimizer_b, gradient_clip_norm=None)  # 명시적 None
+
+    assert loss_a == loss_b
+    for name, tensor in model_a.state_dict().items():
+        assert torch.equal(tensor, model_b.state_dict()[name])
+
+
+def test_run_training_applies_new_gradient_clip_norm_after_resume(monkeypatch: pytest.MonkeyPatch) -> None:
+    """resume 시 gradient_clip_norm을 바꾸면(여기서는 None -> 0.5), 실제로
+    resume된 구간에서 새 값이 clip_grad_norm_()에 전달되는지 확인한다 --
+    require_compatible_resume_config()가 이 값을 비교 대상으로 삼지
+    않는다는 것만으로는 "새 값이 실제로 적용된다"는 것까지는 증명하지
+    못하므로, torch.nn.utils.clip_grad_norm_ 호출을 spy로 감싸 실제
+    max_norm 인자를 기록한다."""
+    calls: list[float | None] = []
+    real_clip_grad_norm_ = torch.nn.utils.clip_grad_norm_
+
+    def spy_clip_grad_norm_(parameters, max_norm, **kwargs):
+        calls.append(max_norm)
+        return real_clip_grad_norm_(parameters, max_norm, **kwargs)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", spy_clip_grad_norm_)
+
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    first_config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2, gradient_clip_norm=None)
+    first = run_training(model, train_loader, val_loader, first_config)
+
+    assert calls == []  # gradient_clip_norm=None이면 clip 호출 자체가 없다
+
+    second_config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2, gradient_clip_norm=0.5)
+    run_training(
+        model, train_loader, val_loader, second_config,
+        resume_state=_make_resume_state(first, first_config),
+    )
+
+    assert calls  # resume 구간에서는 clip이 호출됐다
+    assert all(call == 0.5 for call in calls)  # 그것도 새 config의 값으로
+
+
+def test_run_training_resume_matches_continuous_run_exactly_with_gradient_clip_norm() -> None:
+    """Phase 4M: gradient_clip_norm != None에서도 exact-resume 계약이
+    깨지지 않아야 한다(clip_grad_norm_()는 RNG를 소비하지 않는 결정론적
+    연산이므로 tensor-level exact equality를 기대한다)."""
+    seed = 20260801
+    spec = _dropout_mlp_classifier_spec()
+
+    def make_loaders() -> tuple[DataLoader, DataLoader, torch.Generator]:
+        train_dataset, val_dataset = make_train_val_datasets(
+            spec.input_shape, NUM_CLASSES, seed=seed, train_size=32, val_size=16
+        )
+        generator = torch.Generator().manual_seed(seed)
+        train_loader = DataLoader(
+            train_dataset, batch_size=8, shuffle=True, generator=generator, drop_last=True
+        )
+        val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
+        return train_loader, val_loader, generator
+
+    config_kwargs = dict(
+        batch_size=8, learning_rate=1e-2, optimizer="sgd", momentum=0.9, gradient_clip_norm=0.5,
+        lr_scheduler="plateau", lr_scheduler_factor=0.5, lr_scheduler_patience=1,
+    )
+
+    # (a) 연속 5 epoch
+    torch.manual_seed(seed)
+    model_a = build_model(spec)
+    train_loader_a, val_loader_a, _ = make_loaders()
+    torch.manual_seed(seed)
+    result_a = run_training(model_a, train_loader_a, val_loader_a, TrainingConfig(epochs=5, **config_kwargs))
+
+    # (b) 3 epoch 실행
+    torch.manual_seed(seed)
+    model_b = build_model(spec)
+    train_loader_b, val_loader_b, generator_b = make_loaders()
+    torch.manual_seed(seed)
+    first_config = TrainingConfig(epochs=3, **config_kwargs)
+    result_b1 = run_training(model_b, train_loader_b, val_loader_b, first_config)
+
+    loader_generator_state = generator_b.get_state().clone()
+    cpu_rng_state = torch.get_rng_state().clone()
+    resume_state = _make_resume_state(result_b1, first_config)
+
+    model_b2 = build_model(spec)
+    model_b2.load_state_dict(model_b.state_dict())
+    train_dataset2, val_dataset2 = make_train_val_datasets(
+        spec.input_shape, NUM_CLASSES, seed=seed, train_size=32, val_size=16
+    )
+    restored_generator = torch.Generator()
+    restored_generator.set_state(loader_generator_state)
+    train_loader_b2 = DataLoader(
+        train_dataset2, batch_size=8, shuffle=True, generator=restored_generator, drop_last=True
+    )
+    val_loader_b2 = DataLoader(val_dataset2, batch_size=8, shuffle=False)
+    torch.set_rng_state(cpu_rng_state)
+
+    result_b2 = run_training(
+        model_b2, train_loader_b2, val_loader_b2, TrainingConfig(epochs=2, **config_kwargs),
+        resume_state=resume_state,
+    )
+
+    assert result_b2.history.train_losses == result_a.history.train_losses
+    assert result_b2.history.val_losses == result_a.history.val_losses
+    assert result_b2.history.val_accuracies == result_a.history.val_accuracies
+    assert result_b2.history.best_epoch == result_a.history.best_epoch
+    assert result_b2.history.best_val_loss == result_a.history.best_val_loss
+    assert result_b2.epochs_without_improvement == result_a.epochs_without_improvement
+
+    for name, tensor in model_a.state_dict().items():
+        assert torch.equal(tensor, model_b2.state_dict()[name])
+    for name, tensor in result_a.best_state_dict.items():
+        assert torch.equal(tensor, result_b2.best_state_dict[name])
+
+    _assert_deep_equal(result_a.optimizer_state_dict, result_b2.optimizer_state_dict)
+    _assert_deep_equal(result_a.scheduler_state_dict, result_b2.scheduler_state_dict)
+
+
 # -- Phase 4J: checkpoint_hook / EpochCheckpointView ---------------------------
 
 
@@ -1156,7 +1343,7 @@ def test_run_training_checkpoint_hook_view_matches_epoch_state(monkeypatch: pyte
 
     call_count = {"value": 0}
 
-    def fake_train_one_epoch(model, loader, optimizer, device="cpu"):
+    def fake_train_one_epoch(model, loader, optimizer, device="cpu", gradient_clip_norm=None):
         call_count["value"] += 1
         epoch_value = float(call_count["value"])
         for param in model.parameters():

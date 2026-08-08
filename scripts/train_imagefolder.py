@@ -90,6 +90,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="L2 정규화 계수 (Adam/SGD/AdamW 공통 적용, 기본값 0.0 = 미적용)",
     )
     parser.add_argument(
+        "--gradient-clip-norm",
+        type=float,
+        default=None,
+        help="gradient L2 norm clipping 최대값. 생략하면 clipping 비활성화.",
+    )
+    parser.add_argument(
         "--lr-scheduler",
         choices=["plateau"],
         default=None,
@@ -228,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
                 optimizer=args.optimizer,
                 momentum=args.momentum,
                 weight_decay=args.weight_decay,
+                gradient_clip_norm=args.gradient_clip_norm,
                 lr_scheduler=args.lr_scheduler,
                 lr_scheduler_factor=args.lr_scheduler_factor,
                 lr_scheduler_patience=args.lr_scheduler_patience,

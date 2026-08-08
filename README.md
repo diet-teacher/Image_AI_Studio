@@ -849,11 +849,58 @@ tensor-level로 정확히 일치하는 회귀 테스트로 고정했습니다. �
 `optimizer="adam"`(기본값, `weight_decay=0.0`) 4개 E2E 앵커 수치는 변경
 없이 그대로입니다.
 
-gradient clipping, loss function 선택, `"plateau"` 외 scheduler, Adam
-betas/eps, SGD dampening/nesterov, GPU/device 노출, mixed precision은
-이번 Phase에서도 지원하지 않습니다.
+loss function 선택, `"plateau"` 외 scheduler, Adam betas/eps, SGD
+dampening/nesterov, GPU/device 노출, mixed precision은 이번 Phase에서도
+지원하지 않습니다(gradient norm clipping은 Phase 4M에서 추가됐습니다 --
+아래 "Phase 4M" 절 참고).
 
 설계 배경과 상세 계약은 `docs/phase4l_optimizer_regularization_design.md`를
+참고하세요.
+
+---
+
+## Phase 4M: Gradient Norm Clipping
+
+`TrainingConfig`에 `gradient_clip_norm`을 추가하고,
+`train_one_epoch()`의 `loss.backward()`와 `optimizer.step()` 사이에
+`torch.nn.utils.clip_grad_norm_()` 기반 L2 gradient norm clipping을
+넣었습니다. 깊거나 learning rate가 큰 모델에서 gradient explosion을
+완화할 수단이 없던 공백을 메웁니다.
+
+* `TrainingConfig.gradient_clip_norm: float | None = None` -- `None`(기본값)
+  이면 clipping이 전혀 일어나지 않아 Phase 4A~4L의 기존 동작을 완전히
+  재현합니다. 설정하면 매 batch, `optimizer.step()` 직전에 L2 norm이
+  이 값을 넘지 않도록 scale down합니다.
+* 검증: `0`/음수/bool/`NaN`/`+inf`/`-inf`는 거부하고, 유한한 양수는
+  **상한 없이** 전부 허용합니다. 기존 `_require_positive_float()`는
+  `NaN`/`+inf`를 실수로 통과시키는 것을 코드로 확인했기 때문에(`NaN <= 0.0`
+  과 `inf <= 0.0`이 파이썬에서 둘 다 `False`), 재사용하지 않고 별도
+  `_require_positive_finite_float()` helper로 검증합니다.
+* `scripts/train_imagefolder.py`에 `--gradient-clip-norm FLOAT`(기본값
+  생략 시 `None`) 플래그를 추가했습니다.
+* **resume 호환성**: `TrainingConfig` 전체가 `asdict()`로 그대로
+  저장되므로 `gradient_clip_norm` 값 자체는 checkpoint의
+  `training_config`에 저장되지만, `RESUME_CONFIG_FIELDS`에
+  **포함되지 않아** resume compatibility 비교 대상은 아닙니다 --
+  optimizer의 `param_groups`에 속하지 않는 순수 runtime 파라미터라
+  `optimizer.load_state_dict()`가 조용히 덮어쓸 위험이 없기 때문입니다.
+  그래서 resume할 때마다 이 값을 자유롭게 바꿀 수 있습니다
+  (`epochs`/`early_stopping_patience`와 동일한 이유). `checkpoint.py`/
+  `imagefolder_workflow.py`는 이번 Phase에서 수정하지 않았고, checkpoint
+  format version도 그대로입니다.
+
+실제로 검증됨: clipping을 켰을 때 실제 gradient의 L2 norm이 지정한
+`max_norm` 이하로 줄어드는 것을 직접 계산해 확인했고(대조군으로 clipping
+없이 실행하면 norm이 훨씬 큼도 함께 확인), `gradient_clip_norm != None`
+조합에서도 continuous run과 resume run이 tensor-level exact equality를
+유지하는 회귀 테스트로 고정했습니다. 기존 4개 E2E 앵커 수치는 변경
+없이 그대로입니다.
+
+gradient value clipping, custom `norm_type`, `error_if_nonfinite` 노출,
+gradient norm history/metric 기록, loss function 선택, 추가 scheduler,
+평가 metric 확장, GPU/device 노출은 이번 Phase에서도 지원하지 않습니다.
+
+설계 배경과 상세 계약은 `docs/phase4m_gradient_clipping_design.md`를
 참고하세요.
 
 ---
@@ -899,6 +946,9 @@ betas/eps, SGD dampening/nesterov, GPU/device 노출, mixed precision은
 * `--weight-decay`(상한 없이 0 이상, 기본값 0.0)와 `--optimizer adamw`,
   Phase 4L 이전 checkpoint에 대한 `weight_decay` 전용 하위 호환 resume
   규칙 (Phase 4L)
+* `--gradient-clip-norm`(L2 norm clipping, 상한 없는 양수, 기본값 없음
+  = 비활성화), resume 시 checkpoint와 무관하게 자유롭게 변경 가능
+  (Phase 4M)
 * TorchScript 배포, C++(LibTorch) CPU/CUDA 추론
 * Python/C++ parity 검증 (Phase 0~4E 배포 경로; Phase 4F는 export/parity
   코드를 변경하지 않았고, 기존 parity E2E를 재실행해 회귀 없음을 확인함
@@ -920,7 +970,9 @@ betas/eps, SGD dampening/nesterov, GPU/device 노출, mixed precision은
 * loss function 선택 (CrossEntropyLoss 고정), Adam betas/eps,
   SGD dampening/nesterov, `"plateau"` 외 LR scheduler(StepLR/
   CosineAnnealingLR 등), scheduler threshold/cooldown/min_lr,
-  gradient clipping
+  gradient value clipping, custom gradient `norm_type`,
+  `error_if_nonfinite` 노출, gradient norm history/metric 기록
+  (L2 norm clipping 자체는 Phase 4M에서 지원 -- 위 "Phase 4M" 절 참고)
 * resume 시 config 자유 변경 (optimizer/learning_rate/momentum/
   weight_decay/lr_scheduler/lr_scheduler_factor/lr_scheduler_patience/
   batch_size는 checkpoint와 반드시 일치해야 함 -- weight_decay만 Phase 4L

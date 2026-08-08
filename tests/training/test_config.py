@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from image_ai_studio.training.config import (
+    RESUME_CONFIG_FIELDS,
     TrainingConfig,
     TrainingConfigError,
     require_compatible_resume_config,
@@ -141,6 +142,91 @@ def test_rejects_bool_weight_decay() -> None:
 def test_weight_decay_is_validated_even_when_optimizer_is_adam() -> None:
     with pytest.raises(TrainingConfigError, match="weight_decay"):
         TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, optimizer="adam", weight_decay=-1.0)
+
+
+# -- Phase 4M: gradient_clip_norm (None=비활성화, 0 초과 유한값만 허용, 상한 없음) --
+
+
+def test_gradient_clip_norm_defaults_to_none() -> None:
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3)
+    assert config.gradient_clip_norm is None
+
+
+def test_accepts_none_gradient_clip_norm() -> None:
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, gradient_clip_norm=None)
+    assert config.gradient_clip_norm is None
+
+
+@pytest.mark.parametrize("gradient_clip_norm", [1e-12, 0.1, 1.0, 5.0, 1000.0])
+def test_accepts_positive_gradient_clip_norm_with_no_upper_bound(gradient_clip_norm: float) -> None:
+    """임의의 상한을 두지 않는다 -- 1.0 이상의 값도 허용해야 한다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, gradient_clip_norm=gradient_clip_norm)
+    assert config.gradient_clip_norm == gradient_clip_norm
+
+
+def test_rejects_zero_gradient_clip_norm() -> None:
+    with pytest.raises(TrainingConfigError, match="gradient_clip_norm"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, gradient_clip_norm=0.0)
+
+
+def test_rejects_negative_gradient_clip_norm() -> None:
+    with pytest.raises(TrainingConfigError, match="gradient_clip_norm"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, gradient_clip_norm=-1.0)
+
+
+def test_rejects_bool_gradient_clip_norm() -> None:
+    with pytest.raises(TrainingConfigError, match="gradient_clip_norm"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, gradient_clip_norm=True)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("gradient_clip_norm", [float("nan"), float("inf"), float("-inf")])
+def test_rejects_non_finite_gradient_clip_norm(gradient_clip_norm: float) -> None:
+    """_require_positive_float()는 NaN/+inf를 조용히 통과시키므로(§5-2
+    설계 문서 참고), gradient_clip_norm은 그 helper를 재사용하지 않고
+    별도의 _require_positive_finite_float()로 검증된다 -- 이 테스트가
+    그 계약을 직접 고정한다."""
+    with pytest.raises(TrainingConfigError, match="gradient_clip_norm"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, gradient_clip_norm=gradient_clip_norm)
+
+
+def test_gradient_clip_norm_is_not_a_resume_config_field() -> None:
+    """gradient_clip_norm은 optimizer의 param_groups에 속하지 않는 순수
+    runtime 파라미터라 optimizer.load_state_dict()가 조용히 덮어쓸 위험이
+    없다 -- weight_decay/momentum/learning_rate와 달리 RESUME_CONFIG_FIELDS
+    에 포함되지 않는다는 public contract를 직접 고정한다(설계 문서 §7)."""
+    assert "gradient_clip_norm" not in RESUME_CONFIG_FIELDS
+
+
+@pytest.mark.parametrize(
+    ("saved_gradient_clip_norm", "resume_gradient_clip_norm"),
+    [(None, 0.5), (1.0, 0.5), (1.0, None)],
+)
+def test_require_compatible_resume_config_allows_gradient_clip_norm_to_differ(
+    saved_gradient_clip_norm: float | None, resume_gradient_clip_norm: float | None
+) -> None:
+    """gradient_clip_norm은 resume 시 자유롭게 바꿀 수 있어야 한다(양방향).
+    실제 checkpoint에는 TrainingConfig 전체가 asdict()로 그대로 저장되므로
+    이 필드도 저장되지만, RESUME_CONFIG_FIELDS에 없으므로 비교 대상이
+    아니다 -- 아래 checkpoint_config에 이 필드를 넣어도(가짜 dict가
+    실제 저장 형태를 흉내낸 것) 값이 다르면 거부될 것이라고 착각하지
+    않도록, 실제로는 무시된 채 통과함을 이 테스트가 고정한다."""
+    checkpoint_config = {
+        "optimizer": "adam",
+        "learning_rate": 1e-3,
+        "momentum": 0.9,
+        "weight_decay": 0.0,
+        "lr_scheduler": None,
+        "lr_scheduler_factor": 0.1,
+        "lr_scheduler_patience": 1,
+        "batch_size": 8,
+        # 참고 목적으로만 저장되고 비교에는 쓰이지 않는다 (RESUME_CONFIG_FIELDS 밖).
+        "gradient_clip_norm": saved_gradient_clip_norm,
+    }
+    resume_config = TrainingConfig(
+        epochs=1, batch_size=8, learning_rate=1e-3, gradient_clip_norm=resume_gradient_clip_norm
+    )
+
+    require_compatible_resume_config(checkpoint_config, resume_config)  # raise 없이 통과해야 함
 
 
 # -- Phase 4E: lr_scheduler ---------------------------------------------------

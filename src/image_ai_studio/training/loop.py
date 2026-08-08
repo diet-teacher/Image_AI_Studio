@@ -49,9 +49,16 @@ def _build_scheduler(
 
 
 def train_one_epoch(
-    model: nn.Module, loader: DataLoader, optimizer: torch.optim.Optimizer, device: str = "cpu"
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: str = "cpu",
+    gradient_clip_norm: float | None = None,
 ) -> float:
-    """1 epoch 학습 (model.train() -> forward -> CrossEntropyLoss -> backward -> step). 반환값: epoch 평균 loss."""
+    """1 epoch 학습 (model.train() -> forward -> CrossEntropyLoss -> backward
+    -> [gradient_clip_norm이 있으면 L2 norm clipping] -> step). 반환값: epoch
+    평균 loss. gradient_clip_norm=None(기본값)이면 clip 호출 자체가 없어
+    Phase 4A~4L의 기존 동작과 완전히 동일하다(Phase 4M)."""
     model.train()
     criterion = nn.CrossEntropyLoss()
     total_loss = 0.0
@@ -65,6 +72,8 @@ def train_one_epoch(
         outputs = model(images)
         loss = criterion(outputs, labels)
         loss.backward()
+        if gradient_clip_norm is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_norm)
         optimizer.step()
 
         total_loss += loss.item() * images.size(0)
@@ -523,7 +532,9 @@ def run_training(
     for epoch in range(completed_epochs + 1, completed_epochs + config.epochs + 1):
         run_epoch = epoch - completed_epochs
 
-        train_loss = train_one_epoch(model, train_loader, optimizer, device=device)
+        train_loss = train_one_epoch(
+            model, train_loader, optimizer, device=device, gradient_clip_norm=config.gradient_clip_norm
+        )
         history.train_losses.append(train_loss)
         val_loss, val_accuracy = evaluate(model, val_loader, device=device)
         history.val_losses.append(val_loss)
