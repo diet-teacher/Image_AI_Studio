@@ -463,6 +463,99 @@ def test_require_compatible_resume_config_rejects_mismatched_fields(
         require_compatible_resume_config(payload["training_config"], mismatched_config)
 
 
+# -- Phase 4L hotfix: weight_decay 누락 legacy checkpoint 파일 회귀 -----------
+#
+# 아래 테스트들은 require_compatible_resume_config()에 가짜 dict를 직접
+# 넘기지 않는다 -- save_training_checkpoint()로 실제 파일을 저장한 뒤 그
+# 파일에서 weight_decay 키를 직접 지워 Phase 4L 이전 형식을 흉내내고,
+# load_training_checkpoint()로 그 파일을 다시 읽는다. 이렇게 해야
+# "load_training_checkpoint()가 require_compatible_resume_config()보다
+# 먼저 실행되며 RESUME_CONFIG_FIELDS 전체 존재를 요구한다"는, 가짜 dict로는
+# 드러나지 않았던 실제 계층 경계(checkpoint file -> load_training_checkpoint
+# -> require_compatible_resume_config)를 검증할 수 있다.
+
+
+def _strip_weight_decay_from_saved_checkpoint(checkpoint_path: Path) -> None:
+    payload = torch.load(checkpoint_path, weights_only=True)
+    del payload["training_config"]["weight_decay"]
+    torch.save(payload, checkpoint_path)
+
+
+def test_load_training_checkpoint_accepts_legacy_file_missing_weight_decay(tmp_path: Path) -> None:
+    """Phase 4L 이전 checkpoint 파일에는 weight_decay 키가 없다 --
+    load_training_checkpoint()는 구조적 검사만 담당하므로 이 파일을 정상
+    로드해야 한다(호환성 판단은 require_compatible_resume_config()의 몫)."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2, weight_decay=0.0)
+    checkpoint_path, _, _ = _run_and_save_checkpoint(tmp_path, config)
+    _strip_weight_decay_from_saved_checkpoint(checkpoint_path)
+
+    payload = load_training_checkpoint(checkpoint_path)  # 실패하면 안 됨
+
+    assert "weight_decay" not in payload["training_config"]
+
+
+def test_legacy_checkpoint_file_resumes_when_current_weight_decay_is_zero(tmp_path: Path) -> None:
+    """weight_decay 키가 없는 실제 checkpoint 파일 + 현재 config
+    weight_decay=0.0 조합은, 실제 파일 경로를 거쳐도 resume 호환성 검사를
+    통과해야 한다(Phase 4L이 원래 약속한 migration 정책)."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2, weight_decay=0.0)
+    checkpoint_path, _, _ = _run_and_save_checkpoint(tmp_path, config)
+    _strip_weight_decay_from_saved_checkpoint(checkpoint_path)
+
+    payload = load_training_checkpoint(checkpoint_path)
+    resume_config = TrainingConfig(epochs=5, batch_size=8, learning_rate=1e-2, weight_decay=0.0)
+
+    require_compatible_resume_config(payload["training_config"], resume_config)  # raise 없이 통과해야 함
+
+
+def test_legacy_checkpoint_file_rejects_resume_when_current_weight_decay_is_nonzero(tmp_path: Path) -> None:
+    """weight_decay 키가 없는 실제 checkpoint 파일 + 현재 config
+    weight_decay>0.0 조합은 값이 실제로 달라지므로 여전히 거부돼야 한다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2, weight_decay=0.0)
+    checkpoint_path, _, _ = _run_and_save_checkpoint(tmp_path, config)
+    _strip_weight_decay_from_saved_checkpoint(checkpoint_path)
+
+    payload = load_training_checkpoint(checkpoint_path)
+    resume_config = TrainingConfig(epochs=5, batch_size=8, learning_rate=1e-2, weight_decay=0.1)
+
+    with pytest.raises(ValueError, match="weight_decay"):
+        require_compatible_resume_config(payload["training_config"], resume_config)
+
+
+def test_checkpoint_file_missing_other_required_field_is_still_rejected_at_load(tmp_path: Path) -> None:
+    """weight_decay 외의 다른 RESUME_CONFIG_FIELDS(예: momentum)가 실제
+    checkpoint 파일에서 누락되면, 여전히 load_training_checkpoint() 단계에서
+    즉시 거부돼야 한다 -- weight_decay 예외를 다른 필드로 일반화하지
+    않았음을 확인한다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+    checkpoint_path, _, _ = _run_and_save_checkpoint(tmp_path, config)
+
+    payload = torch.load(checkpoint_path, weights_only=True)
+    del payload["training_config"]["momentum"]
+    torch.save(payload, checkpoint_path)
+
+    with pytest.raises(ValueError, match=r"missing required field\(s\).*momentum"):
+        load_training_checkpoint(checkpoint_path)
+
+
+def test_checkpoint_file_with_weight_decay_present_still_checks_it_normally(tmp_path: Path) -> None:
+    """Phase 4L 이후 정상 checkpoint(weight_decay 키가 실제로 존재)는 기존과
+    동일하게 저장값과 현재 config를 정확히 비교해야 한다 -- legacy 예외는
+    이 경우 전혀 개입하지 않는다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2, weight_decay=0.25)
+    checkpoint_path, _, _ = _run_and_save_checkpoint(tmp_path, config)
+    payload = load_training_checkpoint(checkpoint_path)
+
+    assert payload["training_config"]["weight_decay"] == 0.25
+
+    mismatched_resume_config = TrainingConfig(epochs=5, batch_size=8, learning_rate=1e-2, weight_decay=0.5)
+    with pytest.raises(ValueError, match="weight_decay"):
+        require_compatible_resume_config(payload["training_config"], mismatched_resume_config)
+
+    matching_resume_config = TrainingConfig(epochs=5, batch_size=8, learning_rate=1e-2, weight_decay=0.25)
+    require_compatible_resume_config(payload["training_config"], matching_resume_config)  # raise 없이 통과해야 함
+
+
 # -- Phase 4J: atomic save -----------------------------------------------------
 
 

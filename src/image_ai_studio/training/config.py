@@ -35,6 +35,20 @@ RESUME_CONFIG_FIELDS = (
     "batch_size",
 )
 
+# Phase 4L: weight_decay는 RESUME_CONFIG_FIELDS에 속하면서도 Phase 4L
+# 이전에 저장된 checkpoint에는 키 자체가 없을 수 있는 유일한 필드다 -- 그런
+# checkpoint는 weight_decay=0.0으로 학습된 것으로 간주한다. 이 dict가 "어떤
+# 필드가 이 예외를 갖는지"와 "누락 시 어떤 값으로 간주하는지"의 단일 출처다
+# -- require_compatible_resume_config()(아래)와 checkpoint.py의
+# load_training_checkpoint() 둘 다 이 하나의 dict를 참조해야 한다. 두 곳이
+# 각자 "weight_decay"를 하드코딩해 서로 다른 예외 목록을 갖게 되면(Phase 4L
+# 최초 구현에서 실제로 발생했던 회귀), checkpoint 파일을 통한 실제 resume
+# 경로에서 이 migration 정책이 조용히 깨질 수 있다. 다른 필드를 여기 추가하지
+# 말 것 -- 이 예외는 weight_decay 하나에만 좁게 적용되도록 의도됐다.
+RESUME_CONFIG_LEGACY_DEFAULTS: dict[str, object] = {
+    "weight_decay": 0.0,
+}
+
 
 class TrainingConfigError(ValueError):
     """TrainingConfig 값이 잘못됐을 때 발생."""
@@ -143,25 +157,27 @@ def require_compatible_resume_config(checkpoint_config: dict, resume_config: Tra
     TypeError가 나서, 이 함수가 항상 명확한 ValueError만 낸다는 계약이
     깨진다.
 
-    weight_decay는 예외: Phase 4L 이전에 저장된 checkpoint에는 이 키가
-    없을 수 있으므로, 그런 경우에는 checkpoint가 weight_decay=0.0으로
-    학습된 것으로 간주한다 (checkpoint_config 자체는 mutate하지 않는다).
-    다른 필드가 누락된 경우는 기존과 동일하게 항상 거부한다 -- 이 예외를
-    다른 필드로 일반화하지 말 것.
+    RESUME_CONFIG_LEGACY_DEFAULTS(위)에 있는 필드(현재 weight_decay만)는
+    예외다: Phase 4L 이전에 저장된 checkpoint에는 이 키가 없을 수 있으므로,
+    그런 경우에는 checkpoint가 해당 기본값으로 학습된 것으로 간주한다
+    (checkpoint_config 자체는 mutate하지 않는다). 다른 필드가 누락된 경우는
+    기존과 동일하게 항상 거부한다 -- 이 예외를 다른 필드로 일반화하지 말 것.
     """
     if not isinstance(checkpoint_config, dict):
         raise ValueError(
             f"checkpoint training_config must be a dict, got {type(checkpoint_config).__name__}"
         )
 
-    strictly_required_fields = [name for name in RESUME_CONFIG_FIELDS if name != "weight_decay"]
+    strictly_required_fields = [
+        name for name in RESUME_CONFIG_FIELDS if name not in RESUME_CONFIG_LEGACY_DEFAULTS
+    ]
     missing = [name for name in strictly_required_fields if name not in checkpoint_config]
     if missing:
         raise ValueError(f"checkpoint training_config is missing required field(s): {missing}")
 
     for field_name in RESUME_CONFIG_FIELDS:
-        if field_name == "weight_decay" and field_name not in checkpoint_config:
-            saved_value = 0.0
+        if field_name in RESUME_CONFIG_LEGACY_DEFAULTS and field_name not in checkpoint_config:
+            saved_value = RESUME_CONFIG_LEGACY_DEFAULTS[field_name]
         else:
             saved_value = checkpoint_config[field_name]
         new_value = getattr(resume_config, field_name)

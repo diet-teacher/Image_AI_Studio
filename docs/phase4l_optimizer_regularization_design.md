@@ -5,8 +5,11 @@
 `AdamW`를 더해, README가 "아직 미지원"으로 명시해 온 정규화 공백
 (weight decay)을 메웠다. Phase 4A~4K가 쌓아 온 `config.py` →
 `loop.py`(`_build_optimizer`) → CLI라는 3계층 구조를 그대로 확장했고,
-`checkpoint.py`/`imagefolder_workflow.py`는 계획대로 무수정으로
-끝났다.
+`imagefolder_workflow.py`는 계획대로 무수정으로 끝났다.
+`training/checkpoint.py`는 애초 계획대로 payload 저장 로직은 무수정이지만,
+`load_training_checkpoint()`의 구조 검사가 §5의 migration 정책과 어긋나
+있던 것이 후속 hotfix 라운드에서 발견/수정됐다(§5-4 참고) -- 이 문서는
+그 수정 이후의 최종 상태를 반영한다.
 
 **전제**: 이 문서는 Phase 4K 완료 후 별도 검토 라운드(다음 Phase 후보
 A~J 비교, weight_decay/optimizer 확장을 Phase 4L로 채택)를 거쳐 확정된
@@ -40,13 +43,13 @@ A~J 비교, weight_decay/optimizer 확장을 Phase 4L로 채택)를 거쳐 확�
 - checkpoint 정책 확장(latest+best 분리, overwrite 등)
 
 `src/image_ai_studio` 아래 **production code**에서는 `training/config.py`와
-`training/loop.py`(`_build_optimizer()`)만 수정했다. `training/checkpoint.py`
-(payload를 `asdict(training_config)`로 그대로 저장하므로 무수정),
-`training/imagefolder_workflow.py`(`training_config`를 불투명하게
-통과시키므로 무수정), `training/history.py`, `model_definition/*`,
+`training/loop.py`(`_build_optimizer()`)를 수정했다. `training/checkpoint.py`
+는 payload 저장(`asdict(training_config)`로 그대로 저장) 자체는 무수정이지만,
+`load_training_checkpoint()`의 구조 검사 로직은 §5-4의 hotfix로 한 곳
+수정됐다. `training/imagefolder_workflow.py`(`training_config`를
+불투명하게 통과시키므로 무수정), `training/history.py`, `model_definition/*`,
 `export/*`, `parity/*`, C++ 코드, `scripts/run_imagefolder_training_e2e.py`
-(기본값만 쓰므로 anchor 불변)는 전부 수정하지 않았다 -- 실제 구현도
-그대로 이 경계를 지켰다(`git diff --stat`으로 확인).
+(기본값만 쓰므로 anchor 불변)는 전부 수정하지 않았다.
 
 ---
 
@@ -290,14 +293,38 @@ checkpoint)는 이 특수 처리가 전혀 개입하지 않고 다른 필드와 
 
 ### 5-3. 이 정책이 안전한 이유
 
-`load_training_checkpoint()`(`checkpoint.py`)는 `_REQUIRED_HISTORY_FIELDS`
-같은 구조적 필수 필드 목록과 별개로, `training_config` dict 자체의
-필드 존재 여부는 검사하지 않는다(순수 dict로 반환) — 따라서 이 정책은
-`checkpoint.py`를 전혀 건드리지 않고 `config.py`의 비교 함수 안에서만
-완결된다. `RESUME_CONFIG_FIELDS`에 새 필드를 추가하는 기존 패턴
-(momentum, lr_scheduler 등)과 달리 `weight_decay`만 "누락 시 기본값
-간주"라는 예외를 갖는다는 점을 이 함수 docstring에 명시해, 향후 또
-다른 필드를 추가할 때 이 예외가 실수로 일반화되지 않도록 한다.
+`RESUME_CONFIG_FIELDS`에 새 필드를 추가하는 기존 패턴(momentum,
+lr_scheduler 등)과 달리 `weight_decay`만 "누락 시 기본값 간주"라는
+예외를 갖는다는 점을 `require_compatible_resume_config()`의 docstring에
+명시해, 향후 또 다른 필드를 추가할 때 이 예외가 실수로 일반화되지
+않도록 한다. 이 예외의 정의(어떤 필드가 예외를 갖는지, 누락 시 어떤
+값으로 간주하는지)는 `config.py`의 `RESUME_CONFIG_LEGACY_DEFAULTS` dict
+하나가 단일 출처다(§5-4).
+
+### 5-4. hotfix: `load_training_checkpoint()`도 이 예외를 알아야 한다
+
+최초 구현 당시 이 절은 "`load_training_checkpoint()`는 `training_config`
+dict 자체의 필드 존재 여부를 검사하지 않으므로 `checkpoint.py`를 전혀
+건드리지 않고 이 정책이 `config.py` 안에서만 완결된다"고 서술했으나,
+이는 **부정확했다**. 실제로는 `load_training_checkpoint()`가 구조
+검사의 일부로 `training_config`에 `RESUME_CONFIG_FIELDS` 전체가
+있는지도 확인하고 있었고, 그 검사는 `weight_decay` 예외를 모른 채
+작성돼 있었다. `_prepare_resume()`(imagefolder_workflow.py)가
+`require_compatible_resume_config()`보다 **먼저**
+`load_training_checkpoint()`를 호출하므로, Phase 4L 이전 checkpoint
+파일은 §5-1의 migration 정책에 도달하기도 전에 `load_training_checkpoint()`
+단계에서 `'training_config' is missing required field(s): ['weight_decay']`
+로 거부되고 있었다 -- 즉 §5-1의 정책이 실제 checkpoint 파일 resume
+경로에서는 동작하지 않았다.
+
+hotfix로 `config.py`에 `RESUME_CONFIG_LEGACY_DEFAULTS: dict[str, object]
+= {"weight_decay": 0.0}`를 단일 출처로 도입하고,
+`require_compatible_resume_config()`와 `load_training_checkpoint()`
+양쪽 모두 이 dict를 참조해 "구조적으로 필수인 필드" 목록에서
+`weight_decay`를 제외하도록 맞췄다. `checkpoint.py`의 `_REQUIRED_HISTORY_FIELDS`
+같은 다른 구조 검사는 이 변경과 무관하며, `weight_decay` 외의
+`RESUME_CONFIG_FIELDS`는 여전히 `load_training_checkpoint()` 단계에서
+누락 시 즉시 거부된다(회귀 테스트로 고정, §8-3).
 
 ---
 
@@ -357,7 +384,9 @@ parser.add_argument(
 ## 8. 테스트 및 검증 결과
 
 기존 전체 테스트 437개에 Phase 4L 신규 테스트 24개를 더해 `pytest -q`
-전체 **461 passed**(신규 실패/skip 없음)를 확인했다.
+전체 **461 passed**(신규 실패/skip 없음)를 확인했다. §5-4의 hotfix
+라운드에서 실제 checkpoint 파일 경로를 거치는 회귀 테스트 6개가
+추가되어 최종적으로 **467 passed**다(§8-6).
 
 ### 8-1. `tests/training/test_config.py`
 
@@ -428,6 +457,28 @@ parser.add_argument(
 PASS**함을 확인했고, TorchScript export/C++(LibTorch) CPU·CUDA parity도
 기존과 동일하게 PASS했다.
 
+### 8-6. hotfix 회귀 검증 (§5-4)
+
+`tests/training/test_checkpoint.py`에 실제 checkpoint 파일을 저장한 뒤
+`weight_decay` 키를 파일에서 직접 지워 Phase 4L 이전 형식을 흉내내고,
+`load_training_checkpoint()`/`require_compatible_resume_config()`를
+실제로 그 파일에 대해 호출하는 테스트 5개를 추가했다(구조 검사 통과,
+`weight_decay=0.0`이면 resume 허용, `weight_decay>0.0`이면 거부, 다른
+필드 누락은 여전히 load 단계에서 거부, `weight_decay`가 존재하는
+정상 checkpoint는 기존과 동일하게 비교됨). `tests/training/
+test_imagefolder_workflow.py`에는 `run_imagefolder_training_workflow()`
+→ `_prepare_resume()` → `load_training_checkpoint()` →
+`require_compatible_resume_config()`로 이어지는 production resume
+경로 전체를 실제로 거치는 integration 테스트 1개를 추가해, 가짜 dict가
+아니라 실제 checkpoint 파일로 §5-1의 정책이 end-to-end로 동작함을
+확인했다. `pytest -q` 전체 **467 passed**(437+24+6). 이 hotfix는 학습
+수치 계산을 전혀 변경하지 않으므로, checkpoint resume을 실제로
+실행하는 `run_resume_training_e2e.py`/`run_imagefolder_training_e2e.py`
+두 개만 재실행해 anchor 불변과 C++ CPU/CUDA parity PASS를 확인했다
+(`run_training_e2e.py`/`run_real_training_e2e.py`는 `load_training_checkpoint()`/
+`save_training_checkpoint()`/`require_compatible_resume_config()`를
+전혀 호출하지 않으므로 재실행 대상에서 제외).
+
 ---
 
 ## 9. 호환성과 위험 요소
@@ -452,15 +503,19 @@ PASS**함을 확인했고, TorchScript export/C++(LibTorch) CPU·CUDA parity도
   자동 포함된다(별도 배선 불필요).
 - **기존 CLI 호출과의 backward compatibility**: `--weight-decay`를
   생략하면 기존 명령어가 완전히 동일하게 동작한다.
-- **검증 경계 (수동 재현 미실시)**: Phase 4L 이전에 실제로 생성된
-  사용자 checkpoint 파일을 이용한 수동 resume 재현은 이번 구현 라운드에서
-  수행하지 않았다. 다만 `weight_decay` 키가 없는 checkpoint config를
-  흉내낸 dict를 이용해 (a) 현재 `weight_decay=0.0`이면 resume 허용,
-  (b) 현재 `weight_decay>0.0`이면 resume 거부, (c) 두 경우 모두
-  `checkpoint_config` dict가 mutate되지 않음을 자동화 테스트로 검증했다
-  (§8-1). 이것은 현재 blocker로 간주하지 않는다 -- 실제 구버전 checkpoint의
-  `training_config` 저장 형식(순수 `asdict()` dict)은 이 테스트가 흉내낸
-  구조와 동일하다.
+- **검증 경계**: §5-4의 hotfix 이전에는 이 마이그레이션 정책을
+  `require_compatible_resume_config()`에 가짜 dict를 직접 전달하는
+  테스트로만 검증했고, 실제 checkpoint 파일을 통한 production resume
+  경로(`load_training_checkpoint()`가 먼저 실행됨)는 검증하지 않았다 --
+  그 결과 실제 파일 경로에서는 정책이 동작하지 않는 회귀가 있었다(§5-4).
+  hotfix 이후에는 실제로 저장된 checkpoint 파일에서 `weight_decay` 키를
+  지워 Phase 4L 이전 형식을 흉내내고, `load_training_checkpoint()`와
+  `run_imagefolder_training_workflow()`의 production resume 경로
+  전체를 실제로 거치는 테스트로 이 계약을 검증했다(§8-6). 실제 사용자가
+  Phase 4L 이전에 저장해 둔 checkpoint 파일 자체로 수동 재현하는
+  절차는 여전히 수행하지 않았지만, `training_config` 저장 형식(순수
+  `asdict()` dict)이 테스트가 흉내낸 구조와 동일하므로 blocker로
+  간주하지 않는다.
 
 ---
 
@@ -483,11 +538,18 @@ PASS**함을 확인했고, TorchScript export/C++(LibTorch) CPU·CUDA parity도
       `test_run_training_resume_matches_continuous_run_exactly_with_adamw_weight_decay`로
       검증 완료
 - [x] `--weight-decay` CLI 플래그가 `TrainingConfig`에 정확히 배선됨 -- CLI wiring 테스트로 검증 완료
-- [x] `checkpoint.py`/`imagefolder_workflow.py` 무수정 확인(git diff로
-      검증) -- `git diff --stat`에 두 파일이 나타나지 않음을 확인
-- [x] 전체 pytest 통과 -- 기존 437개 + 신규 24개 = **461 passed**
-- [x] 4개 기존 E2E anchor 수치 완전 불변 -- 4개 전부 재실행해 PASS,
-      TorchScript/C++ CPU·CUDA parity도 기존과 동일하게 PASS
+- [x] §5의 마이그레이션 규칙이 **실제 checkpoint 파일** save/load 경로와
+      production resume 경로(`load_training_checkpoint()` →
+      `require_compatible_resume_config()`, `run_imagefolder_training_workflow()`
+      경유 포함)에서도 정확히 동작함 -- §5-4 hotfix로 발견된 회귀를
+      수정, §8-6의 실제 파일 기반 테스트 6개로 검증 완료
+- [x] `imagefolder_workflow.py` 무수정, `checkpoint.py`는 §5-4 hotfix
+      범위(구조 검사 1곳)로만 수정됨을 `git diff --stat`으로 확인
+- [x] 전체 pytest 통과 -- 기존 437개 + Phase 4L 신규 24개 + hotfix 신규
+      6개 = **467 passed**
+- [x] 4개 기존 E2E anchor 수치 완전 불변 -- Phase 4L 라운드에서 4개
+      전부, hotfix 라운드에서 checkpoint resume 관련 2개를 재실행해
+      전부 PASS, TorchScript/C++ CPU·CUDA parity도 기존과 동일하게 PASS
 - [x] README "현재 지원 범위"/"아직 미지원" 목록 갱신 -- 반영 완료
 
 ---
@@ -511,8 +573,20 @@ PASS**함을 확인했고, TorchScript export/C++(LibTorch) CPU·CUDA parity도
 9. [x] README 갱신("현재 지원 범위"에 Phase 4L 항목 추가, "아직 미지원"
    목록에서 weight decay 관련 문구 정리).
 
-위 9단계 전부 이 순서 그대로 완료됐다 -- 계획과 실제 구현 순서 사이에
-차이는 없었다.
+위 9단계는 이 순서 그대로 완료됐다. 이후 별도 검토 라운드에서
+`load_training_checkpoint()`가 §5의 마이그레이션 정책과 어긋나 있는
+회귀가 발견되어(§5-4), 다음 hotfix 단계가 추가로 진행됐다:
+
+10. [x] `config.py`: `RESUME_CONFIG_LEGACY_DEFAULTS` 단일 출처 상수 도입,
+    `require_compatible_resume_config()`가 이를 참조하도록 변경.
+11. [x] `checkpoint.py`: `load_training_checkpoint()`의 구조 검사가
+    `RESUME_CONFIG_LEGACY_DEFAULTS`를 참조해 `weight_decay`를 필수
+    필드 목록에서 제외.
+12. [x] `test_checkpoint.py`/`test_imagefolder_workflow.py`: 실제
+    checkpoint 파일 save/load 및 production resume 경로를 거치는
+    회귀 테스트 6개 추가/통과(§8-6).
+13. [x] 전체 pytest 재실행(467 passed) + checkpoint resume을 실제로
+    수행하는 E2E 2개 재실행(anchor 불변 확인).
 
 ---
 

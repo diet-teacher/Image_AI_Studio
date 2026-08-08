@@ -32,6 +32,7 @@ from torch import nn
 
 from image_ai_studio.training.config import (
     RESUME_CONFIG_FIELDS,
+    RESUME_CONFIG_LEGACY_DEFAULTS,
     TrainingConfig,
     require_compatible_resume_config,
 )
@@ -165,6 +166,10 @@ def load_training_checkpoint(path: str | Path, *, map_location: str = "cpu") -> 
     key 누락, history/training_config가 dict가 아니거나 그 안의 필수
     필드 누락, history 길이 불일치, epochs_without_improvement가 음수,
     scheduler 관련 필드 불일치)은 여기서 명확한 ValueError로 거부한다.
+    `training_config`의 "필수 필드"는 `RESUME_CONFIG_LEGACY_DEFAULTS`
+    (config.py)에 있는 필드(현재 weight_decay만)는 제외한다 -- Phase 4L
+    이전 checkpoint에는 그 키가 없을 수 있고, 그 경우의 처리는 이 함수가
+    아니라 require_compatible_resume_config()의 책임이다.
 
     **`history.stopped_early`가 True여도 거부하지 않는다** -- 이 함수의
     책임은 "이 파일이 구조적으로 유효한 checkpoint인가"까지다. 사용자가
@@ -235,7 +240,17 @@ def load_training_checkpoint(path: str | Path, *, map_location: str = "cpu") -> 
     training_config = loaded["training_config"]
     if not isinstance(training_config, dict):
         raise ValueError(f"{path}: 'training_config' must be a dict, got {type(training_config).__name__}")
-    missing_config_fields = [name for name in RESUME_CONFIG_FIELDS if name not in training_config]
+    # RESUME_CONFIG_LEGACY_DEFAULTS(config.py)에 있는 필드(현재 weight_decay만)는
+    # Phase 4L 이전 checkpoint에 키 자체가 없을 수 있으므로 여기서 필수로
+    # 요구하지 않는다 -- require_compatible_resume_config()가 이 dict를
+    # 그대로 참조해 누락 시 기본값으로 간주한다. 이 구조적 검사가
+    # RESUME_CONFIG_FIELDS 전체를 그대로 요구하면, 그 뒤의 migration 정책이
+    # 실제 checkpoint 파일 경로에서는 결코 실행되지 못한다(load 단계에서
+    # 이미 거부되므로).
+    strictly_required_config_fields = [
+        name for name in RESUME_CONFIG_FIELDS if name not in RESUME_CONFIG_LEGACY_DEFAULTS
+    ]
+    missing_config_fields = [name for name in strictly_required_config_fields if name not in training_config]
     if missing_config_fields:
         raise ValueError(f"{path}: 'training_config' is missing required field(s): {missing_config_fields}")
 

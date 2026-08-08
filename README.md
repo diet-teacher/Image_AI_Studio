@@ -836,10 +836,12 @@ optimizer를 `TrainingConfig`/`_build_optimizer()`의 기존 확장 지점
   `weight_decay=0.0`이면 그대로 resume할 수 있고, `weight_decay>0.0`으로
   resume하려 하면 값이 실제로 달라지므로 거부됩니다. 다른 필드가
   누락된 경우는 기존과 동일하게 항상 거부합니다.
-* `src/image_ai_studio/training/checkpoint.py`/`imagefolder_workflow.py`는
-  이번 Phase에서 수정하지 않았습니다 -- `training_config`를 그대로
-  저장/전달하는 기존 구조 덕분에 새 필드가 checkpoint에 자동으로
-  포함됩니다.
+* `src/image_ai_studio/training/imagefolder_workflow.py`는 수정하지
+  않았습니다 -- `training_config`를 그대로 저장/전달하는 기존 구조
+  덕분에 새 필드가 checkpoint에 자동으로 포함됩니다. `checkpoint.py`의
+  `load_training_checkpoint()`는 후속 hotfix에서 구조 검사 한 곳을
+  수정해, 위 resume 호환성 규칙이 실제 checkpoint 파일 경로에서도
+  정확히 적용되도록 했습니다.
 
 실제로 검증됨: `optimizer="adamw"` + `weight_decay>0` 조합에서도 continuous
 run과 resume run이 model parameter/optimizer state/scheduler state 전부

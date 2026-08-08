@@ -324,6 +324,52 @@ def test_resume_matches_continuous_run_exactly(tmp_path: Path) -> None:
     del result_b1  # 배선 확인용으로만 필요, 값 자체는 비교 대상 아님
 
 
+def test_resume_succeeds_from_checkpoint_file_missing_weight_decay(tmp_path: Path) -> None:
+    """Phase 4L hotfix 회귀: Phase 4L 이전 형식(checkpoint 파일의
+    training_config에 weight_decay 키가 없음)을 실제 checkpoint 파일에서
+    흉내내, production resume 경로 전체
+    (run_imagefolder_training_workflow -> _prepare_resume() ->
+    load_training_checkpoint() -> require_compatible_resume_config())를
+    통해 정상적으로 resume되는지 확인한다. 이 회귀는 가짜 dict가 아니라
+    실제 저장된 checkpoint 파일을 수정해야만 재현됐다(load_training_checkpoint()
+    가 require_compatible_resume_config()보다 먼저 실행되기 때문)."""
+    _make_standard_dataset(tmp_path)
+    spec = _spec()
+    model_json_path = _write_model_json(tmp_path, spec)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+
+    run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2, weight_decay=0.0),
+            output_dir=tmp_path / "a",
+            checkpoint_out=checkpoint_path,
+            export_torchscript=False,
+            seed=SEED,
+        )
+    )
+
+    payload = torch.load(checkpoint_path, weights_only=True)
+    del payload["training_config"]["weight_decay"]
+    torch.save(payload, checkpoint_path)
+
+    result = run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2, weight_decay=0.0),
+            output_dir=tmp_path / "b",
+            resume_from=checkpoint_path,
+            checkpoint_out=checkpoint_path,
+            export_torchscript=False,
+            seed=SEED,
+        )
+    )
+
+    assert len(result.history.train_losses) == 2  # 1(fresh) + 1(resume)
+
+
 def test_resume_rejects_dataset_mismatch(tmp_path: Path) -> None:
     saved_root = tmp_path / "saved"
     current_root = tmp_path / "current"
