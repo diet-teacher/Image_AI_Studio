@@ -11,6 +11,7 @@ from dataclasses import asdict
 
 import pytest
 import torch
+from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from image_ai_studio.model_definition.builder import build_model
@@ -22,6 +23,7 @@ from image_ai_studio.training.loop import (
     TrainingHistory,
     TrainingResult,
     TrainingResumeState,
+    _build_criterion,
     _build_optimizer,
     _build_scheduler,
     evaluate,
@@ -436,7 +438,7 @@ def test_run_training_early_stopping_preserves_best_epoch_parameters(
 
     call_count = {"value": 0}
 
-    def fake_train_one_epoch(model, loader, optimizer, device="cpu", gradient_clip_norm=None):
+    def fake_train_one_epoch(model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None):
         call_count["value"] += 1
         epoch_value = float(call_count["value"])
         for param in model.parameters():
@@ -1154,6 +1156,289 @@ def test_run_training_resume_matches_continuous_run_exactly_with_gradient_clip_n
     _assert_deep_equal(result_a.scheduler_state_dict, result_b2.scheduler_state_dict)
 
 
+# -- Phase 4N: label_smoothing --------------------------------------------------
+
+
+def test_build_criterion_default_matches_plain_cross_entropy_loss() -> None:
+    """label_smoothing=0.0(기본값)이면 인자 없는 nn.CrossEntropyLoss()와
+    bitwise 동일해야 한다 -- 기존 동작을 완전히 재현한다는 회귀 계약."""
+    torch.manual_seed(0)
+    logits = torch.randn(4, NUM_CLASSES)
+    targets = torch.randint(0, NUM_CLASSES, (4,))
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3)
+
+    criterion = _build_criterion(config)
+
+    assert isinstance(criterion, nn.CrossEntropyLoss)
+    assert criterion.label_smoothing == 0.0
+    assert torch.equal(criterion(logits, targets), nn.CrossEntropyLoss()(logits, targets))
+
+
+def test_build_criterion_applies_label_smoothing_matching_pytorch_reference() -> None:
+    """하드코딩된 magic number가 아니라 PyTorch reference 구현
+    (nn.CrossEntropyLoss(label_smoothing=0.1))과 직접 비교한다."""
+    torch.manual_seed(0)
+    logits = torch.randn(4, NUM_CLASSES)
+    targets = torch.randint(0, NUM_CLASSES, (4,))
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, label_smoothing=0.1)
+
+    criterion = _build_criterion(config)
+
+    assert criterion.label_smoothing == 0.1
+    reference = nn.CrossEntropyLoss(label_smoothing=0.1)
+    assert torch.equal(criterion(logits, targets), reference(logits, targets))
+
+
+def test_build_criterion_label_smoothing_changes_loss_value() -> None:
+    """smoothing>0이 실제로 unsmoothed CE와 다른 값을 낸다는 대조군 --
+    이게 없으면 위 테스트가 "우연히 같은 값"인지 구분할 수 없다."""
+    torch.manual_seed(0)
+    logits = torch.randn(4, NUM_CLASSES)
+    targets = torch.randint(0, NUM_CLASSES, (4,))
+
+    unsmoothed = _build_criterion(TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3))
+    smoothed = _build_criterion(
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, label_smoothing=0.1)
+    )
+
+    assert not torch.equal(unsmoothed(logits, targets), smoothed(logits, targets))
+
+
+def test_train_one_epoch_default_criterion_matches_plain_cross_entropy() -> None:
+    """criterion 생략(기존 호출 `train_one_epoch(model, loader, optimizer)`)
+    이 명시적으로 unsmoothed CrossEntropyLoss()를 넘긴 것과 완전히 동일한
+    결과를 내야 한다 -- 기존 public 호출의 backward compatibility."""
+    spec = _mlp_classifier_spec()
+
+    torch.manual_seed(0)
+    model_a = build_model(spec)
+    train_loader_a, _ = _make_loaders(spec, seed=0)
+    optimizer_a = torch.optim.SGD(model_a.parameters(), lr=1e-2)
+    loss_a = train_one_epoch(model_a, train_loader_a, optimizer_a)  # criterion 생략
+
+    torch.manual_seed(0)
+    model_b = build_model(spec)
+    train_loader_b, _ = _make_loaders(spec, seed=0)
+    optimizer_b = torch.optim.SGD(model_b.parameters(), lr=1e-2)
+    loss_b = train_one_epoch(
+        model_b, train_loader_b, optimizer_b, criterion=nn.CrossEntropyLoss()
+    )  # 명시적 unsmoothed CE
+
+    assert loss_a == loss_b
+    for name, tensor in model_a.state_dict().items():
+        assert torch.equal(tensor, model_b.state_dict()[name])
+
+
+def test_train_one_epoch_actually_uses_provided_criterion() -> None:
+    """넘긴 criterion이 mock으로 호출 여부만 확인되는 게 아니라, 매 batch
+    실제로 사용됨을 직접 확인한다."""
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, _ = _make_loaders(spec, seed=0)
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+
+    call_count = {"value": 0}
+
+    class RecordingCriterion(nn.Module):
+        def forward(self, outputs: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+            call_count["value"] += 1
+            return nn.functional.cross_entropy(outputs, labels, label_smoothing=0.2)
+
+    train_one_epoch(model, train_loader, optimizer, criterion=RecordingCriterion())
+
+    assert call_count["value"] == len(train_loader)  # 매 batch마다 정확히 한 번씩
+
+
+def test_train_one_epoch_criterion_and_gradient_clip_norm_coexist() -> None:
+    """Phase 4M(gradient_clip_norm)과 Phase 4N(criterion)이 동시에 있어도
+    호출 순서가 깨지지 않고 정상적으로 완료돼야 한다."""
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, _ = _make_loaders(spec, seed=0)
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+
+    loss = train_one_epoch(
+        model, train_loader, optimizer,
+        gradient_clip_norm=1.0, criterion=nn.CrossEntropyLoss(label_smoothing=0.1),
+    )
+
+    assert loss > 0.0
+
+
+def test_run_training_passes_build_criterion_result_to_train_one_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """run_training()이 _build_criterion(config)로 만든 바로 그 criterion
+    객체를 실제로 train_one_epoch()에 전달한다는 연결 계약을 직접 고정한다.
+    다른 테스트들(criterion factory가 올바른 CrossEntropyLoss를 만드는지,
+    train_one_epoch()가 넘겨받은 criterion을 실제로 쓰는지, resume 시
+    새 값으로 다시 만들어지는지)은 각 구간을 따로 검증하지만, 그 사이를
+    잇는 `train_one_epoch(..., criterion=criterion)` 한 줄이 production
+    코드에서 실수로 빠지는 회귀는 어느 것도 직접 잡지 못한다 -- 예를 들어
+    run_training()이 criterion을 만들어 놓고 실제로는 넘기지 않아도(즉
+    train_one_epoch()가 항상 자체 기본 unsmoothed CrossEntropyLoss를
+    쓰게 되어도) 그 테스트들은 각자의 관찰 지점에서는 여전히 통과할 수
+    있다. train_one_epoch() 자체를 monkeypatch해 실제로 전달받은
+    `criterion` keyword 인자를 검사하는 것으로 이 연결을 직접 증명한다."""
+    captured: dict = {}
+
+    def fake_train_one_epoch(model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None):
+        captured["criterion"] = criterion
+        return 0.5
+
+    monkeypatch.setattr("image_ai_studio.training.loop.train_one_epoch", fake_train_one_epoch)
+    monkeypatch.setattr(
+        "image_ai_studio.training.loop.evaluate",
+        lambda model, loader, device="cpu": (0.5, 0.5),
+    )
+
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2, label_smoothing=0.3)
+
+    run_training(model, train_loader, val_loader, config)
+
+    assert captured["criterion"] is not None
+    assert isinstance(captured["criterion"], nn.CrossEntropyLoss)
+    assert captured["criterion"].label_smoothing == 0.3
+
+
+def test_run_training_evaluate_ignores_label_smoothing() -> None:
+    """label_smoothing>0으로 학습해도 run_training()이 history에 기록하는
+    val_loss/val_accuracy는 (수정되지 않은) evaluate()를 그대로 호출한
+    결과와 정확히 일치해야 한다 -- 즉 이 테스트는 "run_training()의
+    validation 경로가 무수정 evaluate()를 그대로 쓴다"는 배선을
+    증명한다. evaluate() 자체가 항상 ordinary(unsmoothed)
+    CrossEntropyLoss를 쓴다는 계약은 evaluate()가 이번 Phase에서 무수정
+    production 코드라는 사실과, 그 계약을 이미 검증하는 기존 evaluate
+    테스트들이 담당한다(이 테스트가 manual reference와 독립적으로
+    "unsmoothed임"을 다시 증명하는 것은 아니다)."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2, label_smoothing=0.5)
+
+    result = run_training(model, train_loader, val_loader, config)
+    expected_val_loss, expected_val_accuracy = evaluate(model, val_loader)
+
+    assert result.history.val_losses[-1] == expected_val_loss
+    assert result.history.val_accuracies[-1] == expected_val_accuracy
+
+
+def test_run_training_uses_new_label_smoothing_after_resume(monkeypatch: pytest.MonkeyPatch) -> None:
+    """resume 시 label_smoothing을 바꾸면(여기서는 0.0 -> 0.1), 실제로
+    resume된 구간에서 새 값으로 만든 criterion이 쓰이는지 확인한다 --
+    require_compatible_resume_config()가 이 값을 비교 대상으로 삼지
+    않는다는 것만으로는 "새 값이 실제로 적용된다"는 것까지는 증명하지
+    못하므로, _build_criterion() 호출을 spy로 감싸 실제로 어떤
+    label_smoothing으로 호출되는지 기록한다."""
+    calls: list[float] = []
+    real_build_criterion = _build_criterion
+
+    def spy_build_criterion(config: TrainingConfig) -> nn.Module:
+        calls.append(config.label_smoothing)
+        return real_build_criterion(config)
+
+    monkeypatch.setattr("image_ai_studio.training.loop._build_criterion", spy_build_criterion)
+
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    first_config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2, label_smoothing=0.0)
+    first = run_training(model, train_loader, val_loader, first_config)
+
+    assert calls == [0.0]
+
+    second_config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2, label_smoothing=0.1)
+    run_training(
+        model, train_loader, val_loader, second_config,
+        resume_state=_make_resume_state(first, first_config),
+    )
+
+    assert calls == [0.0, 0.1]  # resume 구간에서도 새 config의 값으로 criterion이 다시 만들어짐
+
+
+def test_run_training_resume_matches_continuous_run_exactly_with_label_smoothing() -> None:
+    """Phase 4N: label_smoothing != 0에서도 exact-resume 계약이 깨지지
+    않아야 한다(CrossEntropyLoss(label_smoothing=...)는 RNG를 소비하지
+    않는 결정론적 연산이므로 tensor-level exact equality를 기대한다).
+    continuous run과 resume run 양쪽에 동일한 label_smoothing 값을
+    쓴다 -- resume 도중 값을 바꾸는 케이스는 별도 spy 테스트(위)가
+    담당한다."""
+    seed = 20260801
+    spec = _dropout_mlp_classifier_spec()
+
+    def make_loaders() -> tuple[DataLoader, DataLoader, torch.Generator]:
+        train_dataset, val_dataset = make_train_val_datasets(
+            spec.input_shape, NUM_CLASSES, seed=seed, train_size=32, val_size=16
+        )
+        generator = torch.Generator().manual_seed(seed)
+        train_loader = DataLoader(
+            train_dataset, batch_size=8, shuffle=True, generator=generator, drop_last=True
+        )
+        val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
+        return train_loader, val_loader, generator
+
+    config_kwargs = dict(
+        batch_size=8, learning_rate=1e-2, optimizer="sgd", momentum=0.9, label_smoothing=0.3,
+        lr_scheduler="plateau", lr_scheduler_factor=0.5, lr_scheduler_patience=1,
+    )
+
+    # (a) 연속 5 epoch
+    torch.manual_seed(seed)
+    model_a = build_model(spec)
+    train_loader_a, val_loader_a, _ = make_loaders()
+    torch.manual_seed(seed)
+    result_a = run_training(model_a, train_loader_a, val_loader_a, TrainingConfig(epochs=5, **config_kwargs))
+
+    # (b) 3 epoch 실행
+    torch.manual_seed(seed)
+    model_b = build_model(spec)
+    train_loader_b, val_loader_b, generator_b = make_loaders()
+    torch.manual_seed(seed)
+    first_config = TrainingConfig(epochs=3, **config_kwargs)
+    result_b1 = run_training(model_b, train_loader_b, val_loader_b, first_config)
+
+    loader_generator_state = generator_b.get_state().clone()
+    cpu_rng_state = torch.get_rng_state().clone()
+    resume_state = _make_resume_state(result_b1, first_config)
+
+    model_b2 = build_model(spec)
+    model_b2.load_state_dict(model_b.state_dict())
+    train_dataset2, val_dataset2 = make_train_val_datasets(
+        spec.input_shape, NUM_CLASSES, seed=seed, train_size=32, val_size=16
+    )
+    restored_generator = torch.Generator()
+    restored_generator.set_state(loader_generator_state)
+    train_loader_b2 = DataLoader(
+        train_dataset2, batch_size=8, shuffle=True, generator=restored_generator, drop_last=True
+    )
+    val_loader_b2 = DataLoader(val_dataset2, batch_size=8, shuffle=False)
+    torch.set_rng_state(cpu_rng_state)
+
+    result_b2 = run_training(
+        model_b2, train_loader_b2, val_loader_b2, TrainingConfig(epochs=2, **config_kwargs),
+        resume_state=resume_state,
+    )
+
+    assert result_b2.history.train_losses == result_a.history.train_losses
+    assert result_b2.history.val_losses == result_a.history.val_losses
+    assert result_b2.history.val_accuracies == result_a.history.val_accuracies
+    assert result_b2.history.best_epoch == result_a.history.best_epoch
+    assert result_b2.history.best_val_loss == result_a.history.best_val_loss
+    assert result_b2.epochs_without_improvement == result_a.epochs_without_improvement
+
+    for name, tensor in model_a.state_dict().items():
+        assert torch.equal(tensor, model_b2.state_dict()[name])
+    for name, tensor in result_a.best_state_dict.items():
+        assert torch.equal(tensor, result_b2.best_state_dict[name])
+
+    _assert_deep_equal(result_a.optimizer_state_dict, result_b2.optimizer_state_dict)
+    _assert_deep_equal(result_a.scheduler_state_dict, result_b2.scheduler_state_dict)
+
+
 # -- Phase 4J: checkpoint_hook / EpochCheckpointView ---------------------------
 
 
@@ -1343,7 +1628,7 @@ def test_run_training_checkpoint_hook_view_matches_epoch_state(monkeypatch: pyte
 
     call_count = {"value": 0}
 
-    def fake_train_one_epoch(model, loader, optimizer, device="cpu", gradient_clip_norm=None):
+    def fake_train_one_epoch(model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None):
         call_count["value"] += 1
         epoch_value = float(call_count["value"])
         for param in model.parameters():

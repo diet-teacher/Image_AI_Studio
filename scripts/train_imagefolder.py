@@ -96,6 +96,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="gradient L2 norm clipping 최대값. 생략하면 clipping 비활성화.",
     )
     parser.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=0.0,
+        help="label smoothing 계수 (CrossEntropyLoss, [0.0, 1.0], 기본값 0.0 = 미적용, training loss에만 적용)",
+    )
+    parser.add_argument(
         "--lr-scheduler",
         choices=["plateau"],
         default=None,
@@ -235,6 +241,7 @@ def main(argv: list[str] | None = None) -> int:
                 momentum=args.momentum,
                 weight_decay=args.weight_decay,
                 gradient_clip_norm=args.gradient_clip_norm,
+                label_smoothing=args.label_smoothing,
                 lr_scheduler=args.lr_scheduler,
                 lr_scheduler_factor=args.lr_scheduler_factor,
                 lr_scheduler_patience=args.lr_scheduler_patience,

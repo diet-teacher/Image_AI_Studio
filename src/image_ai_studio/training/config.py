@@ -6,7 +6,11 @@ _build_scheduler)가 담당한다 (선택지가 2개/1개뿐이라 registry는 �
 Phase 4L부터 optimizer에 AdamW가 추가되고, weight_decay(Adam/SGD/AdamW
 공통 적용)를 선택할 수 있다. Phase 4M부터 gradient norm clipping
 (gradient_clip_norm)을 선택할 수 있다 -- optimizer의 param_groups와
-무관한 순수 runtime 파라미터라 RESUME_CONFIG_FIELDS에 포함되지 않는다."""
+무관한 순수 runtime 파라미터라 RESUME_CONFIG_FIELDS에 포함되지 않는다.
+Phase 4N부터 label smoothing(label_smoothing)을 선택할 수 있다 --
+training loss에만 적용되고(loop.py의 evaluate()는 항상 unsmoothed
+CrossEntropyLoss를 쓴다), gradient_clip_norm과 동일한 이유로
+RESUME_CONFIG_FIELDS에 포함되지 않는다."""
 from __future__ import annotations
 
 import math
@@ -100,6 +104,14 @@ def _require_non_negative_finite_float(name: str, value: object) -> None:
         raise TrainingConfigError(f"'{name}' must be a finite number >= 0.0, got {value!r}")
 
 
+def _require_closed_unit_interval(name: str, value: object) -> None:
+    """[0.0, 1.0] 양끝 포함 (label_smoothing). 상/하한 비교 자체가 NaN을
+    걸러내므로(NaN과의 모든 비교는 False) math.isfinite()가 따로 필요
+    없다 -- +inf/-inf도 각각 상한/하한 비교에서 자연히 거부된다."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not (0.0 <= float(value) <= 1.0):
+        raise TrainingConfigError(f"'{name}' must be in [0.0, 1.0], got {value!r}")
+
+
 def _require_positive_finite_float(name: str, value: object) -> None:
     """0보다 큰 유한한 실수만 허용 (gradient_clip_norm -- 상한은 두지
     않는다). _require_positive_float()와 달리 math.isfinite()로 NaN/+inf도
@@ -129,6 +141,8 @@ class TrainingConfig:
 
     gradient_clip_norm: float | None = None  # None => clipping 비활성화 (Phase 4M)
 
+    label_smoothing: float = 0.0  # [0.0, 1.0], training loss에만 적용 (Phase 4N)
+
     lr_scheduler: str | None = None  # None | "plateau"
     lr_scheduler_factor: float = 0.1  # lr_scheduler="plateau"일 때만 사용
     lr_scheduler_patience: int = 1  # 〃
@@ -151,6 +165,9 @@ class TrainingConfig:
 
         if self.gradient_clip_norm is not None:
             _require_positive_finite_float("gradient_clip_norm", self.gradient_clip_norm)
+
+        # optimizer/scheduler와 무관하게 항상 검증 (momentum/weight_decay와 같은 이유).
+        _require_closed_unit_interval("label_smoothing", self.label_smoothing)
 
         if self.lr_scheduler is not None:
             _require_one_of("lr_scheduler", self.lr_scheduler, LR_SCHEDULER_CHOICES)

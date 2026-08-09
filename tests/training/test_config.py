@@ -241,6 +241,85 @@ def test_require_compatible_resume_config_allows_gradient_clip_norm_to_differ(
     require_compatible_resume_config(checkpoint_config, resume_config)  # raise 없이 통과해야 함
 
 
+# -- Phase 4N: label_smoothing ([0.0, 1.0] 양끝 포함, resume 시 자유 변경) ----
+
+
+def test_label_smoothing_defaults_to_zero() -> None:
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3)
+    assert config.label_smoothing == 0.0
+
+
+@pytest.mark.parametrize("label_smoothing", [0.0, 0.1, 0.5, 1.0])
+def test_accepts_label_smoothing_in_closed_unit_interval(label_smoothing: float) -> None:
+    """[0.0, 1.0] 양끝 포함 -- 1.0도 PyTorch에서 수치적으로 유효한 값이다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, label_smoothing=label_smoothing)
+    assert config.label_smoothing == label_smoothing
+
+
+def test_rejects_negative_label_smoothing() -> None:
+    with pytest.raises(TrainingConfigError, match="label_smoothing"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, label_smoothing=-0.1)
+
+
+def test_rejects_label_smoothing_greater_than_one() -> None:
+    with pytest.raises(TrainingConfigError, match="label_smoothing"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, label_smoothing=1.1)
+
+
+def test_rejects_bool_label_smoothing() -> None:
+    with pytest.raises(TrainingConfigError, match="label_smoothing"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, label_smoothing=True)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("label_smoothing", [float("nan"), float("inf"), float("-inf")])
+def test_rejects_non_finite_label_smoothing(label_smoothing: float) -> None:
+    """_require_fraction()은 상한이 항상 <1.0(배타적)이라 label_smoothing=1.0을
+    거부하므로 재사용하지 않고 별도의 _require_closed_unit_interval()로
+    검증한다 -- 이 helper의 양끝 경계 비교 자체가 NaN/+inf/-inf를 자연히
+    거부함을 이 테스트가 고정한다."""
+    with pytest.raises(TrainingConfigError, match="label_smoothing"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, label_smoothing=label_smoothing)
+
+
+def test_label_smoothing_is_not_a_resume_config_field() -> None:
+    """label_smoothing은 CrossEntropyLoss 생성자 인자일 뿐 optimizer의
+    param_groups나 어떤 *.load_state_dict()에도 관여하지 않는다(criterion
+    자체가 저장/복원되는 state를 갖지 않음) -- gradient_clip_norm과 동일한
+    이유로 RESUME_CONFIG_FIELDS에 포함되지 않는다는 public contract를
+    직접 고정한다(설계 문서 §7)."""
+    assert "label_smoothing" not in RESUME_CONFIG_FIELDS
+
+
+@pytest.mark.parametrize(
+    ("saved_label_smoothing", "resume_label_smoothing"),
+    [(0.0, 0.1), (0.1, 0.0), (0.2, 0.5)],
+)
+def test_require_compatible_resume_config_allows_label_smoothing_to_differ(
+    saved_label_smoothing: float, resume_label_smoothing: float
+) -> None:
+    """label_smoothing은 resume 시 자유롭게 바꿀 수 있어야 한다(양방향).
+    실제 checkpoint에는 TrainingConfig 전체가 asdict()로 그대로 저장되므로
+    이 필드도 저장은 되지만, RESUME_CONFIG_FIELDS에 없으므로 비교 대상이
+    아니다 -- 저장되지 않는다는 표현은 부정확하므로 쓰지 않는다."""
+    checkpoint_config = {
+        "optimizer": "adam",
+        "learning_rate": 1e-3,
+        "momentum": 0.9,
+        "weight_decay": 0.0,
+        "lr_scheduler": None,
+        "lr_scheduler_factor": 0.1,
+        "lr_scheduler_patience": 1,
+        "batch_size": 8,
+        # 참고 목적으로만 저장되고 비교에는 쓰이지 않는다 (RESUME_CONFIG_FIELDS 밖).
+        "label_smoothing": saved_label_smoothing,
+    }
+    resume_config = TrainingConfig(
+        epochs=1, batch_size=8, learning_rate=1e-3, label_smoothing=resume_label_smoothing
+    )
+
+    require_compatible_resume_config(checkpoint_config, resume_config)  # raise 없이 통과해야 함
+
+
 # -- Phase 4E: lr_scheduler ---------------------------------------------------
 
 

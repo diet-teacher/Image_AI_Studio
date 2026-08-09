@@ -528,6 +528,38 @@ def test_workflow_forwards_progress_callback_to_run_training(tmp_path: Path) -> 
     assert [p.global_epoch for p in progresses] == [1, 2, 3]
 
 
+def test_workflow_forwards_label_smoothing_to_criterion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Phase 4N: TrainingConfig.label_smoothing이 production 경로
+    (ImageFolderWorkflowRequest -> run_imagefolder_training_workflow() ->
+    run_training() -> _build_criterion())를 통해 실제로 전달되는지 확인한다.
+    새 E2E 스크립트 대신 기존 통합 테스트 파일의 monkeypatch/spy 패턴을
+    그대로 재사용한다(이미지 데이터셋 학습 자체를 새로 검증할 필요는 없음
+    -- 그건 다른 기존 테스트가 담당)."""
+    calls: list[float] = []
+    from image_ai_studio.training.loop import _build_criterion as real_build_criterion
+
+    def spy_build_criterion(config: TrainingConfig):
+        calls.append(config.label_smoothing)
+        return real_build_criterion(config)
+
+    monkeypatch.setattr("image_ai_studio.training.loop._build_criterion", spy_build_criterion)
+
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2, label_smoothing=0.3),
+        output_dir=tmp_path / "out",
+        export_torchscript=False,
+        seed=SEED,
+    )
+
+    run_imagefolder_training_workflow(request)
+
+    assert calls == [0.3]
+
+
 def test_workflow_forwards_should_stop_and_stops_training_early(tmp_path: Path) -> None:
     _make_standard_dataset(tmp_path)
     model_json_path = _write_model_json(tmp_path, _spec())

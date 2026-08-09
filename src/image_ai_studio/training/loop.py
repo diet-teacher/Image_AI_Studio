@@ -1,7 +1,8 @@
-"""학습/평가 루프. loss=CrossEntropyLoss는 고정. optimizer(Adam/SGD)와 LR
+"""학습/평가 루프. loss=CrossEntropyLoss는 고정(label smoothing 계수만
+Phase 4N부터 TrainingConfig로 선택 가능). optimizer(Adam/SGD)와 LR
 scheduler(없음/ReduceLROnPlateau)는 Phase 4E부터 TrainingConfig로 선택
 가능 -- 선택지가 2개/1개뿐이라 registry 없이 이 모듈의 private helper
-(_build_optimizer/_build_scheduler)로 충분하다."""
+(_build_optimizer/_build_scheduler/_build_criterion)로 충분하다."""
 from __future__ import annotations
 
 import copy
@@ -48,19 +49,34 @@ def _build_scheduler(
     )
 
 
+def _build_criterion(config: TrainingConfig) -> nn.Module:
+    """config.label_smoothing으로 CrossEntropyLoss를 생성한다(Phase 4N).
+    선택지가 CrossEntropy 하나뿐이라 _build_optimizer()/_build_scheduler()
+    와 동일한 근거로 registry나 loss 이름 선택 필드는 두지 않는다. 이
+    criterion은 training(train_one_epoch)에서만 쓴다 -- evaluate()는
+    validation/test loss의 의미(ReduceLROnPlateau/early stopping/best
+    model selection/test_loss)를 그대로 지키기 위해 항상 별도의 unsmoothed
+    CrossEntropyLoss를 자체적으로 쓴다(무수정)."""
+    return nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: str = "cpu",
     gradient_clip_norm: float | None = None,
+    criterion: nn.Module | None = None,
 ) -> float:
     """1 epoch 학습 (model.train() -> forward -> CrossEntropyLoss -> backward
     -> [gradient_clip_norm이 있으면 L2 norm clipping] -> step). 반환값: epoch
     평균 loss. gradient_clip_norm=None(기본값)이면 clip 호출 자체가 없어
-    Phase 4A~4L의 기존 동작과 완전히 동일하다(Phase 4M)."""
+    Phase 4A~4L의 기존 동작과 완전히 동일하다(Phase 4M). criterion=None
+    (기본값)이면 기존과 동일하게 unsmoothed CrossEntropyLoss를 내부에서
+    생성한다 -- run_training()은 _build_criterion(config)로 만든 criterion을
+    넘겨 label smoothing(Phase 4N)을 적용한다."""
     model.train()
-    criterion = nn.CrossEntropyLoss()
+    criterion = criterion if criterion is not None else nn.CrossEntropyLoss()
     total_loss = 0.0
     total_samples = 0
 
@@ -379,9 +395,18 @@ def run_training(
     것도 마찬가지로 호출자 책임이다. training/checkpoint.py의
     save_training_checkpoint() 참고).
 
-    optimizer/scheduler는 config에 따라 여기서 생성한다. resume_state가
-    None(기본값)이면 Phase 4E까지의 동작과 완전히 동일 -- 매번 새로
-    생성하고, epoch 1부터, 빈 history로 시작한다.
+    optimizer/scheduler/criterion(Phase 4N, _build_criterion)은 config에
+    따라 여기서 생성한다. resume_state가 None(기본값)이면 Phase 4E까지의
+    동작과 완전히 동일 -- 매번 새로 생성하고, epoch 1부터, 빈 history로
+    시작한다. criterion은 학습(train_one_epoch)에만 쓰인다 -- evaluate()
+    는 validation/test loss의 기존 의미(ReduceLROnPlateau/early
+    stopping/best model selection/test_loss)를 그대로 지키기 위해 항상
+    별도의 unsmoothed CrossEntropyLoss를 자체적으로 쓴다(무수정, Phase
+    4N에서도 변경하지 않음). label_smoothing은 optimizer의 param_groups와
+    무관한 순수 criterion 생성자 인자이고 checkpoint에서 복원해야 할
+    학습 state도 없으므로(CrossEntropyLoss(weight=None)의 state_dict()는
+    항상 빈 dict) resume 시 자유롭게 바꿀 수 있다(gradient_clip_norm과
+    동일한 이유, 아래 require_compatible_resume_config 설명 참고).
 
     resume_state가 주어지면(Phase 4F), 다음 순서로 진행한다:
     1. resume_state.history.stopped_early=True는 여기서 거부한다
@@ -496,6 +521,13 @@ def run_training(
 
     optimizer = _build_optimizer(model, config)
     scheduler = _build_scheduler(optimizer, config)
+    # criterion(CrossEntropyLoss(weight=None))은 checkpoint에서 복원해야 할
+    # 학습 state가 없으므로(Phase 4N, state_dict()가 항상 빈 dict), optimizer/
+    # scheduler와 마찬가지로 epoch 루프 진입 전 한 번만 생성해 재사용한다 --
+    # resume 여부와 무관하게 매번 config로 새로 만든다(별도 state_dict
+    # 저장/복원이 없으므로 optimizer/scheduler처럼 resume_state에서 로드할
+    # 것이 없다).
+    criterion = _build_criterion(config)
 
     if resume_state is not None:
         optimizer.load_state_dict(copy.deepcopy(resume_state.optimizer_state_dict))
@@ -533,7 +565,8 @@ def run_training(
         run_epoch = epoch - completed_epochs
 
         train_loss = train_one_epoch(
-            model, train_loader, optimizer, device=device, gradient_clip_norm=config.gradient_clip_norm
+            model, train_loader, optimizer, device=device,
+            gradient_clip_norm=config.gradient_clip_norm, criterion=criterion,
         )
         history.train_losses.append(train_loss)
         val_loss, val_accuracy = evaluate(model, val_loader, device=device)

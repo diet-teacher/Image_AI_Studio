@@ -897,11 +897,63 @@ dampening/nesterov, GPU/device 노출, mixed precision은 이번 Phase에서도
 없이 그대로입니다.
 
 gradient value clipping, custom `norm_type`, `error_if_nonfinite` 노출,
-gradient norm history/metric 기록, loss function 선택, 추가 scheduler,
-평가 metric 확장, GPU/device 노출은 이번 Phase에서도 지원하지 않습니다.
+gradient norm history/metric 기록, 추가 scheduler, 평가 metric 확장,
+GPU/device 노출은 이번 Phase에서도 지원하지 않습니다(label smoothing은
+Phase 4N에서 추가됐습니다 -- 아래 "Phase 4N" 절 참고).
 
 설계 배경과 상세 계약은 `docs/phase4m_gradient_clipping_design.md`를
 참고하세요.
+
+---
+
+## Phase 4N: CrossEntropy Label Smoothing
+
+`TrainingConfig`에 `label_smoothing`을 추가하고, `loop.py`에
+`_build_optimizer()`/`_build_scheduler()`와 나란한 `_build_criterion()`
+을 신설해 `train_one_epoch()`에 주입했습니다. label smoothing은
+**training loss에만** 적용됩니다 -- validation/test loss와
+`ReduceLROnPlateau`/early stopping/best-model-selection의 의미는
+기존 unsmoothed `nn.CrossEntropyLoss()` 그대로 유지합니다
+(`evaluate()`는 이번 Phase에서 전혀 수정하지 않았습니다).
+
+* `TrainingConfig.label_smoothing: float = 0.0` -- `[0.0, 1.0]` 양끝
+  포함, 기본값 `0.0`이면 기존 `nn.CrossEntropyLoss()`와 bitwise
+  동일한 결과를 냅니다(직접 확인).
+* 검증: bool/음수/`>1.0`/`NaN`/`+inf`/`-inf`는 거부합니다. 기존
+  `_require_fraction()`은 상한이 항상 `<1.0`(배타적)으로 고정돼 있어
+  `1.0`을 거부하므로 재사용할 수 없어, 별도
+  `_require_closed_unit_interval()` helper로 검증합니다.
+* `scripts/train_imagefolder.py`에 `--label-smoothing FLOAT`(기본값
+  `0.0`) 플래그를 추가했습니다.
+* **train/validation/test loss 의미**: `label_smoothing > 0`일 때
+  `train_loss`는 smoothed CrossEntropyLoss, `val_loss`/`test_loss`는
+  항상 ordinary(unsmoothed) CrossEntropyLoss입니다 -- 같은 objective의
+  숫자가 아니므로 직접 비교(예: overfitting 판단)에 주의해야 합니다.
+  이 정책 덕분에 `evaluate()`를 monkeypatch하는 기존 테스트 약 20곳이
+  전혀 영향받지 않습니다.
+* **resume 호환성**: `TrainingConfig` 전체가 `asdict()`로 그대로
+  저장되므로 `label_smoothing` 값 자체는 checkpoint의
+  `training_config`에 저장되지만, `RESUME_CONFIG_FIELDS`에
+  **포함되지 않아** resume compatibility 비교 대상은 아닙니다 --
+  `CrossEntropyLoss`에는 `*.load_state_dict()`로 저장/복원되는 state가
+  없어 `gradient_clip_norm`과 동일한 이유로 resume할 때마다 자유롭게
+  바꿀 수 있습니다. `checkpoint.py`/`imagefolder_workflow.py`는 이번
+  Phase에서 수정하지 않았고, checkpoint format version도 그대로입니다.
+
+실제로 검증됨: `label_smoothing=0.0`이 인자 없는 `nn.CrossEntropyLoss()`
+와 `torch.equal()` 수준으로 동일함을 확인했고, `label_smoothing=0.1`이
+PyTorch reference 구현(`nn.CrossEntropyLoss(label_smoothing=0.1)`)과
+정확히 일치함을 확인했습니다. `label_smoothing != 0`(continuous run과
+resume run이 동일 값을 쓸 때) 조합에서도 tensor-level exact equality를
+유지하는 회귀 테스트로 고정했습니다. 기존 4개 E2E 앵커 수치는 변경
+없이 그대로입니다.
+
+BCE/BCEWithLogitsLoss, multilabel, focal loss, class weight, custom
+loss, regression loss, `loss` 이름 선택 필드, reduction/ignore_index
+변경, validation/test smoothing은 이번 Phase에서도 지원하지 않습니다.
+
+설계 배경과 상세 계약은 `docs/phase4n_loss_function_extension_design.md`
+를 참고하세요.
 
 ---
 
@@ -911,8 +963,9 @@ gradient norm history/metric 기록, loss function 선택, 추가 scheduler,
   직렬화)
 * `ResidualBlock` (Phase 2)
 * `Branch` Add / channel `Concat` + `Identity` skip path (Phase 3)
-* Classification 학습, loss=CrossEntropyLoss 고정, optimizer는 Adam/SGD/
-  AdamW 선택 가능, weight decay(L2 정규화) 공통 적용 (Phase 4E, Phase 4L)
+* Classification 학습, loss=CrossEntropyLoss 고정(label smoothing 계수는
+  선택 가능, training loss에만 적용), optimizer는 Adam/SGD/AdamW 선택
+  가능, weight decay(L2 정규화) 공통 적용 (Phase 4E, Phase 4L, Phase 4N)
 * LR scheduler `ReduceLROnPlateau` 선택, early stopping patience 지정,
   `TrainingHistory.stopped_early` 기록 (Phase 4E)
 * Synthetic train/validation 데이터셋 (Phase 4A/4B, 오프라인)
@@ -947,8 +1000,12 @@ gradient norm history/metric 기록, loss function 선택, 추가 scheduler,
   Phase 4L 이전 checkpoint에 대한 `weight_decay` 전용 하위 호환 resume
   규칙 (Phase 4L)
 * `--gradient-clip-norm`(L2 norm clipping, 상한 없는 양수, 기본값 없음
-  = 비활성화), resume 시 checkpoint와 무관하게 자유롭게 변경 가능
+  = 비활성화) -- checkpoint의 `training_config`에는 저장되지만 resume
+  compatibility 비교 대상은 아니라서 resume 시 자유롭게 변경 가능
   (Phase 4M)
+* `--label-smoothing`(`[0.0, 1.0]`, 기본값 0.0), training loss에만
+  적용 -- 마찬가지로 checkpoint에는 저장되지만 resume compatibility
+  비교 대상은 아니라서 resume 시 자유롭게 변경 가능 (Phase 4N)
 * TorchScript 배포, C++(LibTorch) CPU/CUDA 추론
 * Python/C++ parity 검증 (Phase 0~4E 배포 경로; Phase 4F는 export/parity
   코드를 변경하지 않았고, 기존 parity E2E를 재실행해 회귀 없음을 확인함
@@ -967,12 +1024,14 @@ gradient norm history/metric 기록, loss function 선택, 추가 scheduler,
   각각 별도 함수로 연결되어 있고, 둘을 묶는 공통 factory/registry는
   아직 없음), Oxford-IIIT Pet 등 다른 dataset의 실제 연동
 * class imbalance 처리, weighted sampler
-* loss function 선택 (CrossEntropyLoss 고정), Adam betas/eps,
-  SGD dampening/nesterov, `"plateau"` 외 LR scheduler(StepLR/
-  CosineAnnealingLR 등), scheduler threshold/cooldown/min_lr,
-  gradient value clipping, custom gradient `norm_type`,
-  `error_if_nonfinite` 노출, gradient norm history/metric 기록
-  (L2 norm clipping 자체는 Phase 4M에서 지원 -- 위 "Phase 4M" 절 참고)
+* loss function 종류 선택(CrossEntropyLoss 고정 -- BCE/multilabel/
+  focal loss/class weight/custom loss/regression loss는 미지원, label
+  smoothing 계수만 Phase 4N에서 지원), validation/test 시의 label
+  smoothing(항상 unsmoothed), Adam betas/eps, SGD dampening/nesterov,
+  `"plateau"` 외 LR scheduler(StepLR/CosineAnnealingLR 등), scheduler
+  threshold/cooldown/min_lr, gradient value clipping, custom gradient
+  `norm_type`, `error_if_nonfinite` 노출, gradient norm history/metric
+  기록 (L2 norm clipping 자체는 Phase 4M에서 지원 -- 위 "Phase 4M" 절 참고)
 * resume 시 config 자유 변경 (optimizer/learning_rate/momentum/
   weight_decay/lr_scheduler/lr_scheduler_factor/lr_scheduler_patience/
   batch_size는 checkpoint와 반드시 일치해야 함 -- weight_decay만 Phase 4L
