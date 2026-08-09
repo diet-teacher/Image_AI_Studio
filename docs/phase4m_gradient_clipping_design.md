@@ -158,16 +158,24 @@ def _require_positive_float(name: str, value: object) -> None:
         raise TrainingConfigError(f"'{name}' must be a positive number, got {value!r}")
 ```
 
-**이 helper는 NaN과 +inf를 거부하지 못한다** -- `float("nan") <= 0.0`과
-`float("inf") <= 0.0`은 파이썬에서 둘 다 `False`이므로(NaN과의 비교는
-항상 False, +inf는 0.0보다 크므로), `isinstance`/`bool` 검사만 통과하면
-`or` 체인 전체가 `False`가 되어 예외가 발생하지 않는다 -- 즉 현재
-`_require_positive_float()`는 `NaN`과 `+inf`를 **조용히 허용**한다
-(`-inf`는 `<=0.0`이 `True`라 정상적으로 거부됨). 이 사실은
-`learning_rate`(현재 이 helper로 검증됨)에도 이미 해당되는 기존 코드의
-잠재적 결함이지만, 이번 Phase의 범위(gradient_clip_norm 하나)를 벗어나는
-"단순 편의를 위한 refactoring"이므로 `_require_positive_float()` 자체는
-고치지 않는다.
+**이 helper는(Phase 4M 시점에는) NaN과 +inf를 거부하지 못했다** --
+`float("nan") <= 0.0`과 `float("inf") <= 0.0`은 파이썬에서 둘 다
+`False`이므로(NaN과의 비교는 항상 False, +inf는 0.0보다 크므로),
+`isinstance`/`bool` 검사만 통과하면 `or` 체인 전체가 `False`가 되어
+예외가 발생하지 않았다 -- 즉 `_require_positive_float()`는 `NaN`과
+`+inf`를 **조용히 허용**했다(`-inf`는 `<=0.0`이 `True`라 정상적으로
+거부됨). 이 사실은 `learning_rate`(당시 이 helper로 검증됨)에도 이미
+해당되는 기존 코드의 잠재적 결함이었지만, Phase 4M의 범위
+(gradient_clip_norm 하나)를 벗어나는 "단순 편의를 위한 refactoring"이므로
+Phase 4M에서는 `_require_positive_float()` 자체를 고치지 않았다.
+
+**후속 갱신**: 이 latent bug는 Phase 4M 이후 별도의 독립 hotfix(Phase
+번호 없음)에서 `_require_positive_float()` 자체에 `math.isfinite()`
+검사를 추가하는 방식으로 수정됐다 -- `learning_rate`가 이제 NaN/+inf를
+거부한다. 이 hotfix로 `_require_positive_float()`와 아래
+`_require_positive_finite_float()`는 계약이 사실상 동일해졌지만, 두
+helper를 통합하는 것은 그 hotfix에서도 의도적으로 범위 밖에 뒀다(별도
+refactoring 결정 필요).
 
 ```python
 def _require_non_negative_finite_float(name: str, value: object) -> None:
@@ -508,9 +516,10 @@ PASS했다.
 - exact-resume 깨짐: 이론상 위험 낮음(결정론적 연산), §10-4 회귀
   테스트로 실측 검증.
 - RNG consumption 변화: 없음(`clip_grad_norm_`는 RNG 미사용).
-- `_require_positive_float()`의 NaN/+inf 미검출: 기존 코드의 잠재적
-  결함이지만 이번 Phase 범위 밖이라 수정하지 않음(§5-2) -- 별도 향후
-  검토 후보로 남긴다.
+- `_require_positive_float()`의 NaN/+inf 미검출: Phase 4M 시점에는
+  기존 코드의 잠재적 결함이었으나 Phase 4M 범위 밖이라 수정하지
+  않았다(§5-2) -- **Phase 4M 이후 별도 hotfix에서 수정 완료**(§5-2
+  "후속 갱신" 참고).
 - CLI 복잡도 증가: 플래그 1개, 낮음.
 - Phase 범위가 커지는 문제: value clipping/`norm_type` 노출을 함께
   넣지 않도록 주의(§2 non-goals에 명시).

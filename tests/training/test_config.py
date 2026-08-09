@@ -29,6 +29,20 @@ def test_rejects_non_positive_learning_rate(learning_rate: float) -> None:
         TrainingConfig(epochs=1, batch_size=8, learning_rate=learning_rate)
 
 
+@pytest.mark.parametrize("learning_rate", [float("nan"), float("inf"), float("-inf")])
+def test_rejects_non_finite_learning_rate(learning_rate: float) -> None:
+    """_require_positive_float()는 예전에 float(value) <= 0.0만 검사해서
+    NaN/+inf를 조용히 통과시켰다(NaN과의 비교, +inf와 0.0의 비교가 각각
+    False라서) -- math.isfinite() 검사를 추가해 셋 다 거부한다."""
+    with pytest.raises(TrainingConfigError, match="learning_rate"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=learning_rate)
+
+
+def test_rejects_bool_learning_rate() -> None:
+    with pytest.raises(TrainingConfigError, match="learning_rate"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=True)  # type: ignore[arg-type]
+
+
 def test_rejects_bool_epochs() -> None:
     """bool은 int의 서브클래스라서 isinstance(True, int)가 True로 나옴 -- 별도 차단 필요."""
     with pytest.raises(TrainingConfigError, match="epochs"):
@@ -181,10 +195,8 @@ def test_rejects_bool_gradient_clip_norm() -> None:
 
 @pytest.mark.parametrize("gradient_clip_norm", [float("nan"), float("inf"), float("-inf")])
 def test_rejects_non_finite_gradient_clip_norm(gradient_clip_norm: float) -> None:
-    """_require_positive_float()는 NaN/+inf를 조용히 통과시키므로(§5-2
-    설계 문서 참고), gradient_clip_norm은 그 helper를 재사용하지 않고
-    별도의 _require_positive_finite_float()로 검증된다 -- 이 테스트가
-    그 계약을 직접 고정한다."""
+    """gradient_clip_norm은 양의 유한값만 허용하며 NaN/+inf/-inf를
+    모두 거부한다."""
     with pytest.raises(TrainingConfigError, match="gradient_clip_norm"):
         TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, gradient_clip_norm=gradient_clip_norm)
 
