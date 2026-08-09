@@ -5,6 +5,7 @@ import pytest
 
 from image_ai_studio.model_definition.errors import ModelValidationError
 from image_ai_studio.model_definition.specs import (
+    BatchNorm2dSpec,
     BranchSpec,
     Conv2dSpec,
     DropoutSpec,
@@ -72,6 +73,36 @@ def test_max_pool2d_explicit_stride_overrides_default() -> None:
 def test_linear_rejects_non_positive_out_features(out_features: int) -> None:
     with pytest.raises(ModelValidationError, match="out_features"):
         LinearSpec(out_features=out_features)
+
+
+# -- BatchNorm2d ---------------------------------------------------------------
+
+
+def test_batch_norm2d_eps_defaults_to_1e_minus_5() -> None:
+    assert BatchNorm2dSpec().eps == 1e-5
+
+
+@pytest.mark.parametrize("eps", [1e-8, 1e-5, 1.0, 5.0])
+def test_batch_norm2d_accepts_positive_finite_eps_with_no_upper_bound(eps: float) -> None:
+    assert BatchNorm2dSpec(eps=eps).eps == eps
+
+
+@pytest.mark.parametrize("eps", [0.0, -1e-5])
+def test_batch_norm2d_rejects_non_positive_eps(eps: float) -> None:
+    with pytest.raises(ModelValidationError, match="eps"):
+        BatchNorm2dSpec(eps=eps)
+
+
+def test_batch_norm2d_rejects_bool_eps() -> None:
+    with pytest.raises(ModelValidationError, match="eps"):
+        BatchNorm2dSpec(eps=True)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("eps", [float("nan"), float("inf"), float("-inf")])
+def test_batch_norm2d_rejects_non_finite_eps(eps: float) -> None:
+    """eps는 양의 유한값만 허용하며 NaN/+inf/-inf를 모두 거부한다."""
+    with pytest.raises(ModelValidationError, match="eps"):
+        BatchNorm2dSpec(eps=eps)
 
 
 @pytest.mark.parametrize("p", [-0.1, 1.1])

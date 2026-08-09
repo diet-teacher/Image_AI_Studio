@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from image_ai_studio.model_definition.errors import ModelValidationError
@@ -27,8 +28,16 @@ def _require_non_negative_int(name: str, value: object) -> None:
 
 
 def _require_positive_float(name: str, value: object) -> None:
-    if not isinstance(value, (int, float)) or isinstance(value, bool) or float(value) <= 0.0:
-        raise ModelValidationError(f"'{name}' must be a positive number, got {value!r}")
+    # math.isfinite()를 명시적으로 검사한다 -- NaN/+inf는 <= 0.0과 비교하면
+    # 둘 다 False가 되어(NaN과의 비교는 항상 False, +inf는 0.0보다 큼) 그냥
+    # float(value) <= 0.0만 검사하면 조용히 통과해버린다.
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or float(value) <= 0.0
+    ):
+        raise ModelValidationError(f"'{name}' must be a finite positive number, got {value!r}")
 
 
 def _require_unit_interval(name: str, value: object) -> None:
