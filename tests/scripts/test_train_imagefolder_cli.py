@@ -950,6 +950,215 @@ def test_class_weights_invalid_value_fails_cleanly(tmp_path: Path, capsys) -> No
     assert "class_weights" in stderr
 
 
+# -- Phase 4Q: --device ---------------------------------------------------------
+
+
+def test_device_forwards_exact_value_to_workflow_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, "cli_device_forward_model")
+
+    captured: dict = {}
+
+    def fake_workflow(request, *, progress_callback=None, should_stop=None):
+        captured["request"] = request
+        history = TrainingHistory(
+            train_losses=[0.5], val_losses=[0.5], val_accuracies=[0.5],
+            best_epoch=1, best_val_loss=0.5,
+        )
+        return ImageFolderWorkflowResult(
+            history=history,
+            test_loss=0.5,
+            test_accuracy=0.5,
+            best_model_state_dict_path=tmp_path / "best_model_state_dict.pt",
+            training_history_path=tmp_path / "training_history.json",
+            class_mapping_path=tmp_path / "class_mapping.json",
+            test_result_path=tmp_path / "test_result.json",
+            checkpoint_path=None,
+            checkpoint_metadata_path=None,
+            torchscript_model_path=None,
+            torchscript_metadata_path=None,
+        )
+
+    monkeypatch.setattr(cli, "run_imagefolder_training_workflow", fake_workflow)
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "1",
+            "--batch-size", "4",
+            "--device", "cuda:0",
+            "--no-export-torchscript",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["request"].device == "cuda:0"
+
+
+def test_device_defaults_to_cpu_when_flag_omitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, "cli_device_default_model")
+
+    captured: dict = {}
+
+    def fake_workflow(request, *, progress_callback=None, should_stop=None):
+        captured["request"] = request
+        history = TrainingHistory(
+            train_losses=[0.5], val_losses=[0.5], val_accuracies=[0.5],
+            best_epoch=1, best_val_loss=0.5,
+        )
+        return ImageFolderWorkflowResult(
+            history=history,
+            test_loss=0.5,
+            test_accuracy=0.5,
+            best_model_state_dict_path=tmp_path / "best_model_state_dict.pt",
+            training_history_path=tmp_path / "training_history.json",
+            class_mapping_path=tmp_path / "class_mapping.json",
+            test_result_path=tmp_path / "test_result.json",
+            checkpoint_path=None,
+            checkpoint_metadata_path=None,
+            torchscript_model_path=None,
+            torchscript_metadata_path=None,
+        )
+
+    monkeypatch.setattr(cli, "run_imagefolder_training_workflow", fake_workflow)
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "1",
+            "--batch-size", "4",
+            "--no-export-torchscript",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["request"].device == "cpu"
+
+
+def test_device_stdout_echoes_requested_value(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    """Phase 4Q에서 승인된 stdout echo -- Model JSON/Dataset root/Resume from/
+    Checkpoint out과 같은 계층으로 사용자가 지정한 값을 그대로 echo한다
+    (새로 계산된 지표가 아니라 입력값 echo이므로 Phase 4O의 stdout 확대
+    금지 원칙과 충돌하지 않는다)."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, "cli_device_stdout_model")
+
+    def fake_workflow(request, *, progress_callback=None, should_stop=None):
+        history = TrainingHistory(
+            train_losses=[0.5], val_losses=[0.5], val_accuracies=[0.5],
+            best_epoch=1, best_val_loss=0.5,
+        )
+        return ImageFolderWorkflowResult(
+            history=history,
+            test_loss=0.5,
+            test_accuracy=0.5,
+            best_model_state_dict_path=tmp_path / "best_model_state_dict.pt",
+            training_history_path=tmp_path / "training_history.json",
+            class_mapping_path=tmp_path / "class_mapping.json",
+            test_result_path=tmp_path / "test_result.json",
+            checkpoint_path=None,
+            checkpoint_metadata_path=None,
+            torchscript_model_path=None,
+            torchscript_metadata_path=None,
+        )
+
+    monkeypatch.setattr(cli, "run_imagefolder_training_workflow", fake_workflow)
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "1",
+            "--batch-size", "4",
+            "--device", "cpu",
+            "--no-export-torchscript",
+        ]
+    )
+
+    assert exit_code == 0
+    stdout = capsys.readouterr().out
+    assert "Device: cpu" in stdout
+
+
+def test_device_invalid_syntax_fails_cleanly(tmp_path: Path, capsys) -> None:
+    """--device gpu는 workflow entry(_validate_device)에서 거부된다 --
+    main()의 기존 ValueError -> exit code 1 경로를 그대로 탄다."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, "cli_device_invalid_model")
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "1",
+            "--device", "gpu",
+            "--no-export-torchscript",
+        ]
+    )
+
+    assert exit_code == 1
+    stderr = capsys.readouterr().err
+    assert "device" in stderr
+
+
+def test_device_cuda_unavailable_fails_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """--device cuda인데 CUDA가 사용 불가능하면 CPU로 조용히 대체하지
+    않고 명확히 거부한다."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, "cli_device_cuda_unavailable_model")
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "1",
+            "--device", "cuda",
+            "--no-export-torchscript",
+        ]
+    )
+
+    assert exit_code == 1
+    stderr = capsys.readouterr().err
+    assert "cuda" in stderr
+
+
+def test_device_cuda_index_out_of_range_fails_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """--device cuda:5인데 GPU가 1개뿐이면 .to(device)까지 내려가지 않고
+    조기에 명확히 거부한다."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, "cli_device_cuda_out_of_range_model")
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "1",
+            "--device", "cuda:5",
+            "--no-export-torchscript",
+        ]
+    )
+
+    assert exit_code == 1
+    stderr = capsys.readouterr().err
+    assert "out of range" in stderr
+
+
 # -- Phase 4K: Graceful SIGINT and Cooperative Training Stop ------------------
 #
 # docs/phase4k_graceful_interruption_design.md 기준. 실제 OS signal은 전혀

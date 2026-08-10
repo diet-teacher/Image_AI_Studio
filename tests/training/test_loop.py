@@ -154,7 +154,7 @@ def test_evaluate_classification_metrics_matches_evaluate_loss_and_accuracy() ->
 def test_evaluate_classification_metrics_accuracy_matches_confusion_matrix_diagonal() -> None:
     """accuracy == sum(diagonal(confusion_matrix)) / sum(confusion_matrix) --
     accuracy와 confusion matrix가 같은 예측 결과로부터 계산됐음을 보장하는
-    핵심 회귀 계약(§16/§21)."""
+    핵심 회귀 계약."""
     torch.manual_seed(0)
     spec = _mlp_classifier_spec()
     model = build_model(spec)
@@ -186,7 +186,7 @@ def test_evaluate_classification_metrics_returns_expected_shapes() -> None:
 
 def test_evaluate_classification_metrics_metrics_are_finite() -> None:
     """zero-division=0.0 정책 덕분에 모든 지표가 항상 finite여야 한다(NaN/
-    +-inf 없음, §28) -- json.dumps()의 비표준 NaN 허용에 의존하지 않는다."""
+    +-inf 없음) -- json.dumps()의 비표준 NaN 허용에 의존하지 않는다."""
     torch.manual_seed(0)
     spec = _mlp_classifier_spec()
     model = build_model(spec)
@@ -251,6 +251,26 @@ def test_run_training_reduces_training_loss() -> None:
     assert len(history.val_losses) == config.epochs
     assert len(history.val_accuracies) == config.epochs
     assert history.train_losses[-1] < history.train_losses[0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a local CUDA device")
+def test_run_training_on_cuda_completes_one_epoch() -> None:
+    """optional CUDA smoke test(Phase 4Q) -- model.to("cuda") 후
+    run_training(..., device="cuda")가 정상 완료되는지 최소 확인한다
+    (GPU 없는 CI에서는 자동 skip). model이 이미 target device에 있어야
+    한다는 run_training()의 기존 계약을 caller가 그대로 지킨다."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec).to("cuda")
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+
+    result = run_training(model, train_loader, val_loader, config, device="cuda")
+
+    assert next(model.parameters()).device.type == "cuda"
+    assert len(result.history.train_losses) == 1
+    assert math.isfinite(result.history.train_losses[0])
+    assert math.isfinite(result.history.val_losses[0])
 
 
 # -- Phase 4B: best epoch 추적 --------------------------------------------------
@@ -1630,6 +1650,19 @@ def test_build_criterion_weight_tensor_dtype_and_device() -> None:
     assert criterion.weight.dtype == torch.float32
     assert criterion.weight.device.type == "cpu"
     assert torch.equal(criterion.weight, torch.tensor([1.0, 2.0], dtype=torch.float32))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a local CUDA device")
+def test_build_criterion_weight_tensor_on_cuda_device() -> None:
+    """optional CUDA smoke test(Phase 4Q) -- class_weights tensor가
+    _build_criterion(config, device="cuda")로 실제 CUDA device 위에
+    생성되는지 확인한다(GPU 없는 CI에서는 자동 skip)."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, class_weights=(1.0, 2.0))
+
+    criterion = _build_criterion(config, device="cuda")
+
+    assert criterion.weight.dtype == torch.float32
+    assert criterion.weight.device.type == "cuda"
 
 
 def test_build_criterion_class_weights_and_label_smoothing_combination_matches_pytorch_reference() -> None:

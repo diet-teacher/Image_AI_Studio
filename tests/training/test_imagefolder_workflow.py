@@ -36,9 +36,10 @@ from image_ai_studio.training.imagefolder_workflow import (
     _normalized_path,
     _validate_checkpoint_every,
     _validate_checkpoint_output_paths,
+    _validate_device,
     run_imagefolder_training_workflow,
 )
-from image_ai_studio.training.loop import TrainingHistory, run_training
+from image_ai_studio.training.loop import TrainingHistory, evaluate_classification_metrics, run_training
 from image_ai_studio.training.torchvision_dataset import make_imagefolder_datasets
 
 INPUT_SHAPE = (3, 8, 8)
@@ -259,7 +260,7 @@ def test_best_model_evaluation_and_test_result_json(tmp_path: Path) -> None:
 def test_production_result_has_classification_metrics(tmp_path: Path) -> None:
     """run_imagefolder_training_workflow()가 정상 완료한 production 결과는
     test_metrics가 항상 실제 ClassificationMetrics다(None이 아니다) --
-    dataclass의 default=None은 constructor 하위호환 전용이라는 계약(§17)을
+    dataclass의 default=None은 constructor 하위호환 전용이라는 계약을
     실제 production 경로로 확인한다."""
     _make_standard_dataset(tmp_path)
     model_json_path = _write_model_json(tmp_path, _spec())
@@ -284,7 +285,7 @@ def test_production_result_has_classification_metrics(tmp_path: Path) -> None:
     assert isinstance(result.test_metrics.macro_f1, float)
 
     # test_result.json도 기존 top-level key(test_loss/test_accuracy)는 유지한
-    # 채 nested classification_metrics를 추가로 담아야 한다(§18, additive).
+    # 채 nested classification_metrics를 추가로 담아야 한다(additive).
     on_disk = json.loads(result.test_result_path.read_text())
     assert on_disk["test_loss"] == result.test_loss
     assert on_disk["test_accuracy"] == result.test_accuracy
@@ -307,8 +308,8 @@ def test_production_result_has_classification_metrics(tmp_path: Path) -> None:
 def test_classification_metrics_class_index_order_matches_class_mapping(tmp_path: Path) -> None:
     """confusion_matrix/per_class_recall의 class index 순서가 실제로
     class_mapping.json의 classes 순서와 일치하는지를, class별 test sample
-    개수를 서로 다르게 만들어 관찰 가능한 방식으로 검증한다(§26 -- shape만
-    보고 order가 맞다고 주장하지 않는다). test split의 class별 sample 수를
+    개수를 서로 다르게 만들어 관찰 가능한 방식으로 검증한다(shape만 보고
+    order가 맞다고 주장하지 않는다). test split의 class별 sample 수를
     cat=6, dog=2로 비대칭으로 만들면, confusion matrix의 row별 합(=해당
     true class의 test sample 수)이 어느 class_mapping index가 cat/dog인지를
     직접 드러낸다."""
@@ -352,7 +353,7 @@ def test_imagefolder_workflow_result_constructor_backward_compatible() -> None:
     """test_metrics 없이 ImageFolderWorkflowResult(...)를 직접 생성하던
     기존 코드(테스트의 manual/fake constructor 호출)가 이번 Phase 이후에도
     그대로 성공하고, 그 경우 test_metrics는 backward-compat 전용 기본값
-    None이어야 한다(§17/§27)."""
+    None이어야 한다."""
     result = ImageFolderWorkflowResult(
         history=TrainingHistory(),
         test_loss=0.5,
@@ -1400,3 +1401,249 @@ def test_in_place_resume_never_rewrites_metadata_sidecar(
     # 정밀도 차이로 flaky해질 수 있는 mtime 비교에는 의존하지 않는다.
     assert len(metadata_calls) == 0
     assert sidecar_path.read_bytes() == content_before
+
+
+# -- Phase 4Q: runtime training device exposure -------------------------------
+
+
+def test_workflow_request_device_defaults_to_cpu() -> None:
+    request = ImageFolderWorkflowRequest(
+        model_json_path=Path("model.json"),
+        dataset_root=Path("dataset"),
+        training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+        output_dir=Path("out"),
+    )
+    assert request.device == "cpu"
+
+
+def test_validate_device_accepts_cpu() -> None:
+    _validate_device("cpu")  # raise 없이 통과해야 함
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "gpu", "CUDA", "CPU", "mps", "xpu", "hip", "cuda:", "cuda:-1", "cuda:00", "cuda: 0", "", 123, None,
+        "cpu\n", "cuda\n", "cuda:0\n",
+    ],
+)
+def test_validate_device_rejects_invalid_syntax(value: object) -> None:
+    """공식 지원 syntax는 cpu/cuda/cuda:N뿐이다 -- 대소문자 변형, 다른
+    backend(mps/xpu/hip), zero-padding/음수 index, 빈 문자열, 문자열이
+    아닌 타입 전부 거부한다. "cpu\\n" 등 trailing newline 케이스는 정규식이
+    `match()`가 아니라 `fullmatch()`를 쓴다는 계약을 직접 고정한다 --
+    Python `re`의 `$`는 문자열 끝뿐 아니라 trailing newline 직전에도
+    매치될 수 있어(`match()`로는 "cpu\\n"가 통과함을 실측 확인),
+    `fullmatch()`가 아니면 이 케이스가 조용히 통과해버린다."""
+    with pytest.raises(ValueError, match="device"):
+        _validate_device(value)
+
+
+def test_validate_device_rejects_cuda_when_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CUDA가 사용 불가능하면 CPU로 조용히 대체하지 않고 명확히 거부한다."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    with pytest.raises(ValueError, match="cuda"):
+        _validate_device("cuda")
+    with pytest.raises(ValueError, match="cuda"):
+        _validate_device("cuda:0")
+
+
+def test_validate_device_accepts_plain_cuda_and_valid_index_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+
+    _validate_device("cuda")  # raise 없이 통과해야 함 (PyTorch default CUDA device 의미)
+    _validate_device("cuda:0")  # raise 없이 통과해야 함
+    _validate_device("cuda:1")  # raise 없이 통과해야 함
+
+
+def test_validate_device_rejects_out_of_range_cuda_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`.to(device)`까지 내려가면 저수준 AcceleratorError가 나는 것을
+    직접 실측했다 -- 여기서 조기에 명확한 ValueError로 거부한다."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+
+    with pytest.raises(ValueError, match="out of range"):
+        _validate_device("cuda:1")
+
+
+def test_workflow_rejects_invalid_device_before_training_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """device가 유효하지 않으면 run_training()이 호출되지 않았음을
+    monkeypatch로 직접 증명하며, 학습 시작 전에 조기 거부돼야 한다
+    (Phase 4P의 class_weights 길이 mismatch 조기 검증과 동일한 패턴)."""
+    called = {"value": False}
+
+    def fail_if_called(*args, **kwargs):
+        called["value"] = True
+        raise AssertionError("run_training() must not be called when device is invalid")
+
+    monkeypatch.setattr("image_ai_studio.training.imagefolder_workflow.run_training", fail_if_called)
+
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path / "out",
+        export_torchscript=False,
+        seed=SEED,
+        device="not-a-real-device",
+    )
+
+    with pytest.raises(ValueError, match="device"):
+        run_imagefolder_training_workflow(request)
+
+    assert called["value"] is False
+
+
+def test_workflow_forwards_device_to_run_training_and_moves_model_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """request.device가 실제로 run_training()의 device kwarg로 전달되고,
+    run_training()에 넘어가는 model이 이미 그 device 위에 있는지(즉
+    model.to(device)가 run_training() 호출보다 먼저 일어났는지) 직접
+    고정한다. GPU가 없는 CI에서도 "cpu" 경로로 이 wiring 전체를 실측할
+    수 있다(optional CUDA smoke test가 실제 device 이동 자체를 커버한다)."""
+    captured: dict = {}
+    real_run_training = run_training
+
+    def spy_run_training(model, train_loader, val_loader, config, device="cpu", **kwargs):
+        captured["device_kwarg"] = device
+        captured["model_device"] = next(model.parameters()).device
+        return real_run_training(model, train_loader, val_loader, config, device=device, **kwargs)
+
+    monkeypatch.setattr("image_ai_studio.training.imagefolder_workflow.run_training", spy_run_training)
+
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path / "out",
+        export_torchscript=False,
+        seed=SEED,
+        device="cpu",
+    )
+
+    run_imagefolder_training_workflow(request)
+
+    assert captured["device_kwarg"] == "cpu"
+    assert captured["model_device"] == torch.device("cpu")
+
+
+def test_workflow_final_evaluation_explicitly_uses_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """workflow의 최종 detailed evaluation 호출
+    (evaluate_classification_metrics)이 request.device를 그대로 전달하지
+    않고 명시적으로 device="cpu"를 쓴다는 계약을 고정한다(Phase 4Q는
+    training device exposure이지 evaluation device exposure가 아니다).
+    이 테스트는 request.device="cpu"인 경우만 다룬다 -- CUDA training
+    뒤 최종 test/export 전체 경로가 실제로 CPU에서 정상 완료되는지는
+    별도의 optional CUDA smoke test
+    (test_workflow_cuda_training_completes_with_cpu_final_test_and_export)
+    가 담당한다."""
+    captured: dict = {}
+    real_evaluate_classification_metrics = evaluate_classification_metrics
+
+    def spy_evaluate(*args, **kwargs):
+        captured["device_kwarg"] = kwargs.get("device")
+        return real_evaluate_classification_metrics(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "image_ai_studio.training.imagefolder_workflow.evaluate_classification_metrics", spy_evaluate
+    )
+
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path / "out",
+        export_torchscript=False,
+        seed=SEED,
+        device="cpu",
+    )
+
+    run_imagefolder_training_workflow(request)
+
+    assert captured["device_kwarg"] == "cpu"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a local CUDA device")
+def test_workflow_cuda_training_completes_with_cpu_final_test_and_export(tmp_path: Path) -> None:
+    """optional CUDA smoke test(Phase 4Q) -- 실제 CUDA가 있는 로컬 환경에서만
+    실행된다(GPU 없는 CI에서는 자동 skip). 작은 ImageFolder fixture로
+    device="cuda" 학습이 성공하고, 최종 test 평가와 TorchScript export까지
+    (CPU best_model 기반으로) 정상 완료되는지 한 번에 확인한다 -- generic
+    CUDA smoke + export boundary를 이 테스트 하나로 충분히 커버하므로
+    중복 GPU 테스트를 추가하지 않는다."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(
+            epochs=1, batch_size=4, learning_rate=1e-2, class_weights=(1.0, 2.0)
+        ),
+        output_dir=tmp_path / "out",
+        export_torchscript=True,
+        seed=SEED,
+        device="cuda",
+    )
+
+    result = run_imagefolder_training_workflow(request)
+
+    assert len(result.history.train_losses) == 1
+    assert result.test_metrics is not None
+    assert result.torchscript_model_path is not None
+    assert result.torchscript_model_path.exists()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a local CUDA device")
+def test_workflow_resume_from_cpu_checkpoint_on_cuda_completes(tmp_path: Path) -> None:
+    """optional CUDA resume smoke test(Phase 4Q) -- CPU에서 1 epoch 학습한
+    checkpoint를 CUDA에서 resume했을 때 에러 없이 완료되는지만 확인한다
+    (portability smoke). bitwise exact equality는 주장하지 않으므로
+    assert하지 않는다 -- CUDA→CPU 대칭 테스트는 추가하지 않는다(한 방향
+    portability smoke로 충분하다는 판단)."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    checkpoint_path = tmp_path / "checkpoint.pt"
+
+    run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+            output_dir=tmp_path / "cpu_run",
+            checkpoint_out=checkpoint_path,
+            export_torchscript=False,
+            seed=SEED,
+            device="cpu",
+        )
+    )
+
+    result = run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+            output_dir=tmp_path / "cuda_resume",
+            resume_from=checkpoint_path,
+            checkpoint_out=checkpoint_path,
+            export_torchscript=False,
+            seed=SEED,
+            device="cuda",
+        )
+    )
+
+    assert len(result.history.train_losses) == 2

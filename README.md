@@ -430,8 +430,11 @@ Phase 4A~4E는 `save_state_dict()`/`load_state_dict()`로 모델 가중치만
   exact resume이 됩니다 -- 이 둘은 서로 다른 상태입니다(전자는
   로컬 `torch.Generator`, 후자는 `nn.Dropout`이 쓰는 전역 RNG)
 * CUDA RNG state, batch-level(worker/sampler) resume은 지원하지
-  않습니다 -- 학습이 CPU 전용으로 고정되어 있고(`device="cpu"`),
-  `num_workers=0`이라 애초에 필요하지 않습니다
+  않습니다 -- `num_workers=0`이라 worker/sampler RNG는 애초에 필요하지
+  않고, CUDA RNG state는 checkpoint에 아직 저장되지 않으므로 CPU→CPU가
+  아닌 조합(Phase 4Q의 CPU↔CUDA 등)은 resume이 정상 동작(portable)은
+  하지만 bitwise exact-resume 계약의 대상이 아닙니다(위 "Phase 4Q" 절
+  참고)
 
 실행:
 
@@ -1035,7 +1038,7 @@ recall + macro precision/recall/F1을 계산해 `test_result.json`에
   `model.eval()` + `torch.inference_mode()`에서 순수 forward pass만
   수행하므로 gradient/RNG 소비가 없습니다).
 
-이번 Phase에서 지원하지 않는 것(§33 그대로): validation epoch별 상세
+이번 Phase에서 지원하지 않는 것: validation epoch별 상세
 metric, `TrainingHistory`의 metric 필드, metric 기반 early
 stopping/scheduler, class weight, BCE/focal loss, per-class
 precision/F1 노출, micro/weighted average, sklearn dependency,
@@ -1128,6 +1131,75 @@ CLI 노출, AMP, 추가 LR scheduler.
 
 ---
 
+## Phase 4Q: Runtime Training Device Exposure
+
+ImageFolder 학습에 CPU/CUDA/CUDA:N device를 명시적으로 선택할 수 있게
+했습니다. `run_training()`/`evaluate()`/`evaluate_classification_metrics()`
+/`_build_criterion()` 같은 generic training core(`loop.py`)는 이미
+전부 `device` 파라미터를 갖고 있었으므로(Phase 4A~4P가 이미 device-aware
+하게 설계해 둠), `loop.py`는 **전혀 수정하지 않았습니다** -- 이번 Phase는
+그 device 파라미터를 ImageFolder CLI/workflow에서 실제로 선택 가능하게
+연결하는 배선(wiring) 작업입니다.
+
+* `ImageFolderWorkflowRequest.device: str = "cpu"`(기본값 CPU, 기존
+  direct constructor 호출과 하위호환) + CLI `--device`. **runtime
+  실행 파라미터로 취급**합니다 -- `seed`처럼 `TrainingConfig` 밖에서
+  관리되는 run-level 파라미터라는 점에서 같은 계층입니다(`seed`는
+  RNG/initialization 결과에 영향을 주고 `device`는 execution backend를
+  정한다는 차이는 있지만, 둘 다 학습 objective를 바꾸는 hyperparameter가
+  아니므로 `TrainingConfig`에는 두지 않았습니다). checkpoint의
+  `training_config`/`RESUME_CONFIG_FIELDS`와 완전히 무관합니다.
+* 공식 지원 syntax는 `cpu`/`cuda`/`cuda:N`뿐입니다(대소문자 변형,
+  `mps`/`xpu`/`hip` 등 다른 backend, zero-padding/음수 index는 전부
+  거부). `--device cuda`/`cuda:N`인데 `torch.cuda.is_available()`이
+  `False`이거나 index가 `torch.cuda.device_count()` 범위를 벗어나면
+  **CPU로 조용히 대체하지 않고 학습 시작 전에 명확한 오류로 거부**합니다.
+* 학습 전 `model.to(device)`를 수행합니다(optimizer 생성보다 반드시
+  먼저 -- PyTorch semantics). `_build_criterion(config, device)`(Phase 4P)
+  가 그대로 재사용되어, class-weighted CrossEntropy의 weight tensor도
+  자동으로 학습 device 위에 생성됩니다.
+* **최종 test 평가/TorchScript export/C++ parity는 학습 device와
+  무관하게 항상 CPU를 유지합니다** -- `best_model`은 `build_model()`로
+  새로 만들어져 항상 CPU이고(GPU에서 학습한 `best_state_dict`를 로드해도
+  PyTorch가 cross-device 복사를 안전하게 처리함을 직접 실측 확인),
+  기존 `TorchScriptExporter`가 `example_input`을 CPU로 강제하는 암묵적
+  계약(model도 CPU여야 함)을 그대로 유지합니다. 이번 Phase는 "training
+  device exposure"이지 "evaluation device exposure"가 아닙니다.
+* `checkpoint.py`는 **전혀 수정하지 않았습니다** -- `load_training_checkpoint()`
+  /`load_state_dict()`가 이미 `map_location="cpu"` 기본값을 가지므로
+  GPU에서 저장한 checkpoint도 CPU 전용 환경에서 문제없이 로드됩니다.
+  로컬 CUDA로 직접 실측한 결과, `model.load_state_dict()`/
+  `optimizer.load_state_dict()` 둘 다 저장 시점 device와 무관하게 현재
+  model/optimizer의 device로 자동 이관됨을 확인했습니다(CPU→GPU,
+  GPU→CPU 양방향).
+* **resume 계약(중요, 정확히 구분)**: CPU→CPU는 기존 exact-resume
+  계약(tensor-level exact equality)을 **완전히 그대로 유지**합니다.
+  CUDA를 포함한 resume은 model/optimizer **state portability는
+  지원**하지만 **bitwise exact-resume은 보장하지 않습니다** -- 현재
+  checkpoint는 CPU RNG state와 DataLoader generator state만 저장하고
+  **CUDA RNG state(`torch.cuda.get_rng_state_all()`)는 저장하지 않기
+  때문**입니다. Phase 4Q에서는 대표 경로인 CPU→CUDA resume을 실제
+  CUDA smoke test로 검증했습니다(CUDA→CPU/CUDA→CUDA 전용 workflow
+  테스트는 별도로 추가하지 않았습니다 -- model/optimizer state의
+  cross-device 이관 자체는 PyTorch 레벨 실측으로 양방향 확인). CUDA를
+  포함한 exact-resume은 별도 Phase(CUDA RNG checkpoint, deterministic
+  algorithm 설정 필요)로 분리했습니다.
+* CLI stdout에 `Device: cpu`처럼 사용자가 지정한 값을 한 줄 echo합니다
+  -- `Model JSON`/`Dataset root`/`Resume from`/`Checkpoint out`과 같은
+  계층의 입력값 echo이지 새로 계산된 지표가 아니므로, Phase 4O의 "상세
+  metric stdout 확대 금지" 원칙과 충돌하지 않습니다.
+
+이번 Phase에서 지원하지 않는 것: CUDA exact-resume(CUDA RNG checkpoint,
+deterministic algorithm 설정), AMP/mixed precision, gradient
+accumulation, multi-GPU/distributed training, `mps`/`xpu`/`hip` 등 CUDA
+외 backend, 학습 device와 다른 별도 evaluation device, artifact에 device
+기록, GPU 성능 튜닝(pin_memory/num_workers).
+
+설계 배경과 상세 계약은
+`docs/phase4q_runtime_training_device_design.md`를 참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
@@ -1184,6 +1256,12 @@ CLI 노출, AMP, 추가 LR scheduler.
   값만 허용, training loss에만 적용, label smoothing과 조합 가능) --
   마찬가지로 checkpoint에는 저장되지만 resume compatibility 비교 대상은
   아니라서 resume 시 자유롭게 변경 가능 (Phase 4P)
+* `--device`(`cpu`/`cuda`/`cuda:N`, 기본값 `cpu`)로 ImageFolder 학습
+  device 선택 -- runtime 실행 파라미터로 `TrainingConfig`/
+  `RESUME_CONFIG_FIELDS`와 무관, CUDA 미가용/index 범위 초과 시 명확히
+  거부(silent CPU fallback 없음), 최종 test/TorchScript export는 항상
+  CPU 유지, CPU→CPU exact-resume 유지, CUDA를 포함한 resume은 portable
+  하지만 bitwise exact-resume은 미지원 (Phase 4Q)
 * TorchScript 배포, C++(LibTorch) CPU/CUDA 추론
 * Python/C++ parity 검증 (Phase 0~4E 배포 경로; Phase 4F는 export/parity
   코드를 변경하지 않았고, 기존 parity E2E를 재실행해 회귀 없음을 확인함
@@ -1223,8 +1301,8 @@ CLI 노출, AMP, 추가 LR scheduler.
   weight_decay/lr_scheduler/lr_scheduler_factor/lr_scheduler_patience/
   batch_size는 checkpoint와 반드시 일치해야 함 -- weight_decay만 Phase 4L
   이전 checkpoint에 한해 누락 시 0.0으로 간주하는 좁은 예외가 있음), CUDA
-  RNG state 저장(학습이 CPU
-  전용으로 고정되어 있어 검증 불가), batch-level(worker/sampler
+  RNG state 저장(따라서 CUDA를 포함한 resume은 portable하지만 bitwise
+  exact-resume은 미지원 -- 위 "Phase 4Q" 절 참고), batch-level(worker/sampler
   iterator) resume, distributed checkpoint
 * 기존 `--checkpoint-out` 경로를 명시적으로 덮어쓰도록 강제하는 옵션
   (예: `--overwrite-checkpoint`) -- in-place resume(`--resume-from`과

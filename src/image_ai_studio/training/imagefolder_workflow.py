@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
@@ -87,7 +88,17 @@ class ImageFolderWorkflowRequest:
     §6/§11)는 global epoch이 이 값의 배수가 될 때마다 `checkpoint_out`을
     자동으로 갱신한다. `None`(기본값)이면 학습 도중 자동 저장을 하지
     않고, 기존과 동일하게 학습 종료 시 최종 저장만 수행한다.
-    `checkpoint_every`를 켜려면 `checkpoint_out`이 함께 있어야 한다."""
+    `checkpoint_every`를 켜려면 `checkpoint_out`이 함께 있어야 한다.
+
+    device(Phase 4Q)는 `"cpu"`/`"cuda"`/`"cuda:N"`만 허용하는 순수 runtime
+    실행 파라미터다 -- `seed`처럼 `TrainingConfig` 밖에서 관리되는
+    run-level 파라미터와 같은 계층이지만(둘 다 학습 objective를 바꾸는
+    hyperparameter가 아니므로 `TrainingConfig`에 두지 않는다), `seed`는
+    RNG 결과에 영향을 주고 `device`는 execution backend를 정한다는
+    차이가 있다(checkpoint의 `training_config`/`RESUME_CONFIG_FIELDS`와는
+    둘 다 무관). training(fresh/resume)에만 적용되고, 최종 test 평가/
+    TorchScript export/C++ parity는 이 값과 무관하게 항상 CPU를
+    유지한다(아래 `run_imagefolder_training_workflow()` 참고)."""
 
     model_json_path: Path
     dataset_root: Path
@@ -98,6 +109,7 @@ class ImageFolderWorkflowRequest:
     export_torchscript: bool = True
     seed: int = SEED
     checkpoint_every: int | None = None
+    device: str = "cpu"
 
 
 @dataclass
@@ -198,6 +210,40 @@ def _validate_checkpoint_every(value: int | None) -> None:
         raise ValueError(f"checkpoint_every must be at least 1, got {value!r}")
 
 
+# Phase 4Q: 이 프로젝트가 명시적으로 지원하는 문법은 "cpu"/"cuda"/"cuda:N"
+# 뿐이다(N은 leading zero 없는 음이 아닌 정수). torch.device()도 대소문자
+# 구분, zero-padding, 그 외 backend(mps/xpu/hip 등)를 이미 엄격하게
+# 거부함을 실측했지만, torch.device() 혼자서는 이 프로젝트가 검증하지
+# 않은 backend까지 그대로 통과시키므로(mps/xpu/hip...), 이 프로젝트는
+# 자체 허용 목록을 별도로 관리한다 -- 과도한 자체 parser 대신 최소
+# 정규식 하나로 충분하다.
+_DEVICE_PATTERN = re.compile(r"^(cpu|cuda|cuda:(0|[1-9][0-9]*))$")
+
+
+def _validate_device(value: str) -> None:
+    """device 문자열을 검증한다(Phase 4Q). CUDA 계열이면 추가로
+    `torch.cuda.is_available()`/`torch.cuda.device_count()`로 조기
+    검증한다 -- 그러지 않으면 `.to(device)`까지 내려가서야 저수준
+    `AcceleratorError`("CUDA error: invalid device ordinal")가 나는데,
+    이 경우가 실제로 재현됨을 로컬에서 직접 확인했다(require_matching_num_classes()
+    와 동일한 "깊은 곳 대신 조기에 명확한 에러" 패턴). CUDA 미가용 시
+    CPU로 조용히 대체하지 않는다 -- 사용자가 명시한 실행 의도를 그대로
+    존중한다."""
+    if not isinstance(value, str) or not _DEVICE_PATTERN.fullmatch(value):
+        raise ValueError(f"device must be 'cpu', 'cuda', or 'cuda:N', got {value!r}")
+    if value == "cpu":
+        return
+    if not torch.cuda.is_available():
+        raise ValueError(f"device={value!r} requires CUDA, but torch.cuda.is_available() is False")
+    if ":" in value:
+        index = int(value.split(":", 1)[1])
+        device_count = torch.cuda.device_count()
+        if index >= device_count:
+            raise ValueError(
+                f"device={value!r} is out of range -- torch.cuda.device_count()=={device_count}"
+            )
+
+
 def _normalized_path(path: str | Path) -> str:
     """두 경로가 같은 파일을 가리키는지 비교하기 위한 정규화(Phase 4J,
     §11-2). Path.resolve()로 상대/절대 표기 차이를 없애고,
@@ -296,6 +342,7 @@ def run_imagefolder_training_workflow(
     if request.checkpoint_every is not None and request.checkpoint_out is None:
         raise ValueError("checkpoint_every requires checkpoint_out to be set")
     _validate_checkpoint_output_paths(request)
+    _validate_device(request.device)
 
     model_spec = load_model_spec(request.model_json_path)
     shape_trace = validate_model_spec(model_spec)
@@ -338,6 +385,14 @@ def run_imagefolder_training_workflow(
         metadata_ready = True
 
     model, loader_generator, resume_state, cpu_rng_state = _prepare_resume(request, model_spec, splits)
+    # Phase 4Q: _prepare_resume()은 항상 CPU model을 build/load한다
+    # (map_location 기본값과 build_model()의 기존 동작 유지) -- 여기서
+    # 학습에 실제로 쓸 device로 옮긴다. run_training()의 기존 계약("model은
+    # 호출 전에 이미 device로 옮겨져 있어야 함")을 만족해야 하고, PyTorch
+    # semantics상 optimizer는 model.parameters()가 가리키는 실제 tensor를
+    # 참조하므로 run_training() 내부에서 optimizer가 생성되기 전에 이
+    # 지점에서 target device로 이동한다.
+    model = model.to(request.device)
 
     batch_size = request.training_config.batch_size
     train_loader = DataLoader(
@@ -361,7 +416,7 @@ def run_imagefolder_training_workflow(
         _make_checkpoint_hook(request, ensure_checkpoint_metadata) if request.checkpoint_every is not None else None
     )
     training_result = run_training(
-        model, train_loader, val_loader, request.training_config, device="cpu", resume_state=resume_state,
+        model, train_loader, val_loader, request.training_config, device=request.device, resume_state=resume_state,
         progress_callback=progress_callback, should_stop=should_stop, checkpoint_hook=checkpoint_hook,
     )
     # checkpoint 저장에 쓸 RNG snapshot -- 이후 코드(TorchScript export의
@@ -416,8 +471,15 @@ def run_imagefolder_training_workflow(
     # class_mapping.json(위에서 저장)의 classes 순서가 confusion_matrix/
     # per_class_recall의 class index 순서와 동일하다는 계약을 위해, 여기서
     # 쓰는 num_classes도 그 순서를 만드는 len(splits.classes)를 그대로
-    # 재사용한다(295행의 require_matching_num_classes()가 이미 이 값과
+    # 재사용한다(위의 require_matching_num_classes() 호출이 이미 이 값과
     # model 출력 차원의 일치를 검증했으므로 여기서 다시 검증하지 않는다).
+    # Phase 4Q: 학습이 request.device(예: "cuda")에서 수행됐더라도 최종 test
+    # 평가는 의도적으로 항상 "cpu"를 그대로 쓴다(request.device를 여기로
+    # 전달하지 않는다) -- best_model은 build_model()로 새로 만들어져 항상
+    # CPU이고(위), TorchScriptExporter도 example_input을 강제로 CPU로
+    # 옮긴 뒤 model(example_input)을 호출하므로 model이 CPU가 아니면 export
+    # 단계에서 device mismatch가 난다. 이번 Phase는 "training device
+    # exposure"이지 "evaluation device exposure"가 아니다.
     test_loss, test_accuracy, test_metrics = evaluate_classification_metrics(
         best_model, test_loader, num_classes=len(splits.classes), device="cpu"
     )

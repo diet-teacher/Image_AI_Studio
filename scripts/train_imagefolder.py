@@ -164,6 +164,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="model/DataLoader 초기화 seed (resume 시에는 사실상 무시됨 -- 위 설명 참고)",
     )
     parser.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        help=(
+            "학습에 쓸 device -- 'cpu'(기본값), 'cuda', 'cuda:N'만 지원한다. "
+            "'cuda'/'cuda:N'은 CUDA가 실제로 사용 가능해야 하며, 사용 불가능하면 "
+            "CPU로 조용히 대체하지 않고 명확한 오류로 거부한다. 최종 test 평가/TorchScript "
+            "export는 이 값과 무관하게 항상 CPU에서 수행된다"
+        ),
+    )
+    parser.add_argument(
         "--export-torchscript",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -244,6 +255,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Output dir: {args.output_dir}")
         print(f"Resume from: {args.resume_from if args.resume_from is not None else '(none, fresh training)'}")
         print(f"Checkpoint out: {args.checkpoint_out if args.checkpoint_out is not None else '(none, not saved)'}")
+        print(f"Device: {args.device}")
 
         try:
             training_config = TrainingConfig(
@@ -271,6 +283,7 @@ def main(argv: list[str] | None = None) -> int:
                 export_torchscript=args.export_torchscript,
                 seed=args.seed,
                 checkpoint_every=args.checkpoint_every,
+                device=args.device,
             )
 
             # Phase 4K: 첫 번째 Ctrl+C를 cooperative stop request로 변환하는
