@@ -320,6 +320,98 @@ def test_require_compatible_resume_config_allows_label_smoothing_to_differ(
     require_compatible_resume_config(checkpoint_config, resume_config)  # raise 없이 통과해야 함
 
 
+# -- Phase 4P: class_weights ---------------------------------------------------
+
+
+def test_class_weights_defaults_to_none() -> None:
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3)
+    assert config.class_weights is None
+
+
+def test_accepts_positive_tuple_class_weights() -> None:
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, class_weights=(1.0, 2.0, 0.5))
+    assert config.class_weights == (1.0, 2.0, 0.5)
+
+
+def test_rejects_empty_class_weights() -> None:
+    with pytest.raises(TrainingConfigError, match="class_weights"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, class_weights=())
+
+
+def test_rejects_list_class_weights() -> None:
+    """공식 representation은 tuple뿐이다 -- list 등 다른 sequence는 명확히
+    거부한다(CLI 경계에서만 list -> tuple 변환이 일어나고, TrainingConfig
+    자체는 canonicalize하지 않는다)."""
+    with pytest.raises(TrainingConfigError, match="class_weights"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, class_weights=[1.0, 2.0])  # type: ignore[arg-type]
+
+
+def test_rejects_bool_element_in_class_weights() -> None:
+    with pytest.raises(TrainingConfigError, match="class_weights"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, class_weights=(1.0, True))  # type: ignore[arg-type]
+
+
+def test_rejects_zero_element_in_class_weights() -> None:
+    """all-zero/단일 zero weight 배치 조합이 PyTorch에서 NaN loss를 낼 수
+    있음을 직접 실측 확인했으므로(Phase 4P 설계), 0은 허용하지 않는다."""
+    with pytest.raises(TrainingConfigError, match="class_weights"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, class_weights=(1.0, 0.0))
+
+
+def test_rejects_negative_element_in_class_weights() -> None:
+    with pytest.raises(TrainingConfigError, match="class_weights"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, class_weights=(1.0, -2.0))
+
+
+@pytest.mark.parametrize("bad_weight", [float("nan"), float("inf"), float("-inf")])
+def test_rejects_non_finite_element_in_class_weights(bad_weight: float) -> None:
+    with pytest.raises(TrainingConfigError, match="class_weights"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, class_weights=(1.0, bad_weight))
+
+
+def test_class_weights_error_message_includes_index() -> None:
+    """오류 메시지에 잘못된 원소의 index가 드러나야 한다."""
+    with pytest.raises(TrainingConfigError, match=r"class_weights\[1\]"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, class_weights=(1.0, -2.0))
+
+
+def test_class_weights_is_not_a_resume_config_field() -> None:
+    """class_weights는 CrossEntropyLoss(weight=...) 생성자 인자일 뿐이고,
+    criterion은 checkpoint subsystem이 state를 저장/복원하지 않는 값이다
+    (label_smoothing/gradient_clip_norm과 동일한 근거) --
+    RESUME_CONFIG_FIELDS에 포함되지 않는다는 public contract를 직접
+    고정한다."""
+    assert "class_weights" not in RESUME_CONFIG_FIELDS
+
+
+@pytest.mark.parametrize(
+    ("saved_class_weights", "resume_class_weights"),
+    [(None, (1.0, 2.0)), ((1.0, 2.0), None), ((1.0, 2.0), (2.0, 1.0))],
+)
+def test_require_compatible_resume_config_allows_class_weights_to_differ(
+    saved_class_weights: tuple[float, ...] | None, resume_class_weights: tuple[float, ...] | None
+) -> None:
+    """class_weights는 resume 시 자유롭게 바꿀 수 있어야 한다(양방향,
+    None <-> tuple 전환 포함)."""
+    checkpoint_config = {
+        "optimizer": "adam",
+        "learning_rate": 1e-3,
+        "momentum": 0.9,
+        "weight_decay": 0.0,
+        "lr_scheduler": None,
+        "lr_scheduler_factor": 0.1,
+        "lr_scheduler_patience": 1,
+        "batch_size": 8,
+        # 참고 목적으로만 저장되고 비교에는 쓰이지 않는다 (RESUME_CONFIG_FIELDS 밖).
+        "class_weights": saved_class_weights,
+    }
+    resume_config = TrainingConfig(
+        epochs=1, batch_size=8, learning_rate=1e-3, class_weights=resume_class_weights
+    )
+
+    require_compatible_resume_config(checkpoint_config, resume_config)  # raise 없이 통과해야 함
+
+
 # -- Phase 4E: lr_scheduler ---------------------------------------------------
 
 

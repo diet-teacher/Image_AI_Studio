@@ -1046,6 +1046,88 @@ ROC-AUC/PR-AUC, CLI macro F1 출력, GPU/device 노출.
 
 ---
 
+## Phase 4P: Explicit Class-weighted CrossEntropy
+
+`TrainingConfig`에 `class_weights`를 추가하고, `_build_criterion()`
+(Phase 4N이 만든 확장점)이 `nn.CrossEntropyLoss(weight=..., label_smoothing=...)`
+를 생성하도록 확장했습니다. **사용자가 직접 지정하는 explicit weight만
+지원합니다** -- 자동(inverse-frequency 등) 계산이나 `WeightedRandomSampler`
+는 이번 Phase 범위 밖입니다(§ 아직 미지원 참고). class weighting은
+**training loss에만** 적용됩니다 -- validation/test loss와
+`ReduceLROnPlateau`/early stopping/best-model-selection/Phase 4O
+classification metrics의 의미는 기존 unweighted `nn.CrossEntropyLoss()`
+그대로 유지합니다(`evaluate()`, `evaluate_classification_metrics()`
+둘 다 이번 Phase에서 전혀 수정하지 않았습니다).
+
+* `TrainingConfig.class_weights: tuple[float, ...] | None = None` --
+  공식 representation은 **tuple뿐**입니다(list 등 다른 sequence는
+  `TrainingConfigError`로 거부). 각 원소는 finite + strictly positive
+  (`> 0`)여야 합니다 -- 0/음수/NaN/`+inf`/`-inf`는 전부 거부됩니다.
+  PyTorch의 `CrossEntropyLoss(weight=...)`는 이 값들을 constructor/forward
+  어디서도 검증하지 않고(실측 확인: 0/음수/NaN/inf 전부 조용히 통과,
+  all-zero 또는 한 배치가 우연히 zero-weight class 샘플로만 구성되면
+  `NaN` loss가 실제로 재현됨) 그 방어를 이 프로젝트가 대신합니다.
+* `scripts/train_imagefolder.py`에 `--class-weights FLOAT [FLOAT ...]`
+  (`nargs="+"`, 기본값 없음 = weighting 비활성) 플래그를 추가했습니다.
+  CLI boundary에서만 `tuple(args.class_weights)`로 canonicalize하며,
+  `TrainingConfig` 자체는 list를 자동 변환하지 않습니다.
+* **class 순서 계약**: `--class-weights`의 순서는 `class_mapping.json`의
+  `classes`/`class_to_idx` 순서와 반드시 일치해야 합니다(예:
+  `classes=["cat","dog"]`이면 `--class-weights 1.0 3.0`은 `cat=1.0,
+  dog=3.0`). `TrainingConfig`/generic training core에는 class 이름을
+  전혀 넣지 않습니다 -- Phase 4O가 확립한 generic core/ImageFolder
+  presentation 분리를 그대로 유지합니다.
+* **class 수 불일치 검증 범위(중요, 과장하지 않음)**: ImageFolder
+  workflow는 학습 시작 전에 `len(class_weights)`와 dataset의 실제 class
+  수(`len(splits.classes)`)가 일치하는지 명시적으로 검증합니다(기존
+  `require_matching_num_classes()`와 대칭적인 위치). 하지만 generic
+  `run_training()`/`TrainingConfig` 경로는 ModelSpec도 dataset도 몰라서
+  이 길이를 스스로 검증하지 않습니다 -- 그 경로에서 길이가 어긋나면
+  PyTorch `CrossEntropyLoss`의 forward-time `RuntimeError`(실측 확인된
+  shape 검증)가 최종 backstop입니다. **"class weight 길이는 항상
+  사전 검증된다"는 진술은 정확하지 않습니다** -- ImageFolder 경로에
+  한해서만 사전 검증됩니다.
+* **weight tensor의 dtype/device**: `_build_criterion(config, device)`가
+  `device` 위에 `torch.float32` dtype으로 직접 생성합니다(model/입력과
+  같은 device에 있어야 forward에서 device mismatch가 나지 않음).
+* **label smoothing과 조합 가능**: `class_weights`와 `label_smoothing`을
+  동시에 켤 수 있습니다(PyTorch가 이 조합을 제약 없이 지원함을 실측
+  확인). 기본 경로(`class_weights=None, label_smoothing=0.0`)의 기존
+  numerical anchor는 그대로 유지됩니다.
+* **resume 호환성**: `class_weights`는 `RESUME_CONFIG_FIELDS`에
+  **포함되지 않습니다** -- checkpoint에는 `training_config`를 통해
+  저장되지만 resume compatibility 비교 대상은 아니라서 resume 시
+  자유롭게 변경할 수 있습니다. 이 정책의 실제 근거를 정확히 표현하면:
+  **weight가 설정된 `CrossEntropyLoss`는 실제로 `weight` buffer를 가져
+  `state_dict()`가 비어있지 않습니다** -- "criterion의 state_dict가
+  항상 비어서"가 resume-free-change의 근거가 아닙니다. 진짜 근거는
+  `training/checkpoint.py`(checkpoint subsystem)가 criterion의 state
+  자체를 애초에 저장하지도 복원하지도 않기 때문입니다(`run_training()`
+  이 매번 config로 criterion을 새로 생성) -- optimizer/scheduler처럼
+  checkpoint에서 `load_state_dict()`로 복원되어 새 config 값을 조용히
+  덮어쓸 경로가 criterion에는 없습니다. Phase 4P 이전 checkpoint 파일에는
+  `class_weights` 키 자체가 없지만, `RESUME_CONFIG_FIELDS`에 없으므로
+  구조 검증/호환성 비교 어느 단계에서도 요구되지 않아 별도 legacy
+  migration이 필요 없습니다(Phase 4L의 `weight_decay` 문제와 다른
+  구조 -- 실제 checkpoint 파일 기반 회귀 테스트로 확인함).
+* **exact-resume**: 동일한 `class_weights`로 resume하면 기존 exact-resume
+  계약(model/optimizer/scheduler state, history, best state 등 tensor-level
+  일치)이 그대로 유지됩니다(weight tensor 생성은 RNG를 소비하지 않는
+  결정론적 연산).
+* CLI stdout은 무수정입니다 -- 상세 metric은 기존과 동일하게
+  `test_result.json`(Phase 4O)에서 확인합니다.
+
+이번 Phase에서 지원하지 않는 것: automatic(inverse-frequency 등) class
+weight 계산, `WeightedRandomSampler`/oversampling/undersampling,
+class-name 기반 weight 지정 문법(index/tuple 순서만 지원), zero/negative
+weight, validation/test weighting, Phase 4O metric 로직 변경, GPU/device
+CLI 노출, AMP, 추가 LR scheduler.
+
+설계 배경과 상세 계약은
+`docs/phase4p_class_weighted_cross_entropy_design.md`를 참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
@@ -1098,6 +1180,10 @@ ROC-AUC/PR-AUC, CLI macro F1 출력, GPU/device 노출.
 * ImageFolder 최종 test 평가에서 confusion matrix + per-class recall +
   macro precision/recall/F1을 계산해 `test_result.json`에 저장(test-only,
   validation/`TrainingHistory`/checkpoint 무영향) (Phase 4O)
+* `--class-weights`(class별 명시적 explicit weight, tuple, 0보다 큰 유한한
+  값만 허용, training loss에만 적용, label smoothing과 조합 가능) --
+  마찬가지로 checkpoint에는 저장되지만 resume compatibility 비교 대상은
+  아니라서 resume 시 자유롭게 변경 가능 (Phase 4P)
 * TorchScript 배포, C++(LibTorch) CPU/CUDA 추론
 * Python/C++ parity 검증 (Phase 0~4E 배포 경로; Phase 4F는 export/parity
   코드를 변경하지 않았고, 기존 parity E2E를 재실행해 회귀 없음을 확인함
@@ -1115,16 +1201,20 @@ ROC-AUC/PR-AUC, CLI macro F1 출력, GPU/device 노출.
 * dataset registry/factory를 통한 통합 연동 (CIFAR-10과 `ImageFolder`가
   각각 별도 함수로 연결되어 있고, 둘을 묶는 공통 factory/registry는
   아직 없음), Oxford-IIIT Pet 등 다른 dataset의 실제 연동
-* class imbalance 처리, weighted sampler
+* class imbalance 자동 처리 -- explicit class weight(사용자가 직접 지정)는
+  Phase 4P에서 지원하지만, automatic(inverse-frequency 등) 계산과
+  `WeightedRandomSampler`/oversampling/undersampling은 미지원(위 "Phase 4P"
+  절 참고), class-name 기반 weight 지정 문법도 미지원(index/tuple 순서만)
 * validation epoch별 상세 classification metric(confusion matrix 등 --
   test 평가에서만 지원, 위 "Phase 4O" 절 참고), metric 기반 early
   stopping/scheduler, per-class precision/F1 노출, micro/weighted
   average, ROC-AUC/PR-AUC, top-k accuracy, specificity, CLI에 macro
   F1 등 상세 지표 출력(상세 지표는 `test_result.json` 파일로만 제공)
 * loss function 종류 선택(CrossEntropyLoss 고정 -- BCE/multilabel/
-  focal loss/class weight/custom loss/regression loss는 미지원, label
-  smoothing 계수만 Phase 4N에서 지원), validation/test 시의 label
-  smoothing(항상 unsmoothed), Adam betas/eps, SGD dampening/nesterov,
+  focal loss/custom loss/regression loss는 미지원, label smoothing
+  계수는 Phase 4N에서, class별 explicit weight는 Phase 4P에서 지원),
+  validation/test 시의 label smoothing/class weighting(항상
+  unsmoothed/unweighted), Adam betas/eps, SGD dampening/nesterov,
   `"plateau"` 외 LR scheduler(StepLR/CosineAnnealingLR 등), scheduler
   threshold/cooldown/min_lr, gradient value clipping, custom gradient
   `norm_type`, `error_if_nonfinite` 노출, gradient norm history/metric

@@ -304,6 +304,22 @@ def run_imagefolder_training_workflow(
     splits = make_imagefolder_datasets(model_spec.input_shape, root=request.dataset_root)
     require_matching_num_classes(len(splits.classes), final_shape)
 
+    # Phase 4P: class_weights가 설정돼 있으면 dataset의 실제 class 수와 길이가
+    # 일치하는지 여기서 조기 검증한다(require_matching_num_classes()와 대칭적인
+    # 위치/스타일) -- generic run_training()/TrainingConfig는 class 이름도
+    # dataset도 모르므로 이 검증을 할 수 없고(PyTorch CrossEntropyLoss의
+    # forward-time shape 검증이 그 경로의 backstop), ImageFolder workflow는
+    # 이미 splits.classes를 알고 있으므로 학습을 시작하기 전에 명확한 에러로
+    # 거부할 수 있는 유일한 지점이다.
+    if request.training_config.class_weights is not None and len(
+        request.training_config.class_weights
+    ) != len(splits.classes):
+        raise ValueError(
+            f"class_weights has {len(request.training_config.class_weights)} value(s) but dataset has "
+            f"{len(splits.classes)} classes {splits.classes} -- class_weights order must match "
+            "class_mapping.json's classes/class_to_idx order"
+        )
+
     # metadata_ready/ensure_checkpoint_metadata는 이 workflow 호출 하나당
     # 정확히 한 번 만들어지는 closure 상태다 -- scheduled checkpoint_hook과
     # 아래의 학습 종료 후 최종 저장이 이 하나를 함께 공유해서, metadata

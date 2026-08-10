@@ -10,7 +10,11 @@ Phase 4L부터 optimizer에 AdamW가 추가되고, weight_decay(Adam/SGD/AdamW
 Phase 4N부터 label smoothing(label_smoothing)을 선택할 수 있다 --
 training loss에만 적용되고(loop.py의 evaluate()는 항상 unsmoothed
 CrossEntropyLoss를 쓴다), gradient_clip_norm과 동일한 이유로
-RESUME_CONFIG_FIELDS에 포함되지 않는다."""
+RESUME_CONFIG_FIELDS에 포함되지 않는다. Phase 4P부터 class별 명시적
+weight(class_weights)를 선택할 수 있다 -- label_smoothing과 마찬가지로
+training loss(CrossEntropyLoss(weight=...))에만 적용되고, criterion은
+매번 config로 새로 생성될 뿐 checkpoint subsystem이 그 state를 저장/
+복원하지 않으므로 RESUME_CONFIG_FIELDS에 포함되지 않는다."""
 from __future__ import annotations
 
 import math
@@ -125,6 +129,29 @@ def _require_positive_finite_float(name: str, value: object) -> None:
         raise TrainingConfigError(f"'{name}' must be a finite positive number, got {value!r}")
 
 
+def _require_class_weights(name: str, value: object) -> None:
+    """class_weights 전용 검증(Phase 4P) -- None(비활성)이 아니면 반드시
+    tuple이어야 하고(공식 representation, list 등 다른 sequence는 거부 --
+    canonicalization은 CLI 경계의 책임이지 이 dataclass의 책임이 아니다),
+    비어 있지 않아야 하며, 각 원소는 finite + strictly positive(0 이하/
+    NaN/+-inf 거부)여야 한다. PyTorch CrossEntropyLoss(weight=...)는 이
+    값들을 constructor/forward 어디서도 검증하지 않고(0/음수/NaN/inf
+    전부 조용히 통과시켜 NaN loss나 잘못된 부호의 finite loss를 낼 수
+    있음을 직접 실측 확인함), 그 방어를 이 helper가 대신한다."""
+    if not isinstance(value, tuple):
+        raise TrainingConfigError(f"'{name}' must be a tuple of positive numbers or None, got {value!r}")
+    if len(value) == 0:
+        raise TrainingConfigError(f"'{name}' must not be empty, got {value!r}")
+    for index, element in enumerate(value):
+        if (
+            not isinstance(element, (int, float))
+            or isinstance(element, bool)
+            or not math.isfinite(float(element))
+            or float(element) <= 0.0
+        ):
+            raise TrainingConfigError(f"'{name}[{index}]' must be a finite positive number, got {element!r}")
+
+
 @dataclass
 class TrainingConfig:
     """epochs/batch_size/learning_rate는 필수. optimizer/scheduler/early
@@ -142,6 +169,8 @@ class TrainingConfig:
     gradient_clip_norm: float | None = None  # None => clipping 비활성화 (Phase 4M)
 
     label_smoothing: float = 0.0  # [0.0, 1.0], training loss에만 적용 (Phase 4N)
+
+    class_weights: tuple[float, ...] | None = None  # class별 명시적 weight, training loss에만 적용 (Phase 4P)
 
     lr_scheduler: str | None = None  # None | "plateau"
     lr_scheduler_factor: float = 0.1  # lr_scheduler="plateau"일 때만 사용
@@ -168,6 +197,9 @@ class TrainingConfig:
 
         # optimizer/scheduler와 무관하게 항상 검증 (momentum/weight_decay와 같은 이유).
         _require_closed_unit_interval("label_smoothing", self.label_smoothing)
+
+        if self.class_weights is not None:
+            _require_class_weights("class_weights", self.class_weights)
 
         if self.lr_scheduler is not None:
             _require_one_of("lr_scheduler", self.lr_scheduler, LR_SCHEDULER_CHOICES)

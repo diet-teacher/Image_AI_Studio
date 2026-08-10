@@ -832,6 +832,124 @@ def test_label_smoothing_invalid_value_fails_cleanly(tmp_path: Path, capsys) -> 
     assert "label_smoothing" in stderr
 
 
+# -- Phase 4P: --class-weights -------------------------------------------------
+
+
+def test_class_weights_forwards_exact_tuple_to_workflow_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, "cli_class_weights_forward_model")
+
+    captured: dict = {}
+
+    def fake_workflow(request, *, progress_callback=None, should_stop=None):
+        captured["request"] = request
+        history = TrainingHistory(
+            train_losses=[0.5], val_losses=[0.5], val_accuracies=[0.5],
+            best_epoch=1, best_val_loss=0.5,
+        )
+        return ImageFolderWorkflowResult(
+            history=history,
+            test_loss=0.5,
+            test_accuracy=0.5,
+            best_model_state_dict_path=tmp_path / "best_model_state_dict.pt",
+            training_history_path=tmp_path / "training_history.json",
+            class_mapping_path=tmp_path / "class_mapping.json",
+            test_result_path=tmp_path / "test_result.json",
+            checkpoint_path=None,
+            checkpoint_metadata_path=None,
+            torchscript_model_path=None,
+            torchscript_metadata_path=None,
+        )
+
+    monkeypatch.setattr(cli, "run_imagefolder_training_workflow", fake_workflow)
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "1",
+            "--batch-size", "4",
+            "--class-weights", "1.0", "2.5",
+            "--no-export-torchscript",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["request"].training_config.class_weights == (1.0, 2.5)
+    assert isinstance(captured["request"].training_config.class_weights, tuple)
+
+
+def test_class_weights_defaults_to_none_when_flag_omitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, "cli_class_weights_default_model")
+
+    captured: dict = {}
+
+    def fake_workflow(request, *, progress_callback=None, should_stop=None):
+        captured["request"] = request
+        history = TrainingHistory(
+            train_losses=[0.5], val_losses=[0.5], val_accuracies=[0.5],
+            best_epoch=1, best_val_loss=0.5,
+        )
+        return ImageFolderWorkflowResult(
+            history=history,
+            test_loss=0.5,
+            test_accuracy=0.5,
+            best_model_state_dict_path=tmp_path / "best_model_state_dict.pt",
+            training_history_path=tmp_path / "training_history.json",
+            class_mapping_path=tmp_path / "class_mapping.json",
+            test_result_path=tmp_path / "test_result.json",
+            checkpoint_path=None,
+            checkpoint_metadata_path=None,
+            torchscript_model_path=None,
+            torchscript_metadata_path=None,
+        )
+
+    monkeypatch.setattr(cli, "run_imagefolder_training_workflow", fake_workflow)
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "1",
+            "--batch-size", "4",
+            "--no-export-torchscript",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["request"].training_config.class_weights is None
+
+
+def test_class_weights_invalid_value_fails_cleanly(tmp_path: Path, capsys) -> None:
+    """--class-weights 1.0 0.0는 argparse가 아니라
+    TrainingConfig.__post_init__(_require_class_weights)에서 거부된다 --
+    main()의 기존 TrainingConfigError -> exit code 1 경로를 그대로 탄다."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, "cli_class_weights_invalid_model")
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "1",
+            "--class-weights", "1.0", "0.0",
+            "--no-export-torchscript",
+        ]
+    )
+
+    assert exit_code == 1
+    stderr = capsys.readouterr().err
+    assert "class_weights" in stderr
+
+
 # -- Phase 4K: Graceful SIGINT and Cooperative Training Stop ------------------
 #
 # docs/phase4k_graceful_interruption_design.md 기준. 실제 OS signal은 전혀

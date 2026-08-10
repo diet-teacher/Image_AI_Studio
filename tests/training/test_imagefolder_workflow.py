@@ -655,9 +655,9 @@ def test_workflow_forwards_label_smoothing_to_criterion(tmp_path: Path, monkeypa
     calls: list[float] = []
     from image_ai_studio.training.loop import _build_criterion as real_build_criterion
 
-    def spy_build_criterion(config: TrainingConfig):
+    def spy_build_criterion(config: TrainingConfig, device: str = "cpu"):
         calls.append(config.label_smoothing)
-        return real_build_criterion(config)
+        return real_build_criterion(config, device=device)
 
     monkeypatch.setattr("image_ai_studio.training.loop._build_criterion", spy_build_criterion)
 
@@ -675,6 +675,63 @@ def test_workflow_forwards_label_smoothing_to_criterion(tmp_path: Path, monkeypa
     run_imagefolder_training_workflow(request)
 
     assert calls == [0.3]
+
+
+def test_workflow_trains_successfully_with_matching_class_weights_length(tmp_path: Path) -> None:
+    """dataset class 수(cat/dog=2)와 class_weights 길이가 일치하면 정상
+    학습된다(Phase 4P)."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(
+            epochs=1, batch_size=4, learning_rate=1e-2, class_weights=(1.0, 2.0)
+        ),
+        output_dir=tmp_path / "out",
+        export_torchscript=False,
+        seed=SEED,
+    )
+
+    result = run_imagefolder_training_workflow(request)
+
+    assert len(result.history.train_losses) == 1
+
+
+def test_workflow_rejects_class_weights_length_mismatch_before_training_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """dataset은 class 2개(cat/dog)인데 class_weights가 1개뿐이면, 실제
+    학습(run_training)이 시작되기 전에 명확한 에러로 거부돼야 한다.
+    run_training()을 monkeypatch해 절대 호출되지 않음을 직접 증명한다 --
+    "에러가 난다"는 것만으로는 그 에러가 학습을 실제로 시작한 뒤(예: 첫
+    optimizer step 도중 PyTorch RuntimeError)에 난 것인지, 시작 전
+    조기 검증에서 난 것인지 구분되지 않는다."""
+    called = {"value": False}
+
+    def fail_if_called(*args, **kwargs):
+        called["value"] = True
+        raise AssertionError("run_training() must not be called when class_weights length mismatches")
+
+    monkeypatch.setattr("image_ai_studio.training.imagefolder_workflow.run_training", fail_if_called)
+
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(
+            epochs=1, batch_size=4, learning_rate=1e-2, class_weights=(1.0,)
+        ),
+        output_dir=tmp_path / "out",
+        export_torchscript=False,
+        seed=SEED,
+    )
+
+    with pytest.raises(ValueError, match="class_weights"):
+        run_imagefolder_training_workflow(request)
+
+    assert called["value"] is False
 
 
 def test_workflow_forwards_should_stop_and_stops_training_early(tmp_path: Path) -> None:

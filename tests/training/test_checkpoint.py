@@ -556,6 +556,66 @@ def test_checkpoint_file_with_weight_decay_present_still_checks_it_normally(tmp_
     require_compatible_resume_config(payload["training_config"], matching_resume_config)  # raise 없이 통과해야 함
 
 
+# -- Phase 4P: class_weights -- legacy checkpoint(키 자체가 없음) 회귀 --------
+#
+# class_weights는 weight_decay와 달리 RESUME_CONFIG_FIELDS에 아예 들어있지
+# 않으므로(RESUME_CONFIG_LEGACY_DEFAULTS에 넣을 필요 자체가 없음), Phase 4L의
+# "예외를 두지 않으면 legacy checkpoint가 구조 검증 단계에서부터 거부된다"는
+# 문제가 애초에 발생할 수 없다는 것을 실제 checkpoint 파일 경로로 직접
+# 확인한다 -- weight_decay 회귀 테스트와 동일한 패턴(가짜 dict가 아니라 실제
+# 저장된 파일에서 키를 지운다).
+
+
+def _strip_class_weights_from_saved_checkpoint(checkpoint_path: Path) -> None:
+    payload = torch.load(checkpoint_path, weights_only=True)
+    del payload["training_config"]["class_weights"]
+    torch.save(payload, checkpoint_path)
+
+
+def test_load_training_checkpoint_accepts_legacy_file_missing_class_weights(tmp_path: Path) -> None:
+    """Phase 4P 이전 checkpoint 파일에는 class_weights 키가 아예 없다 --
+    class_weights는 RESUME_CONFIG_FIELDS에 없으므로 load_training_checkpoint()의
+    구조적 필수 필드 목록에도 없다. 이 파일을 정상 로드해야 한다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+    checkpoint_path, _, _ = _run_and_save_checkpoint(tmp_path, config)
+    _strip_class_weights_from_saved_checkpoint(checkpoint_path)
+
+    payload = load_training_checkpoint(checkpoint_path)  # 실패하면 안 됨
+
+    assert "class_weights" not in payload["training_config"]
+
+
+def test_legacy_checkpoint_file_missing_class_weights_resumes_regardless_of_new_value(tmp_path: Path) -> None:
+    """class_weights 키가 없는 실제 checkpoint 파일이더라도, 새 resume
+    config의 class_weights 값(None이든 tuple이든)과 무관하게 resume 호환성
+    검사를 통과해야 한다 -- class_weights는 애초에 비교 대상(RESUME_CONFIG_FIELDS)이
+    아니므로 weight_decay 같은 legacy-default 예외 자체가 필요 없다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+    checkpoint_path, _, _ = _run_and_save_checkpoint(tmp_path, config)
+    _strip_class_weights_from_saved_checkpoint(checkpoint_path)
+    payload = load_training_checkpoint(checkpoint_path)
+
+    resume_config_without_weights = TrainingConfig(epochs=5, batch_size=8, learning_rate=1e-2)
+    require_compatible_resume_config(payload["training_config"], resume_config_without_weights)
+
+    resume_config_with_weights = TrainingConfig(
+        epochs=5, batch_size=8, learning_rate=1e-2, class_weights=(1.0, 2.0, 0.5, 3.0)
+    )
+    require_compatible_resume_config(payload["training_config"], resume_config_with_weights)
+
+
+def test_checkpoint_round_trips_class_weights_when_set(tmp_path: Path) -> None:
+    """class_weights가 설정된 정상 checkpoint는 저장된 값을 그대로
+    round-trip해야 한다(단순 asdict() 자동 반영 확인, 별도 직렬화 로직
+    없음)."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2, class_weights=(1.0, 2.0, 0.5, 3.0))
+    checkpoint_path, _, _ = _run_and_save_checkpoint(tmp_path, config)
+
+    payload = load_training_checkpoint(checkpoint_path)
+
+    assert payload["training_config"]["class_weights"] == (1.0, 2.0, 0.5, 3.0)
+
+
 # -- Phase 4J: atomic save -----------------------------------------------------
 
 

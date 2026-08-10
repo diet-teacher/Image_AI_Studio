@@ -1450,9 +1450,9 @@ def test_run_training_uses_new_label_smoothing_after_resume(monkeypatch: pytest.
     calls: list[float] = []
     real_build_criterion = _build_criterion
 
-    def spy_build_criterion(config: TrainingConfig) -> nn.Module:
+    def spy_build_criterion(config: TrainingConfig, device: str = "cpu") -> nn.Module:
         calls.append(config.label_smoothing)
-        return real_build_criterion(config)
+        return real_build_criterion(config, device=device)
 
     monkeypatch.setattr("image_ai_studio.training.loop._build_criterion", spy_build_criterion)
 
@@ -1497,6 +1497,267 @@ def test_run_training_resume_matches_continuous_run_exactly_with_label_smoothing
 
     config_kwargs = dict(
         batch_size=8, learning_rate=1e-2, optimizer="sgd", momentum=0.9, label_smoothing=0.3,
+        lr_scheduler="plateau", lr_scheduler_factor=0.5, lr_scheduler_patience=1,
+    )
+
+    # (a) 연속 5 epoch
+    torch.manual_seed(seed)
+    model_a = build_model(spec)
+    train_loader_a, val_loader_a, _ = make_loaders()
+    torch.manual_seed(seed)
+    result_a = run_training(model_a, train_loader_a, val_loader_a, TrainingConfig(epochs=5, **config_kwargs))
+
+    # (b) 3 epoch 실행
+    torch.manual_seed(seed)
+    model_b = build_model(spec)
+    train_loader_b, val_loader_b, generator_b = make_loaders()
+    torch.manual_seed(seed)
+    first_config = TrainingConfig(epochs=3, **config_kwargs)
+    result_b1 = run_training(model_b, train_loader_b, val_loader_b, first_config)
+
+    loader_generator_state = generator_b.get_state().clone()
+    cpu_rng_state = torch.get_rng_state().clone()
+    resume_state = _make_resume_state(result_b1, first_config)
+
+    model_b2 = build_model(spec)
+    model_b2.load_state_dict(model_b.state_dict())
+    train_dataset2, val_dataset2 = make_train_val_datasets(
+        spec.input_shape, NUM_CLASSES, seed=seed, train_size=32, val_size=16
+    )
+    restored_generator = torch.Generator()
+    restored_generator.set_state(loader_generator_state)
+    train_loader_b2 = DataLoader(
+        train_dataset2, batch_size=8, shuffle=True, generator=restored_generator, drop_last=True
+    )
+    val_loader_b2 = DataLoader(val_dataset2, batch_size=8, shuffle=False)
+    torch.set_rng_state(cpu_rng_state)
+
+    result_b2 = run_training(
+        model_b2, train_loader_b2, val_loader_b2, TrainingConfig(epochs=2, **config_kwargs),
+        resume_state=resume_state,
+    )
+
+    assert result_b2.history.train_losses == result_a.history.train_losses
+    assert result_b2.history.val_losses == result_a.history.val_losses
+    assert result_b2.history.val_accuracies == result_a.history.val_accuracies
+    assert result_b2.history.best_epoch == result_a.history.best_epoch
+    assert result_b2.history.best_val_loss == result_a.history.best_val_loss
+    assert result_b2.epochs_without_improvement == result_a.epochs_without_improvement
+
+    for name, tensor in model_a.state_dict().items():
+        assert torch.equal(tensor, model_b2.state_dict()[name])
+    for name, tensor in result_a.best_state_dict.items():
+        assert torch.equal(tensor, result_b2.best_state_dict[name])
+
+    _assert_deep_equal(result_a.optimizer_state_dict, result_b2.optimizer_state_dict)
+    _assert_deep_equal(result_a.scheduler_state_dict, result_b2.scheduler_state_dict)
+
+
+# -- Phase 4P: class_weights ---------------------------------------------------
+
+
+def test_build_criterion_default_class_weights_matches_plain_cross_entropy_loss() -> None:
+    """class_weights=None(기본값)이면 인자 없는 nn.CrossEntropyLoss()와
+    bitwise 동일해야 한다 -- 기존 동작을 완전히 재현한다는 회귀 계약."""
+    torch.manual_seed(0)
+    logits = torch.randn(4, NUM_CLASSES)
+    targets = torch.randint(0, NUM_CLASSES, (4,))
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3)
+
+    criterion = _build_criterion(config)
+
+    assert criterion.weight is None
+    assert torch.equal(criterion(logits, targets), nn.CrossEntropyLoss()(logits, targets))
+
+
+def test_build_criterion_applies_class_weights_matching_pytorch_reference() -> None:
+    """하드코딩된 magic number가 아니라 PyTorch reference 구현
+    (nn.CrossEntropyLoss(weight=torch.tensor(...)))과 직접 비교한다."""
+    torch.manual_seed(0)
+    logits = torch.randn(4, NUM_CLASSES)
+    targets = torch.randint(0, NUM_CLASSES, (4,))
+    weights = (1.0, 2.0, 0.5, 3.0)
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, class_weights=weights)
+
+    criterion = _build_criterion(config)
+
+    reference = nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float32))
+    assert torch.equal(criterion(logits, targets), reference(logits, targets))
+
+
+def test_build_criterion_class_weights_changes_loss_value() -> None:
+    """class_weights가 실제로 unweighted CE와 다른 값을 낸다는 대조군.
+
+    random fixture 대신 손으로 구성한 deterministic 값을 쓴다 -- weighted
+    CrossEntropyLoss의 기본 reduction="mean"은 각 샘플의 loss를 그 샘플의
+    target class weight로 가중 평균하므로(weight 합으로 정규화), batch의
+    모든 샘플이 우연히 같은 per-sample loss를 내면 weight를 아무리
+    비대칭으로 줘도 weighted/unweighted 평균이 같아질 수 있다(동일한 값의
+    가중 평균은 weight와 무관하게 그 값 자체이므로). 이 fixture는 두
+    샘플의 target class(0, 1)가 서로 다른 per-sample loss를 내도록
+    logits를 직접 골라(target 0은 다른 클래스보다 훨씬 큰 logit을 가져
+    loss가 작고, target 1은 그렇지 않아 loss가 큼) class 1에 훨씬 큰
+    weight(4.0)를 줬다 -- 어떤 seed가 나오든 항상 이 두 값이 다르다는
+    것을 보장한다(random RNG에 의존하지 않음)."""
+    logits = torch.tensor(
+        [
+            [3.0, 0.0, 0.0, 0.0],  # target 0: 다른 클래스보다 logit이 훨씬 커서 loss가 작음
+            [2.0, 1.0, 0.0, 0.0],  # target 1: 1등 클래스가 아니라서 loss가 상대적으로 큼
+        ]
+    )
+    targets = torch.tensor([0, 1])
+    # class 1(loss가 큰 샘플의 target)에 훨씬 큰 weight를 줘, weighted 평균이
+    # unweighted 평균(단순 산술 평균)보다 명확히 커지도록 만든다.
+    weights = (1.0, 4.0, 1.0, 1.0)
+
+    unweighted = _build_criterion(TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3))
+    weighted = _build_criterion(
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, class_weights=weights)
+    )
+
+    assert not torch.equal(unweighted(logits, targets), weighted(logits, targets))
+
+
+def test_build_criterion_weight_tensor_dtype_and_device() -> None:
+    """weight tensor의 dtype은 항상 float32로 고정되고(PyTorch가 정수 dtype을
+    거부함을 실측 확인), device는 _build_criterion()에 전달한 device와
+    일치해야 한다. GPU가 CI에 없다고 CPU 검증을 생략하지 않는다 -- 여기서는
+    CPU 경로만 검증하고 GPU는 필수로 요구하지 않는다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, class_weights=(1.0, 2.0))
+
+    criterion = _build_criterion(config, device="cpu")
+
+    assert criterion.weight.dtype == torch.float32
+    assert criterion.weight.device.type == "cpu"
+    assert torch.equal(criterion.weight, torch.tensor([1.0, 2.0], dtype=torch.float32))
+
+
+def test_build_criterion_class_weights_and_label_smoothing_combination_matches_pytorch_reference() -> None:
+    """weight+label_smoothing 조합이 PyTorch reference와 정확히 일치해야
+    한다(둘의 조합을 PyTorch가 제약 없이 지원함을 실측 확인)."""
+    torch.manual_seed(0)
+    logits = torch.randn(4, NUM_CLASSES)
+    targets = torch.randint(0, NUM_CLASSES, (4,))
+    weights = (1.0, 2.0, 0.5, 3.0)
+    config = TrainingConfig(
+        epochs=1, batch_size=8, learning_rate=1e-3, class_weights=weights, label_smoothing=0.1
+    )
+
+    criterion = _build_criterion(config)
+
+    reference = nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float32), label_smoothing=0.1)
+    assert torch.equal(criterion(logits, targets), reference(logits, targets))
+
+
+def test_run_training_passes_class_weights_criterion_to_train_one_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """run_training()이 _build_criterion(config, device)로 만든 weighted
+    criterion을 실제로 train_one_epoch()에 전달하는지 직접 고정한다
+    (Phase 4N의 동일 목적 테스트와 같은 이유 -- criterion factory가 옳고
+    train_one_epoch()가 넘겨받은 criterion을 쓴다는 것만으로는 그 사이를
+    잇는 한 줄이 production 코드에서 실수로 빠지는 회귀를 잡지 못한다)."""
+    captured: dict = {}
+
+    def fake_train_one_epoch(model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None):
+        captured["criterion"] = criterion
+        return 0.5
+
+    monkeypatch.setattr("image_ai_studio.training.loop.train_one_epoch", fake_train_one_epoch)
+    monkeypatch.setattr(
+        "image_ai_studio.training.loop.evaluate",
+        lambda model, loader, device="cpu": (0.5, 0.5),
+    )
+
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    weights = (1.0, 2.0, 0.5, 3.0)
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2, class_weights=weights)
+
+    run_training(model, train_loader, val_loader, config)
+
+    assert captured["criterion"] is not None
+    assert torch.equal(captured["criterion"].weight, torch.tensor(weights, dtype=torch.float32))
+
+
+def test_run_training_evaluate_ignores_class_weights() -> None:
+    """class_weights를 써서 학습해도 run_training()이 history에 기록하는
+    val_loss/val_accuracy는 (수정되지 않은) evaluate()를 그대로 호출한
+    결과와 정확히 일치해야 한다 -- label_smoothing과 동일한 검증 목적."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(
+        epochs=1, batch_size=8, learning_rate=1e-2, class_weights=(1.0, 2.0, 0.5, 3.0)
+    )
+
+    result = run_training(model, train_loader, val_loader, config)
+    expected_val_loss, expected_val_accuracy = evaluate(model, val_loader)
+
+    assert result.history.val_losses[-1] == expected_val_loss
+    assert result.history.val_accuracies[-1] == expected_val_accuracy
+
+
+def test_run_training_uses_new_class_weights_after_resume(monkeypatch: pytest.MonkeyPatch) -> None:
+    """resume 시 class_weights를 바꾸면, 실제로 resume된 구간에서 새 값으로
+    만든 criterion이 쓰이는지 확인한다 -- compatibility 통과만으로는 새
+    값이 실제 적용된다는 것을 증명하지 못하므로 _build_criterion() 호출을
+    spy로 감싼다."""
+    calls: list[tuple[float, ...] | None] = []
+    real_build_criterion = _build_criterion
+
+    def spy_build_criterion(config: TrainingConfig, device: str = "cpu") -> nn.Module:
+        calls.append(config.class_weights)
+        return real_build_criterion(config, device=device)
+
+    monkeypatch.setattr("image_ai_studio.training.loop._build_criterion", spy_build_criterion)
+
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    first_config = TrainingConfig(
+        epochs=1, batch_size=8, learning_rate=1e-2, class_weights=(1.0, 2.0, 0.5, 3.0)
+    )
+    first = run_training(model, train_loader, val_loader, first_config)
+
+    assert calls == [(1.0, 2.0, 0.5, 3.0)]
+
+    second_config = TrainingConfig(
+        epochs=1, batch_size=8, learning_rate=1e-2, class_weights=(3.0, 0.5, 2.0, 1.0)
+    )
+    run_training(
+        model, train_loader, val_loader, second_config,
+        resume_state=_make_resume_state(first, first_config),
+    )
+
+    assert calls == [(1.0, 2.0, 0.5, 3.0), (3.0, 0.5, 2.0, 1.0)]
+
+
+def test_run_training_resume_matches_continuous_run_exactly_with_class_weights() -> None:
+    """Phase 4P: class_weights != None에서도 exact-resume 계약이 깨지지
+    않아야 한다(weight tensor 생성은 RNG를 소비하지 않는 결정론적 연산이므로
+    tensor-level exact equality를 기대한다). continuous run과 resume run
+    양쪽에 동일한 class_weights 값을 쓴다 -- resume 도중 값을 바꾸는
+    케이스는 별도 spy 테스트(위)가 담당한다."""
+    seed = 20260810
+    spec = _dropout_mlp_classifier_spec()
+
+    def make_loaders() -> tuple[DataLoader, DataLoader, torch.Generator]:
+        train_dataset, val_dataset = make_train_val_datasets(
+            spec.input_shape, NUM_CLASSES, seed=seed, train_size=32, val_size=16
+        )
+        generator = torch.Generator().manual_seed(seed)
+        train_loader = DataLoader(
+            train_dataset, batch_size=8, shuffle=True, generator=generator, drop_last=True
+        )
+        val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
+        return train_loader, val_loader, generator
+
+    config_kwargs = dict(
+        batch_size=8, learning_rate=1e-2, optimizer="sgd", momentum=0.9,
+        class_weights=(1.0, 2.0, 0.5, 3.0),
         lr_scheduler="plateau", lr_scheduler_factor=0.5, lr_scheduler_patience=1,
     )
 
