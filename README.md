@@ -957,6 +957,95 @@ loss, regression loss, `loss` 이름 선택 필드, reduction/ignore_index
 
 ---
 
+## Phase 4O: Test Classification Metrics
+
+ImageFolder 학습의 **최종 test 평가에서만** confusion matrix + per-class
+recall + macro precision/recall/F1을 계산해 `test_result.json`에
+추가했습니다(test-only). 학습 루프의 validation 경로가 쓰는 `evaluate()`,
+`TrainingHistory`, checkpoint/resume, config는 이번 Phase에서 전혀
+수정하지 않았습니다.
+
+* 신규 `src/image_ai_studio/training/metrics.py`: `ClassificationMetrics`
+  dataclass(`confusion_matrix`, `per_class_recall`, `macro_precision`,
+  `macro_recall`, `macro_f1`)와 confusion matrix tensor로부터 이 값들을
+  파생 계산하는 순수 함수 `compute_classification_metrics()`. 모델
+  forward/DataLoader 순회는 이 모듈에 없습니다(순수 계산만).
+* 신규 `loop.py::evaluate_classification_metrics(model, loader,
+  num_classes, device="cpu") -> (loss, accuracy, ClassificationMetrics)`:
+  기존 `evaluate()`와 동일한 의미(unsmoothed `CrossEntropyLoss`, argmax
+  accuracy, sample-weighted 평균)로 loss/accuracy를 계산하면서, 같은 한
+  번의 forward pass 안에서 confusion matrix도 배치 단위로 누적합니다 --
+  같은 test 데이터셋을 두 번 순회하지 않습니다. `evaluate()` 자체는
+  무수정이며 계속 validation 경로에서만 쓰입니다.
+* confusion matrix 컨벤션(고정): `confusion_matrix[true_idx][predicted_idx]`
+  -- row=실제 클래스, column=예측 클래스, shape `[num_classes,
+  num_classes]`. class 이름은 이 dataclass에 담지 않습니다 -- generic
+  training core는 class 이름 개념 자체가 없고(ImageFolder 전용 계층에만
+  존재), index 순서는 기존 `class_mapping.json`의 `classes` 배열 순서와
+  동일하다는 계약으로 대신합니다(`test_result.json`에 class 이름을
+  복제해서 넣지 않습니다).
+* `per_class_recall`(이름 주의: "per-class accuracy"라 부르지 않습니다 --
+  class별 accuracy는 정의상 recall과 동일합니다), `macro_precision`,
+  `macro_recall`, `macro_f1`을 계산합니다. **`macro_f1`은 class별 F1을
+  먼저 구한 뒤 평균한 값**입니다 -- `harmonic_mean(macro_precision,
+  macro_recall)`이 아닙니다.
+* zero-division 정책(고정): 분모(해당 class의 true/predicted sample 수)가
+  0이면 그 class의 지표는 `0.0`입니다. **`0.0`이 항상 "모델이 그 class를
+  전부 틀렸다"는 뜻은 아닙니다** -- 특히 test set에 해당 class의 true
+  sample 자체가 없으면 `recall=0.0`은 "측정할 sample이 없어 정책상
+  0.0을 기록했다"는 뜻입니다. 함께 저장되는 confusion matrix의 해당
+  row/column 합이 0인지 봐서 이 두 경우를 구별할 수 있습니다(별도
+  support/count 필드는 추가하지 않았습니다).
+* `test_result.json` 스키마(additive, nested): 기존 `test_loss`/
+  `test_accuracy` top-level key는 그대로 유지하고, `classification_metrics`
+  키 아래에 위 5개 필드를 nested로 추가했습니다. schema version 필드는
+  추가하지 않았습니다.
+  ```json
+  {
+    "test_loss": 0.42,
+    "test_accuracy": 0.88,
+    "classification_metrics": {
+      "confusion_matrix": [[45, 5], [7, 43]],
+      "per_class_recall": [0.9, 0.86],
+      "macro_precision": 0.87,
+      "macro_recall": 0.88,
+      "macro_f1": 0.875
+    }
+  }
+  ```
+* `ImageFolderWorkflowResult`에 `test_metrics: ClassificationMetrics |
+  None = None` 필드를 **기본값과 함께 마지막 필드로** 추가했습니다 --
+  기존에 이 dataclass를 `test_metrics` 없이 직접 생성하던 코드(기존
+  테스트의 manual/fake constructor 호출)는 그대로 동작합니다.
+  `run_imagefolder_training_workflow()`가 정상 완료해 반환하는 production
+  결과의 `test_metrics`는 항상 실제 `ClassificationMetrics`입니다 --
+  `None`은 constructor 하위호환 전용이지 production에서 test 평가가
+  생략될 수 있다는 뜻이 아닙니다. 기존 `result.test_loss`/
+  `result.test_accuracy` 필드는 변경 없이 그대로 유지됩니다.
+* sklearn 등 신규 dependency를 추가하지 않았습니다 -- confusion
+  matrix/파생 지표는 전부 torch/Python으로 직접 계산합니다(기존
+  `dependencies = ["torch>=2.4", "numpy"]` 그대로).
+* `scripts/train_imagefolder.py`의 stdout은 변경하지 않았습니다(기존
+  `Test: loss=... accuracy=...` 한 줄 그대로) -- 상세 지표는
+  `test_result.json`에서 확인합니다.
+* `TrainingHistory`/`checkpoint.py`/`config.py`는 이번 Phase에서
+  전혀 수정하지 않았습니다. `RESUME_CONFIG_FIELDS`,
+  `RESUME_CONFIG_LEGACY_DEFAULTS`, checkpoint format version, exact
+  resume 전부 무영향입니다(metric 계산은 `evaluate()`와 마찬가지로
+  `model.eval()` + `torch.inference_mode()`에서 순수 forward pass만
+  수행하므로 gradient/RNG 소비가 없습니다).
+
+이번 Phase에서 지원하지 않는 것(§33 그대로): validation epoch별 상세
+metric, `TrainingHistory`의 metric 필드, metric 기반 early
+stopping/scheduler, class weight, BCE/focal loss, per-class
+precision/F1 노출, micro/weighted average, sklearn dependency,
+ROC-AUC/PR-AUC, CLI macro F1 출력, GPU/device 노출.
+
+설계 배경과 상세 계약은 `docs/phase4o_evaluation_metrics_design.md`를
+참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
@@ -1006,6 +1095,9 @@ loss, regression loss, `loss` 이름 선택 필드, reduction/ignore_index
 * `--label-smoothing`(`[0.0, 1.0]`, 기본값 0.0), training loss에만
   적용 -- 마찬가지로 checkpoint에는 저장되지만 resume compatibility
   비교 대상은 아니라서 resume 시 자유롭게 변경 가능 (Phase 4N)
+* ImageFolder 최종 test 평가에서 confusion matrix + per-class recall +
+  macro precision/recall/F1을 계산해 `test_result.json`에 저장(test-only,
+  validation/`TrainingHistory`/checkpoint 무영향) (Phase 4O)
 * TorchScript 배포, C++(LibTorch) CPU/CUDA 추론
 * Python/C++ parity 검증 (Phase 0~4E 배포 경로; Phase 4F는 export/parity
   코드를 변경하지 않았고, 기존 parity E2E를 재실행해 회귀 없음을 확인함
@@ -1024,6 +1116,11 @@ loss, regression loss, `loss` 이름 선택 필드, reduction/ignore_index
   각각 별도 함수로 연결되어 있고, 둘을 묶는 공통 factory/registry는
   아직 없음), Oxford-IIIT Pet 등 다른 dataset의 실제 연동
 * class imbalance 처리, weighted sampler
+* validation epoch별 상세 classification metric(confusion matrix 등 --
+  test 평가에서만 지원, 위 "Phase 4O" 절 참고), metric 기반 early
+  stopping/scheduler, per-class precision/F1 노출, micro/weighted
+  average, ROC-AUC/PR-AUC, top-k accuracy, specificity, CLI에 macro
+  F1 등 상세 지표 출력(상세 지표는 `test_result.json` 파일로만 제공)
 * loss function 종류 선택(CrossEntropyLoss 고정 -- BCE/multilabel/
   focal loss/class weight/custom loss/regression loss는 미지원, label
   smoothing 계수만 Phase 4N에서 지원), validation/test 시의 label

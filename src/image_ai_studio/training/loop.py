@@ -14,6 +14,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from image_ai_studio.training.config import TrainingConfig, require_compatible_resume_config
+from image_ai_studio.training.metrics import ClassificationMetrics, compute_classification_metrics
 
 
 def _build_optimizer(model: nn.Module, config: TrainingConfig) -> torch.optim.Optimizer:
@@ -125,6 +126,70 @@ def evaluate(model: nn.Module, loader: DataLoader, device: str = "cpu") -> tuple
         raise ValueError("evaluate: loader produced no samples (empty DataLoader)")
 
     return total_loss / total_samples, total_correct / total_samples
+
+
+def evaluate_classification_metrics(
+    model: nn.Module,
+    loader: DataLoader,
+    num_classes: int,
+    device: str = "cpu",
+) -> tuple[float, float, ClassificationMetrics]:
+    """evaluate()와 같은 의미의 (loss, accuracy)를 계산하면서, 같은 forward
+    pass 안에서 confusion matrix도 배치 단위로 함께 누적해 상세
+    classification metric까지 반환한다(Phase 4O). loss/accuracy 계산 방식
+    (unsmoothed CrossEntropyLoss, argmax accuracy, sample-weighted 평균)은
+    evaluate()와 정확히 동일하다 -- 이 함수는 evaluate()를 대체하지 않는다
+    (evaluate()는 무수정이며 training-loop validation 경로가 계속 그대로
+    쓴다); confusion matrix까지 필요한 소비자(현재는 ImageFolder 최종 test
+    평가)가 이 함수를 대신 쓴다. 같은 데이터셋을 evaluate()로 한 번, 이
+    함수로 또 한 번 -- 두 번 순회하지 않도록, loss/accuracy/confusion
+    matrix를 전부 이 함수 하나의 순회에서 함께 계산한다.
+
+    confusion matrix 누적 tensor는 `device` 위에 그대로 두고 배치마다
+    더한다 -- GPU 평가 시에도 배치마다 CPU로 옮기는 동기화 없이 텐서
+    상에서만 누적한다. evaluation이 끝난 뒤 `[num_classes, num_classes]`
+    matrix 하나를 `compute_classification_metrics()`가 딱 한 번만 CPU로
+    옮겨 상세 metric을 계산한다(그 함수 내부에서 class별 `.item()`을
+    반복하므로, 매 배치가 아니라 여기서 한 번만 옮겨야 반복 GPU
+    synchronization을 피할 수 있다). empty loader 정책은 evaluate()와
+    동일하게 ValueError."""
+    if num_classes <= 0:
+        raise ValueError(
+            f"evaluate_classification_metrics: num_classes must be a positive integer, got {num_classes!r}"
+        )
+
+    model.eval()
+    criterion = nn.CrossEntropyLoss()
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+    confusion_matrix = torch.zeros((num_classes, num_classes), dtype=torch.long, device=device)
+
+    with torch.inference_mode():
+        for images, labels in loader:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            predictions = outputs.argmax(dim=1)
+
+            total_loss += loss.item() * images.size(0)
+            total_correct += (predictions == labels).sum().item()
+            total_samples += images.size(0)
+
+            indices = labels * num_classes + predictions
+            confusion_matrix += torch.bincount(indices, minlength=num_classes * num_classes).reshape(
+                num_classes, num_classes
+            )
+
+    if total_samples == 0:
+        raise ValueError("evaluate_classification_metrics: loader produced no samples (empty DataLoader)")
+
+    avg_loss = total_loss / total_samples
+    accuracy = total_correct / total_samples
+    metrics = compute_classification_metrics(confusion_matrix)
+    return avg_loss, accuracy, metrics
 
 
 @dataclass

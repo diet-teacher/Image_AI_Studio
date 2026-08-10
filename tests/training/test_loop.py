@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import asdict
 
 import pytest
@@ -27,6 +28,7 @@ from image_ai_studio.training.loop import (
     _build_optimizer,
     _build_scheduler,
     evaluate,
+    evaluate_classification_metrics,
     run_training,
     train_one_epoch,
 )
@@ -121,6 +123,118 @@ def test_evaluate_raises_on_empty_loader() -> None:
 
     with pytest.raises(ValueError, match="empty DataLoader"):
         evaluate(model, empty_loader)
+
+
+# -- evaluate_classification_metrics() (Phase 4O) -----------------------------
+#
+# evaluate()의 기존 단위 테스트(위)를 복제하지 않는다 -- evaluate() 자체는
+# 이 Phase에서 무수정이므로 그 테스트들은 그대로 유효하다. 여기서는
+# evaluate_classification_metrics()가 evaluate()와 다르게 새로 제공하는
+# 부분(confusion matrix 기반 상세 metric)과, evaluate()와 반드시 같아야
+# 하는 부분(loss/accuracy의 의미)만 검증한다.
+
+
+def test_evaluate_classification_metrics_matches_evaluate_loss_and_accuracy() -> None:
+    """evaluate_classification_metrics()의 (loss, accuracy)가 같은
+    model/loader에 대한 기존 evaluate()의 반환값과 정확히 일치해야 한다 --
+    두 함수가 같은 의미(unsmoothed CrossEntropyLoss, argmax accuracy,
+    sample-weighted 평균)를 계산한다는 계약을 고정한다."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    _, val_loader = _make_loaders(spec, seed=0)
+
+    expected_loss, expected_accuracy = evaluate(model, val_loader)
+    loss, accuracy, _metrics = evaluate_classification_metrics(model, val_loader, num_classes=NUM_CLASSES)
+
+    assert loss == pytest.approx(expected_loss)
+    assert accuracy == pytest.approx(expected_accuracy)
+
+
+def test_evaluate_classification_metrics_accuracy_matches_confusion_matrix_diagonal() -> None:
+    """accuracy == sum(diagonal(confusion_matrix)) / sum(confusion_matrix) --
+    accuracy와 confusion matrix가 같은 예측 결과로부터 계산됐음을 보장하는
+    핵심 회귀 계약(§16/§21)."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    _, val_loader = _make_loaders(spec, seed=0)
+
+    _loss, accuracy, metrics = evaluate_classification_metrics(model, val_loader, num_classes=NUM_CLASSES)
+
+    cm = torch.tensor(metrics.confusion_matrix)
+    diagonal_sum = cm.diagonal().sum().item()
+    total = cm.sum().item()
+    assert diagonal_sum / total == pytest.approx(accuracy)
+
+
+def test_evaluate_classification_metrics_returns_expected_shapes() -> None:
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    _, val_loader = _make_loaders(spec, seed=0)
+
+    _loss, _accuracy, metrics = evaluate_classification_metrics(model, val_loader, num_classes=NUM_CLASSES)
+
+    assert len(metrics.confusion_matrix) == NUM_CLASSES
+    assert all(len(row) == NUM_CLASSES for row in metrics.confusion_matrix)
+    assert len(metrics.per_class_recall) == NUM_CLASSES
+    assert isinstance(metrics.macro_precision, float)
+    assert isinstance(metrics.macro_recall, float)
+    assert isinstance(metrics.macro_f1, float)
+
+
+def test_evaluate_classification_metrics_metrics_are_finite() -> None:
+    """zero-division=0.0 정책 덕분에 모든 지표가 항상 finite여야 한다(NaN/
+    +-inf 없음, §28) -- json.dumps()의 비표준 NaN 허용에 의존하지 않는다."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    _, val_loader = _make_loaders(spec, seed=0)
+
+    _loss, _accuracy, metrics = evaluate_classification_metrics(model, val_loader, num_classes=NUM_CLASSES)
+
+    assert all(math.isfinite(value) for row in metrics.confusion_matrix for value in row)
+    assert all(math.isfinite(value) for value in metrics.per_class_recall)
+    assert math.isfinite(metrics.macro_precision)
+    assert math.isfinite(metrics.macro_recall)
+    assert math.isfinite(metrics.macro_f1)
+
+
+def test_evaluate_classification_metrics_does_not_change_parameters() -> None:
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    _, val_loader = _make_loaders(spec, seed=0)
+
+    before = copy.deepcopy(model.state_dict())
+    evaluate_classification_metrics(model, val_loader, num_classes=NUM_CLASSES)
+    after = model.state_dict()
+
+    assert all(torch.equal(before[name], after[name]) for name in before)
+
+
+def test_evaluate_classification_metrics_raises_on_empty_loader() -> None:
+    """evaluate()와 동일한 empty-loader 정책(ValueError) -- zero-division으로
+    조용히 0 loss/accuracy를 반환하지 않는다."""
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    empty_loader = DataLoader(
+        TensorDataset(torch.empty(0, *spec.input_shape), torch.empty(0, dtype=torch.long)), batch_size=8
+    )
+
+    with pytest.raises(ValueError, match="empty DataLoader"):
+        evaluate_classification_metrics(model, empty_loader, num_classes=NUM_CLASSES)
+
+
+@pytest.mark.parametrize("invalid_num_classes", [0, -1])
+def test_evaluate_classification_metrics_rejects_non_positive_num_classes(invalid_num_classes: int) -> None:
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    _, val_loader = _make_loaders(spec, seed=0)
+
+    with pytest.raises(ValueError, match="num_classes"):
+        evaluate_classification_metrics(model, val_loader, num_classes=invalid_num_classes)
 
 
 def test_run_training_reduces_training_loss() -> None:

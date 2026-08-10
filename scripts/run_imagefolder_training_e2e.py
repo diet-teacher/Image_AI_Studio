@@ -209,6 +209,30 @@ def main(argv: list[str] | None = None) -> int:
         print("\nIMAGEFOLDER TRAINING E2E: FAIL")
         return 1
 
+    # Phase 4O: test_result.json에 classification_metrics(confusion matrix +
+    # macro precision/recall/F1)가 실제 production artifact로 기록되는지,
+    # 그리고 accuracy와 confusion matrix diagonal이 일치하는지(§16/§21 회귀
+    # 계약) end-to-end로 확인한다.
+    print("Classification metrics check:")
+    test_result = json.loads(result.test_result_path.read_text())
+    metrics = test_result.get("classification_metrics")
+    num_classes = len(splits.classes)
+    metrics_ok = (
+        metrics is not None
+        and len(metrics["confusion_matrix"]) == num_classes
+        and all(len(row) == num_classes for row in metrics["confusion_matrix"])
+        and len(metrics["per_class_recall"]) == num_classes
+    )
+    if metrics_ok:
+        diagonal_sum = sum(metrics["confusion_matrix"][i][i] for i in range(num_classes))
+        total = sum(sum(row) for row in metrics["confusion_matrix"])
+        accuracy_matches = total > 0 and abs(diagonal_sum / total - result.test_accuracy) < 1e-9
+        metrics_ok = metrics_ok and accuracy_matches
+    print("  PASS" if metrics_ok else "  FAIL: classification_metrics missing/malformed or accuracy mismatch")
+    if not metrics_ok:
+        print("\nIMAGEFOLDER TRAINING E2E: FAIL")
+        return 1
+
     if result.torchscript_model_path is None:
         print("TorchScript export: FAIL (workflow did not produce a TorchScript artifact)")
         print("\nIMAGEFOLDER TRAINING E2E: FAIL")

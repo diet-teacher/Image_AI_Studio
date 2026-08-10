@@ -31,13 +31,14 @@ from image_ai_studio.training.imagefolder_resume import (
 )
 from image_ai_studio.training.imagefolder_workflow import (
     ImageFolderWorkflowRequest,
+    ImageFolderWorkflowResult,
     _is_in_place_resume,
     _normalized_path,
     _validate_checkpoint_every,
     _validate_checkpoint_output_paths,
     run_imagefolder_training_workflow,
 )
-from image_ai_studio.training.loop import run_training
+from image_ai_studio.training.loop import TrainingHistory, run_training
 from image_ai_studio.training.torchvision_dataset import make_imagefolder_datasets
 
 INPUT_SHAPE = (3, 8, 8)
@@ -250,6 +251,122 @@ def test_best_model_evaluation_and_test_result_json(tmp_path: Path) -> None:
     on_disk = json.loads(result.test_result_path.read_text())
     assert on_disk["test_loss"] == result.test_loss
     assert on_disk["test_accuracy"] == result.test_accuracy
+
+
+# -- classification metrics / test_result.json 확장 (Phase 4O) ---------------
+
+
+def test_production_result_has_classification_metrics(tmp_path: Path) -> None:
+    """run_imagefolder_training_workflow()가 정상 완료한 production 결과는
+    test_metrics가 항상 실제 ClassificationMetrics다(None이 아니다) --
+    dataclass의 default=None은 constructor 하위호환 전용이라는 계약(§17)을
+    실제 production 경로로 확인한다."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+
+    request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path / "out",
+        export_torchscript=False,
+        seed=SEED,
+    )
+    result = run_imagefolder_training_workflow(request)
+
+    assert result.test_metrics is not None
+    num_classes = 2  # _spec()의 마지막 LinearSpec(out_features=2), cat/dog
+    assert len(result.test_metrics.confusion_matrix) == num_classes
+    assert all(len(row) == num_classes for row in result.test_metrics.confusion_matrix)
+    assert len(result.test_metrics.per_class_recall) == num_classes
+    assert isinstance(result.test_metrics.macro_precision, float)
+    assert isinstance(result.test_metrics.macro_recall, float)
+    assert isinstance(result.test_metrics.macro_f1, float)
+
+    # test_result.json도 기존 top-level key(test_loss/test_accuracy)는 유지한
+    # 채 nested classification_metrics를 추가로 담아야 한다(§18, additive).
+    on_disk = json.loads(result.test_result_path.read_text())
+    assert on_disk["test_loss"] == result.test_loss
+    assert on_disk["test_accuracy"] == result.test_accuracy
+    assert on_disk["classification_metrics"]["confusion_matrix"] == result.test_metrics.confusion_matrix
+    assert on_disk["classification_metrics"]["per_class_recall"] == pytest.approx(
+        result.test_metrics.per_class_recall
+    )
+    assert on_disk["classification_metrics"]["macro_precision"] == pytest.approx(
+        result.test_metrics.macro_precision
+    )
+    assert on_disk["classification_metrics"]["macro_recall"] == pytest.approx(result.test_metrics.macro_recall)
+    assert on_disk["classification_metrics"]["macro_f1"] == pytest.approx(result.test_metrics.macro_f1)
+
+    # confusion matrix는 JSON에서도 정수로 남아야 한다(부동소수로 뭉개지지 않음).
+    for row in on_disk["classification_metrics"]["confusion_matrix"]:
+        for value in row:
+            assert isinstance(value, int)
+
+
+def test_classification_metrics_class_index_order_matches_class_mapping(tmp_path: Path) -> None:
+    """confusion_matrix/per_class_recall의 class index 순서가 실제로
+    class_mapping.json의 classes 순서와 일치하는지를, class별 test sample
+    개수를 서로 다르게 만들어 관찰 가능한 방식으로 검증한다(§26 -- shape만
+    보고 order가 맞다고 주장하지 않는다). test split의 class별 sample 수를
+    cat=6, dog=2로 비대칭으로 만들면, confusion matrix의 row별 합(=해당
+    true class의 test sample 수)이 어느 class_mapping index가 cat/dog인지를
+    직접 드러낸다."""
+    for split, count_per_class in (("train", 4), ("val", 4)):
+        _make_split(tmp_path, split, count_per_class)
+    # test split만 cat/dog 개수를 다르게 만든다.
+    cat_dir = tmp_path / "test" / "cat"
+    dog_dir = tmp_path / "test" / "dog"
+    cat_dir.mkdir(parents=True)
+    dog_dir.mkdir(parents=True)
+    for i in range(6):
+        Image.new("RGB", (20, 20), color=(250, 250, 250)).save(cat_dir / f"{i}.png")
+    for i in range(2):
+        Image.new("RGB", (20, 20), color=(5, 5, 5)).save(dog_dir / f"{i}.png")
+
+    model_json_path = _write_model_json(tmp_path, _spec())
+    request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+        output_dir=tmp_path / "out",
+        export_torchscript=False,
+        seed=SEED,
+    )
+    result = run_imagefolder_training_workflow(request)
+
+    class_mapping = json.loads(result.class_mapping_path.read_text())
+    assert class_mapping["classes"] == ["cat", "dog"]  # ImageFolder는 알파벳순 정렬
+    cat_idx = class_mapping["class_to_idx"]["cat"]
+    dog_idx = class_mapping["class_to_idx"]["dog"]
+
+    cm = result.test_metrics.confusion_matrix
+    cat_row_support = sum(cm[cat_idx])
+    dog_row_support = sum(cm[dog_idx])
+
+    assert cat_row_support == 6
+    assert dog_row_support == 2
+
+
+def test_imagefolder_workflow_result_constructor_backward_compatible() -> None:
+    """test_metrics 없이 ImageFolderWorkflowResult(...)를 직접 생성하던
+    기존 코드(테스트의 manual/fake constructor 호출)가 이번 Phase 이후에도
+    그대로 성공하고, 그 경우 test_metrics는 backward-compat 전용 기본값
+    None이어야 한다(§17/§27)."""
+    result = ImageFolderWorkflowResult(
+        history=TrainingHistory(),
+        test_loss=0.5,
+        test_accuracy=0.9,
+        best_model_state_dict_path=Path("best.pt"),
+        training_history_path=Path("history.json"),
+        class_mapping_path=Path("class_mapping.json"),
+        test_result_path=Path("test_result.json"),
+        checkpoint_path=None,
+        checkpoint_metadata_path=None,
+        torchscript_model_path=None,
+        torchscript_metadata_path=None,
+    )
+    assert result.test_metrics is None
 
 
 # -- resume exactness ---------------------------------------------------------

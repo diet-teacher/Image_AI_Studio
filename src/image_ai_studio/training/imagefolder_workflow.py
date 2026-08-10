@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -60,9 +60,10 @@ from image_ai_studio.training.loop import (
     TrainingProgressCallback,
     TrainingResult,
     TrainingResumeState,
-    evaluate,
+    evaluate_classification_metrics,
     run_training,
 )
+from image_ai_studio.training.metrics import ClassificationMetrics
 from image_ai_studio.training.torchvision_dataset import (
     ImageFolderSplits,
     make_imagefolder_datasets,
@@ -116,6 +117,15 @@ class ImageFolderWorkflowResult:
     checkpoint_metadata_path: Path | None
     torchscript_model_path: Path | None
     torchscript_metadata_path: Path | None
+    # Phase 4O: 최종 test 평가의 confusion matrix/macro precision/recall/F1
+    # (test-only, validation/TrainingHistory/checkpoint는 무수정). 기본값
+    # None은 "test 평가가 생략될 수 있다"는 뜻이 아니라, 이 dataclass를
+    # 이 필드 없이 직접 생성하던 기존 코드(테스트의 manual/fake
+    # constructor 호출)와의 생성자 하위호환을 위한 것이다 -- 마지막 필드로
+    # 둬야 그 앞의 필드들이 여전히 기본값 없이 위치/키워드 인자로 채워질
+    # 수 있다. `run_imagefolder_training_workflow()`가 정상 완료해 반환하는
+    # production 결과의 test_metrics는 항상 실제 ClassificationMetrics다.
+    test_metrics: ClassificationMetrics | None = None
 
 
 def _set_seed(seed: int) -> None:
@@ -387,10 +397,25 @@ def run_imagefolder_training_workflow(
     best_model_state_dict_path = output_dir / "best_model_state_dict.pt"
     save_state_dict(best_model, best_model_state_dict_path)
 
-    test_loss, test_accuracy = evaluate(best_model, test_loader, device="cpu")
+    # class_mapping.json(위에서 저장)의 classes 순서가 confusion_matrix/
+    # per_class_recall의 class index 순서와 동일하다는 계약을 위해, 여기서
+    # 쓰는 num_classes도 그 순서를 만드는 len(splits.classes)를 그대로
+    # 재사용한다(295행의 require_matching_num_classes()가 이미 이 값과
+    # model 출력 차원의 일치를 검증했으므로 여기서 다시 검증하지 않는다).
+    test_loss, test_accuracy, test_metrics = evaluate_classification_metrics(
+        best_model, test_loader, num_classes=len(splits.classes), device="cpu"
+    )
     test_result_path = output_dir / "test_result.json"
     test_result_path.write_text(
-        json.dumps({"test_loss": test_loss, "test_accuracy": test_accuracy}, indent=2), encoding="utf-8"
+        json.dumps(
+            {
+                "test_loss": test_loss,
+                "test_accuracy": test_accuracy,
+                "classification_metrics": asdict(test_metrics),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
     )
 
     torchscript_model_path: Path | None = None
@@ -434,4 +459,5 @@ def run_imagefolder_training_workflow(
         checkpoint_metadata_path=checkpoint_metadata_path,
         torchscript_model_path=torchscript_model_path,
         torchscript_metadata_path=torchscript_metadata_path,
+        test_metrics=test_metrics,
     )
