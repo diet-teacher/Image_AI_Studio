@@ -16,6 +16,8 @@ from PIL import Image
 from image_ai_studio.model_definition.builder import build_model
 from image_ai_studio.model_definition.serialization import save_model_spec
 from image_ai_studio.model_definition.specs import (
+    BatchNorm2dSpec,
+    Conv2dSpec,
     DropoutSpec,
     FlattenSpec,
     LinearSpec,
@@ -32,8 +34,11 @@ from image_ai_studio.training.imagefolder_resume import (
 from image_ai_studio.training.imagefolder_workflow import (
     ImageFolderWorkflowRequest,
     ImageFolderWorkflowResult,
+    _capture_cuda_rng_state,
+    _cuda_deterministic_context,
     _is_in_place_resume,
     _normalized_path,
+    _restore_cuda_rng_state,
     _validate_checkpoint_every,
     _validate_checkpoint_output_paths,
     _validate_device,
@@ -1647,3 +1652,335 @@ def test_workflow_resume_from_cpu_checkpoint_on_cuda_completes(tmp_path: Path) -
     )
 
     assert len(result.history.train_losses) == 2
+
+
+# -- Phase 4R: same-device CUDA exact resume -----------------------------------
+
+
+def _conv_bn_dropout_spec(name: str = "conv_bn_dropout_test_model") -> ModelSpec:
+    """Conv2d+BatchNorm2d+Dropout fixture(Phase 4R). Dropout-only MLP
+    fixture(위 _spec())로는 CUDA convolution backward의 비결정성을
+    검증할 수 없다 -- 조사 라운드에서 실측한 대로 Conv2d/BatchNorm이
+    있어야 deterministic algorithm 적용 여부가 실제로 결과에 영향을
+    준다."""
+    return ModelSpec(
+        name=name,
+        input_shape=INPUT_SHAPE,
+        layers=[
+            Conv2dSpec(out_channels=4, kernel_size=3, stride=1, padding=1),
+            BatchNorm2dSpec(),
+            ReLUSpec(),
+            FlattenSpec(),
+            DropoutSpec(p=0.3),
+            LinearSpec(out_features=2),
+        ],
+    )
+
+
+def _assert_deep_equal(a: object, b: object, path: str = "value") -> None:
+    """optimizer/scheduler state_dict처럼 텐서와 스칼라가 섞인 중첩
+    dict/list를 재귀적으로 정확히 비교하는 테스트 전용 헬퍼(test_loop.py
+    의 동일 이름 helper와 같은 목적, 이 파일에서 독립적으로 재사용)."""
+    if isinstance(a, torch.Tensor):
+        assert torch.equal(a, b), f"tensor mismatch at {path}"
+    elif isinstance(a, dict):
+        assert a.keys() == b.keys(), f"dict keys mismatch at {path}: {a.keys()} != {b.keys()}"
+        for key in a:
+            _assert_deep_equal(a[key], b[key], f"{path}.{key}")
+    elif isinstance(a, (list, tuple)):
+        assert len(a) == len(b), f"length mismatch at {path}"
+        for index, (x, y) in enumerate(zip(a, b)):
+            _assert_deep_equal(x, y, f"{path}[{index}]")
+    else:
+        assert a == b, f"value mismatch at {path}: {a!r} != {b!r}"
+
+
+def test_cuda_deterministic_context_disabled_does_not_touch_global_state() -> None:
+    """enabled=False(CPU training)면 4개 process-global deterministic
+    상태(algorithms enabled/warn_only/cudnn.deterministic/cudnn.benchmark)
+    를 전혀 읽거나 쓰지 않는다 -- sentinel 값을 그대로 유지해야 한다."""
+    original_algorithms = torch.are_deterministic_algorithms_enabled()
+    original_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    original_cudnn_deterministic = torch.backends.cudnn.deterministic
+    original_cudnn_benchmark = torch.backends.cudnn.benchmark
+    try:
+        torch.use_deterministic_algorithms(False, warn_only=True)
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True  # non-default sentinel
+
+        with _cuda_deterministic_context(enabled=False):
+            assert torch.are_deterministic_algorithms_enabled() is False
+            assert torch.is_deterministic_algorithms_warn_only_enabled() is True
+            assert torch.backends.cudnn.deterministic is False
+            assert torch.backends.cudnn.benchmark is True
+
+        assert torch.are_deterministic_algorithms_enabled() is False
+        assert torch.is_deterministic_algorithms_warn_only_enabled() is True
+        assert torch.backends.cudnn.deterministic is False
+        assert torch.backends.cudnn.benchmark is True
+    finally:
+        # 테스트 자신이 sentinel로 바꾼 값을 원래 프로세스 상태로 복원해
+        # 다른 테스트를 오염시키지 않는다(production contract가 아니라
+        # 순수 테스트 isolation 책임).
+        torch.use_deterministic_algorithms(original_algorithms, warn_only=original_warn_only)
+        torch.backends.cudnn.deterministic = original_cudnn_deterministic
+        torch.backends.cudnn.benchmark = original_cudnn_benchmark
+
+
+def test_cuda_deterministic_context_restores_state_on_normal_exit() -> None:
+    """enabled=True로 정상 종료하면 진입 전 sentinel 값(warn_only 포함
+    4개 process-global 상태)이 정확히 복원돼야 한다. context 내부에서는
+    warn_only=False가 강제 적용되지만, 종료 후에는 진입 전 warn_only=True
+    로 되돌아와야 한다(context의 내부 정책과 caller 상태 복원은 별개).
+    deterministic 관련 flag들은 CUDA 하드웨어 없이도 설정/조회 가능하므로
+    GPU 없는 CI에서도 이 테스트를 실행할 수 있다."""
+    original_algorithms = torch.are_deterministic_algorithms_enabled()
+    original_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    original_cudnn_deterministic = torch.backends.cudnn.deterministic
+    original_cudnn_benchmark = torch.backends.cudnn.benchmark
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True  # non-default sentinel
+
+        with _cuda_deterministic_context(enabled=True):
+            assert torch.are_deterministic_algorithms_enabled() is True
+            assert torch.is_deterministic_algorithms_warn_only_enabled() is False
+            assert torch.backends.cudnn.deterministic is True
+            assert torch.backends.cudnn.benchmark is False
+
+        assert torch.are_deterministic_algorithms_enabled() is True
+        assert torch.is_deterministic_algorithms_warn_only_enabled() is True
+        assert torch.backends.cudnn.deterministic is False
+        assert torch.backends.cudnn.benchmark is True
+    finally:
+        torch.use_deterministic_algorithms(original_algorithms, warn_only=original_warn_only)
+        torch.backends.cudnn.deterministic = original_cudnn_deterministic
+        torch.backends.cudnn.benchmark = original_cudnn_benchmark
+
+
+def test_cuda_deterministic_context_restores_state_on_exception() -> None:
+    """context 안에서 예외가 나도(OOM/unsupported deterministic op 등을
+    흉내낸 임의의 RuntimeError) finally가 warn_only를 포함한 4개
+    process-global 상태를 정확히 복원해야 한다 -- caller의 전역 상태가
+    오염되면 안 된다."""
+    original_algorithms = torch.are_deterministic_algorithms_enabled()
+    original_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    original_cudnn_deterministic = torch.backends.cudnn.deterministic
+    original_cudnn_benchmark = torch.backends.cudnn.benchmark
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True  # non-default sentinel
+
+        with pytest.raises(RuntimeError, match="simulated failure"):
+            with _cuda_deterministic_context(enabled=True):
+                assert torch.are_deterministic_algorithms_enabled() is True
+                assert torch.is_deterministic_algorithms_warn_only_enabled() is False
+                raise RuntimeError("simulated failure mid-training")
+
+        assert torch.are_deterministic_algorithms_enabled() is True
+        assert torch.is_deterministic_algorithms_warn_only_enabled() is True
+        assert torch.backends.cudnn.deterministic is False
+        assert torch.backends.cudnn.benchmark is True
+    finally:
+        torch.use_deterministic_algorithms(original_algorithms, warn_only=original_warn_only)
+        torch.backends.cudnn.deterministic = original_cudnn_deterministic
+        torch.backends.cudnn.benchmark = original_cudnn_benchmark
+
+
+def test_capture_and_restore_cuda_rng_state_are_noop_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """device="cpu"면 _capture_cuda_rng_state()/_restore_cuda_rng_state()
+    가 torch.cuda.get_rng_state()/set_rng_state()를 절대 호출하지 않는다
+    -- 호출되면 실패하도록 monkeypatch해 직접 증명한다."""
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("torch.cuda.*_rng_state must not be called for device='cpu'")
+
+    monkeypatch.setattr(torch.cuda, "get_rng_state", fail_if_called)
+    monkeypatch.setattr(torch.cuda, "set_rng_state", fail_if_called)
+
+    assert _capture_cuda_rng_state("cpu") is None
+    _restore_cuda_rng_state(None, "cpu")  # raise 없이 통과해야 함
+    _restore_cuda_rng_state(torch.tensor([1, 2, 3], dtype=torch.uint8), "cpu")  # state가 있어도 device="cpu"면 무시
+
+
+def test_workflow_cpu_path_never_calls_cuda_rng_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """production CPU workflow(fresh + resume) 전체 경로에서
+    torch.cuda.get_rng_state()/set_rng_state()가 한 번도 호출되지 않음을
+    monkeypatch로 직접 증명한다."""
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("torch.cuda.*_rng_state must not be called on the CPU workflow path")
+
+    monkeypatch.setattr(torch.cuda, "get_rng_state", fail_if_called)
+    monkeypatch.setattr(torch.cuda, "set_rng_state", fail_if_called)
+
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    checkpoint_path = tmp_path / "checkpoint.pt"
+
+    run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+            output_dir=tmp_path / "fresh",
+            checkpoint_out=checkpoint_path,
+            export_torchscript=False,
+            seed=SEED,
+            device="cpu",
+        )
+    )
+    result = run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+            output_dir=tmp_path / "resume",
+            resume_from=checkpoint_path,
+            checkpoint_out=checkpoint_path,
+            export_torchscript=False,
+            seed=SEED,
+            device="cpu",
+        )
+    )
+
+    assert len(result.history.train_losses) == 2
+
+
+def test_workflow_cpu_training_does_not_alter_deterministic_global_state(tmp_path: Path) -> None:
+    """production CPU workflow 실행 전후로 deterministic 관련 4개
+    process-global 상태(algorithms enabled/warn_only/cudnn.deterministic/
+    cudnn.benchmark)가 완전히 그대로여야 한다 -- CPU 경로는 Phase 4R의
+    scoped context를 아예 활성화하지 않으므로 이 값들을 건드릴 이유가
+    없다."""
+    original_algorithms = torch.are_deterministic_algorithms_enabled()
+    original_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    original_cudnn_deterministic = torch.backends.cudnn.deterministic
+    original_cudnn_benchmark = torch.backends.cudnn.benchmark
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = True  # non-default sentinel 조합
+
+        _make_standard_dataset(tmp_path)
+        model_json_path = _write_model_json(tmp_path, _spec())
+        run_imagefolder_training_workflow(
+            ImageFolderWorkflowRequest(
+                model_json_path=model_json_path,
+                dataset_root=tmp_path,
+                training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+                output_dir=tmp_path / "out",
+                export_torchscript=False,
+                seed=SEED,
+                device="cpu",
+            )
+        )
+
+        assert torch.are_deterministic_algorithms_enabled() is True
+        assert torch.is_deterministic_algorithms_warn_only_enabled() is True
+        assert torch.backends.cudnn.deterministic is True
+        assert torch.backends.cudnn.benchmark is True
+    finally:
+        torch.use_deterministic_algorithms(original_algorithms, warn_only=original_warn_only)
+        torch.backends.cudnn.deterministic = original_cudnn_deterministic
+        torch.backends.cudnn.benchmark = original_cudnn_benchmark
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a local CUDA device")
+def test_workflow_cuda_same_device_exact_resume_conv_bn_dropout(tmp_path: Path) -> None:
+    """Phase 4R 핵심 regression. ImageFolder production workflow의 실제
+    checkpoint 경로(run_imagefolder_training_workflow() + checkpoint_out)
+    를 그대로 사용해 continuous CUDA 5 epoch와 split(3+2) CUDA resume이
+    same physical CUDA device 기준 bitwise exact함을 증명한다.
+    Conv2d+BatchNorm2d+Dropout fixture로 CUDA RNG 소비 경로(Dropout)와
+    deterministic algorithm이 필요한 경로(Conv/BatchNorm)를 함께
+    검증한다."""
+    _make_standard_dataset(tmp_path, count_per_class=8)
+    spec = _conv_bn_dropout_spec()
+    model_json_path = _write_model_json(tmp_path, spec)
+    config_kwargs = dict(
+        batch_size=4, learning_rate=1e-2, optimizer="sgd", momentum=0.9,
+        lr_scheduler="plateau", lr_scheduler_factor=0.5, lr_scheduler_patience=1,
+    )
+
+    checkpoint_a = tmp_path / "a_checkpoint.pt"
+    result_a = run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=5, **config_kwargs),
+            output_dir=tmp_path / "a",
+            checkpoint_out=checkpoint_a,
+            export_torchscript=False,
+            seed=SEED,
+            device="cuda",
+        )
+    )
+
+    checkpoint_b = tmp_path / "b_checkpoint.pt"
+    run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=3, **config_kwargs),
+            output_dir=tmp_path / "b1",
+            checkpoint_out=checkpoint_b,
+            export_torchscript=False,
+            seed=SEED,
+            device="cuda",
+        )
+    )
+    result_b2 = run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=2, **config_kwargs),
+            output_dir=tmp_path / "b2",
+            resume_from=checkpoint_b,
+            checkpoint_out=checkpoint_b,
+            export_torchscript=False,
+            seed=SEED,
+            device="cuda",
+        )
+    )
+
+    assert len(result_b2.history.train_losses) == 5
+    assert result_b2.history.train_losses == result_a.history.train_losses
+    assert result_b2.history.val_losses == result_a.history.val_losses
+    assert result_b2.history.val_accuracies == result_a.history.val_accuracies
+    assert result_b2.history.best_epoch == result_a.history.best_epoch
+    assert result_b2.history.best_val_loss == result_a.history.best_val_loss
+    assert result_b2.history.stopped_early == result_a.history.stopped_early
+
+    payload_a = load_training_checkpoint(checkpoint_a)
+    payload_b = load_training_checkpoint(checkpoint_b)
+
+    for name, tensor in payload_a["model_state_dict"].items():
+        assert torch.equal(tensor, payload_b["model_state_dict"][name]), f"model param mismatch: {name}"
+
+    # BatchNorm의 running_mean/running_var/num_batches_tracked도 state_dict()에
+    # 포함되므로 위 루프에서 이미 커버되지만, 실제로 존재하는지와 명시적으로
+    # 다시 한번 강한 계약으로 고정한다.
+    bn_buffer_keys = [
+        key for key in payload_a["model_state_dict"]
+        if "running_mean" in key or "running_var" in key or "num_batches_tracked" in key
+    ]
+    assert len(bn_buffer_keys) > 0, "fixture must actually contain BatchNorm buffers"
+    for key in bn_buffer_keys:
+        assert torch.equal(payload_a["model_state_dict"][key], payload_b["model_state_dict"][key])
+
+    for name, tensor in payload_a["best_state_dict"].items():
+        assert torch.equal(tensor, payload_b["best_state_dict"][name]), f"best_state_dict mismatch: {name}"
+
+    _assert_deep_equal(payload_a["optimizer_state_dict"], payload_b["optimizer_state_dict"])
+    _assert_deep_equal(payload_a["scheduler_state_dict"], payload_b["scheduler_state_dict"])
+
+    # Phase 4R의 강한 regression contract: 두 checkpoint의 최종 CUDA RNG
+    # state 자체도 정확히 일치해야 한다(둘 다 seed부터 동일한 RNG 소비
+    # 순서를 거쳤다면 자연히 같아야 함). production result에는 RNG state를
+    # 노출하지 않으므로 checkpoint를 다시 load해서만 비교한다.
+    assert payload_a["cuda_rng_state"] is not None
+    assert payload_b["cuda_rng_state"] is not None
+    assert torch.equal(payload_a["cuda_rng_state"], payload_b["cuda_rng_state"])

@@ -7,7 +7,10 @@
   중단된 학습을 이어서(resume) 실행하기 위한 self-contained 체크포인트.
   model/optimizer/scheduler state, history, best model, early stopping
   카운터, DataLoader shuffle generator 상태, CPU RNG 상태까지 하나의
-  파일에 담는다.
+  파일에 담는다. Phase 4R부터 CUDA training의 same-device exact-resume을
+  위한 `cuda_rng_state`(optional, CPU checkpoint에서는 `None`)도 담는다
+  -- `cpu_rng_state`와 대칭적인 execution state이며 `TrainingConfig`
+  필드가 아니다.
 
 두 포맷은 서로 다른 용도이므로 섞어 쓰면 안 된다 -- load_training_checkpoint()/
 load_state_dict() 둘 다 상대방 포맷이 들어오면 명확한 에러로 거부한다
@@ -119,6 +122,7 @@ def save_training_checkpoint(
     training_config: TrainingConfig,
     loader_generator_state: torch.Tensor,
     cpu_rng_state: torch.Tensor,
+    cuda_rng_state: torch.Tensor | None = None,
 ) -> None:
     """중단된 학습을 이어서(resume) 실행하기 위한 self-contained checkpoint를
     저장한다.
@@ -138,6 +142,15 @@ def save_training_checkpoint(
         loader_generator_state = train_loader.generator.get_state()
         cpu_rng_state = torch.get_rng_state()
 
+    cuda_rng_state(Phase 4R, 기본값 None)는 CUDA training의 same-device
+    exact-resume에 필요한 현재 training device의 CUDA RNG snapshot이다
+    -- CPU training이면 caller가 이 인자를 생략해 `None`으로 저장한다
+    (기존 CPU checkpoint 호출부는 이 키워드 인자를 몰라도 계속 동작한다).
+    CUDA training이면 caller가 `torch.cuda.get_rng_state(device)`로 직접
+    채취해서 넘겨야 한다(`cpu_rng_state`와 동일한 책임 분리 -- 이 함수는
+    device를 모르므로 스스로 채취하지 않는다). `RESUME_CONFIG_FIELDS`와
+    무관한 순수 실행 state이므로 `training_config`에는 나타나지 않는다.
+
     저장은 원자적이다(Phase 4J, docs/phase4j_epoch_checkpoint_design.md
     §7-2) -- 임시 파일에 다 쓴 뒤 os.replace()로 교체하므로, 이 함수가
     예외를 던지면 `path`의 기존 내용은 전혀 바뀌지 않는다(재시도/
@@ -155,6 +168,7 @@ def save_training_checkpoint(
         "training_config": asdict(training_config),
         "loader_generator_state": loader_generator_state,
         "cpu_rng_state": cpu_rng_state,
+        "cuda_rng_state": cuda_rng_state,
     }
     _atomic_torch_save(payload, path)
 
@@ -170,6 +184,20 @@ def load_training_checkpoint(path: str | Path, *, map_location: str = "cpu") -> 
     (config.py)에 있는 필드(현재 weight_decay만)는 제외한다 -- Phase 4L
     이전 checkpoint에는 그 키가 없을 수 있고, 그 경우의 처리는 이 함수가
     아니라 require_compatible_resume_config()의 책임이다.
+
+    `cuda_rng_state`(Phase 4R)는 structural 필수 key가 아니다 -- pre-4R
+    checkpoint에는 이 키 자체가 없다. 있으면 `None` 또는 `torch.Tensor`
+    인지만 확인한다(shape/dtype은 검증하지 않는다 -- `cpu_rng_state`/
+    `loader_generator_state`도 shape을 검증하지 않는 기존 스타일과 동일,
+    CUDA RNG state의 실제 크기는 PyTorch/CUDA 버전에 따라 달라질 수 있는
+    implementation detail이라 여기서 강하게 가정하면 안 된다). **이 함수
+    자신은 키가 없어도 payload에 `"cuda_rng_state": None`을 새로
+    삽입하지 않는다** -- 반환하는 `dict`는 파일에 저장된 key 구성을
+    그대로 유지한다. 부재를 `None`으로 취급하는 것은 호출 측(예:
+    `imagefolder_workflow.py`의 `payload.get("cuda_rng_state")`)의
+    책임이다. 이 값의 부재는 "CPU checkpoint" 또는 "same-device CUDA
+    exact 계약이 없는 pre-4R CUDA checkpoint"라는 뜻이며, 어느 쪽이든
+    resume 자체를 막지 않는다(portable-only).
 
     **`history.stopped_early`가 True여도 거부하지 않는다** -- 이 함수의
     책임은 "이 파일이 구조적으로 유효한 checkpoint인가"까지다. 사용자가
@@ -265,6 +293,16 @@ def load_training_checkpoint(path: str | Path, *, map_location: str = "cpu") -> 
         if not isinstance(loaded[tensor_field], torch.Tensor):
             raise ValueError(
                 f"{path}: '{tensor_field}' must be a torch.Tensor, got {type(loaded[tensor_field]).__name__}"
+            )
+
+    # cuda_rng_state(Phase 4R)는 optional -- 키 자체가 없는 pre-4R checkpoint는
+    # 여기서 아무것도 검증하지 않고 그대로 통과시킨다(위 docstring 참고).
+    if "cuda_rng_state" in loaded:
+        cuda_rng_state = loaded["cuda_rng_state"]
+        if cuda_rng_state is not None and not isinstance(cuda_rng_state, torch.Tensor):
+            raise ValueError(
+                f"{path}: 'cuda_rng_state' must be None or a torch.Tensor, "
+                f"got {type(cuda_rng_state).__name__}"
             )
 
     scheduler_configured = training_config.get("lr_scheduler") is not None

@@ -616,6 +616,104 @@ def test_checkpoint_round_trips_class_weights_when_set(tmp_path: Path) -> None:
     assert payload["training_config"]["class_weights"] == (1.0, 2.0, 0.5, 3.0)
 
 
+# -- Phase 4R: cuda_rng_state ---------------------------------------------------
+#
+# cuda_rng_state는 cpu_rng_state/loader_generator_state와 대칭적인 순수 실행
+# state다(training config가 아님) -- GPU 없이도 CPU tensor로 직렬화 round-trip을
+# 전부 검증할 수 있다(GPU 필요한 부분은 torch.cuda.get_rng_state()/
+# set_rng_state()를 실제로 호출하는 부분뿐이고, checkpoint.py는 그 호출을
+# 전혀 하지 않는다 -- caller가 채취한 값을 그대로 저장/반환만 한다).
+
+
+def test_checkpoint_round_trips_cuda_rng_state_none(tmp_path: Path) -> None:
+    """cuda_rng_state를 생략하면(기존 CPU checkpoint 호출부와 동일) 기본값
+    None이 그대로 저장/로드된다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+    checkpoint_path, _, _ = _run_and_save_checkpoint(tmp_path, config)  # cuda_rng_state 생략
+
+    payload = load_training_checkpoint(checkpoint_path)
+
+    assert payload["cuda_rng_state"] is None
+
+
+def test_checkpoint_round_trips_cuda_rng_state_tensor(tmp_path: Path) -> None:
+    """실제 CUDA 없이도(GPU 없는 CI에서도) cuda_rng_state가 진짜
+    torch.cuda.get_rng_state()가 반환하는 것과 같은 형태(uint8 1D
+    Tensor)의 가짜 값으로 정확히 round-trip됨을 확인한다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+    torch.manual_seed(0)
+    spec = _mlp_spec()
+    model = build_model(spec)
+    train_loader, val_loader, generator = _make_loaders(seed=0)
+    result = run_training(model, train_loader, val_loader, config)
+
+    fake_cuda_rng_state = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8], dtype=torch.uint8)
+    checkpoint_path = tmp_path / "checkpoint_with_cuda_rng.pt"
+    save_training_checkpoint(
+        checkpoint_path,
+        model=model,
+        training_result=result,
+        training_config=config,
+        loader_generator_state=generator.get_state(),
+        cpu_rng_state=torch.get_rng_state(),
+        cuda_rng_state=fake_cuda_rng_state,
+    )
+
+    payload = load_training_checkpoint(checkpoint_path)
+
+    assert torch.equal(payload["cuda_rng_state"], fake_cuda_rng_state)
+
+
+def _strip_cuda_rng_state_from_saved_checkpoint(checkpoint_path: Path) -> None:
+    payload = torch.load(checkpoint_path, weights_only=True)
+    del payload["cuda_rng_state"]
+    torch.save(payload, checkpoint_path)
+
+
+def test_load_training_checkpoint_accepts_legacy_file_missing_cuda_rng_state(tmp_path: Path) -> None:
+    """Phase 4R 이전 checkpoint 파일에는 cuda_rng_state 키가 아예 없다 --
+    cuda_rng_state는 structural 필수 key가 아니므로 이 파일을 정상
+    로드해야 하고, payload에 없는 키는 그냥 없는 채로 반환되어야 한다
+    (checkpoint.py가 임의로 None을 채워 넣지 않는다 -- 그건 caller,
+    즉 imagefolder_workflow.py의 payload.get() 책임이다)."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+    checkpoint_path, _, _ = _run_and_save_checkpoint(tmp_path, config)
+    _strip_cuda_rng_state_from_saved_checkpoint(checkpoint_path)
+
+    payload = load_training_checkpoint(checkpoint_path)  # 실패하면 안 됨
+
+    assert "cuda_rng_state" not in payload
+
+
+def test_new_checkpoint_writer_always_writes_cuda_rng_state_key(tmp_path: Path) -> None:
+    """새 writer는 CPU checkpoint에도 cuda_rng_state key를 명시적으로
+    쓴다(값은 None) -- "legacy라 키가 아예 없음"과 "새 checkpoint인데
+    CPU라서 값이 None임"을 명확히 구분할 수 있다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+    checkpoint_path, _, _ = _run_and_save_checkpoint(tmp_path, config)
+
+    raw_payload = torch.load(checkpoint_path, weights_only=True)
+
+    assert "cuda_rng_state" in raw_payload
+    assert raw_payload["cuda_rng_state"] is None
+
+
+def test_load_training_checkpoint_rejects_invalid_cuda_rng_state_type(tmp_path: Path) -> None:
+    """cuda_rng_state가 존재하는데 None도 torch.Tensor도 아니면 명확한
+    ValueError로 거부한다. shape/dtype처럼 PyTorch 버전에 따라 달라질 수
+    있는 값까지는 검증하지 않는다(cpu_rng_state/loader_generator_state와
+    동일한 최소 검증 철학)."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+    checkpoint_path, _, _ = _run_and_save_checkpoint(tmp_path, config)
+
+    payload = torch.load(checkpoint_path, weights_only=True)
+    payload["cuda_rng_state"] = "not-a-tensor"
+    torch.save(payload, checkpoint_path)
+
+    with pytest.raises(ValueError, match="cuda_rng_state"):
+        load_training_checkpoint(checkpoint_path)
+
+
 # -- Phase 4J: atomic save -----------------------------------------------------
 
 

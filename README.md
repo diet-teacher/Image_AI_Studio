@@ -1200,6 +1200,51 @@ accumulation, multi-GPU/distributed training, `mps`/`xpu`/`hip` 등 CUDA
 
 ---
 
+## Phase 4R: Same-device CUDA Exact Resume
+
+Phase 4Q가 남겨둔 gap을 메웁니다 -- single CUDA device 학습에서
+checkpoint에 CUDA RNG state를 추가로 저장/복원하고, CUDA training
+구간에만 scoped deterministic execution을 적용해 **같은 물리 CUDA
+device / 같은 머신 / 같은 소프트웨어 환경** 기준으로 continuous
+training과 split+resume training이 bitwise exact하도록 만듭니다.
+
+* `cuda_rng_state`(checkpoint의 새 optional 필드, `cpu_rng_state`/
+  `loader_generator_state`와 대칭적인 순수 실행 state) -- CPU RNG/
+  DataLoader RNG와 함께 같은 지점에서 캡처/복원됩니다. CPU checkpoint는
+  이 값이 `None`입니다.
+* CUDA training 구간(RNG 복원 → `run_training()` → 최종 RNG 캡처)에만
+  scoped context로 `torch.use_deterministic_algorithms(True)`/
+  `torch.backends.cudnn.deterministic=True`/`torch.backends.cudnn.benchmark=False`
+  를 적용합니다 -- workflow 호출이 끝나면(정상 종료든 예외든) caller의
+  기존 전역 설정을 정확히 복원합니다(직접 실측 확인). **CPU 경로는 이
+  설정을 전혀 읽거나 쓰지 않습니다.**
+* deterministic kernel을 강제로 선택하므로 CUDA training 일부가 Phase
+  4Q보다 느려질 수 있습니다 -- 이는 버그가 아니라 exact-resume
+  guarantee의 tradeoff입니다.
+* CPU→CPU exact-resume 계약은 완전히 그대로 유지됩니다(무영향).
+* **CPU↔CUDA**는 Phase 4Q의 state portability 계약만 유지합니다 --
+  Phase 4R의 bitwise exact 계약 대상이 아닙니다. **cross-GPU
+  architecture**(`cuda:0`→다른 물리 GPU 포함)도 same-device exact
+  계약 대상이 아니라 bitwise exact를 검증/보장하지 않습니다.
+  **multi-GPU/distributed는 exact 여부 이전에 training 자체가
+  현재 지원 범위 밖**입니다. fresh-run 전역 reproducibility 보장과
+  continuous-vs-resume exactness는 서로 다른 계약입니다. pre-4R CUDA
+  checkpoint는 resume은 가능하지만(portable-only) same-device exact
+  계약 대상이 아닙니다(별도 warning 없음).
+* `CUBLAS_WORKSPACE_CONFIG` 환경변수는 이번 Phase가 요구하지 않습니다 --
+  실측(subprocess, 환경변수 unset/설정 양쪽)에서 이 프로젝트가 실제
+  쓰는 연산은 결과/에러 여부가 동일했습니다. 다른 CUDA 환경에서 향후
+  deterministic 관련 오류가 발생한다면 process 시작 전 환경변수 설정이
+  필요할 수 있으나, workflow가 실행 중 이 환경변수를 조용히 바꾸지는
+  않습니다.
+* AMP/Mixed Precision은 아직 미지원입니다.
+
+설계 배경과 상세 계약(RNG inventory, positive/negative control 실측,
+Conv2d/BatchNorm 비결정성 실측, deterministic context 설계, 성능
+tradeoff)은 `docs/phase4r_cuda_exact_resume_design.md`를 참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
@@ -1260,8 +1305,13 @@ accumulation, multi-GPU/distributed training, `mps`/`xpu`/`hip` 등 CUDA
   device 선택 -- runtime 실행 파라미터로 `TrainingConfig`/
   `RESUME_CONFIG_FIELDS`와 무관, CUDA 미가용/index 범위 초과 시 명확히
   거부(silent CPU fallback 없음), 최종 test/TorchScript export는 항상
-  CPU 유지, CPU→CPU exact-resume 유지, CUDA를 포함한 resume은 portable
-  하지만 bitwise exact-resume은 미지원 (Phase 4Q)
+  CPU 유지, CPU→CPU exact-resume 유지 (Phase 4Q)
+* same physical CUDA device / 같은 머신 / 같은 소프트웨어 환경 기준의
+  CUDA exact-resume(`cuda_rng_state` checkpoint + CUDA training 구간에만
+  scoped deterministic execution 자동 적용, workflow 종료 시 caller의
+  전역 설정 원복) -- CPU↔CUDA는 Phase 4Q state portability 계약만 유지
+  (exact 아님), cross-GPU architecture는 bitwise exact 미검증/미보장,
+  multi-GPU/distributed는 training 자체가 미지원 (Phase 4R)
 * TorchScript 배포, C++(LibTorch) CPU/CUDA 추론
 * Python/C++ parity 검증 (Phase 0~4E 배포 경로; Phase 4F는 export/parity
   코드를 변경하지 않았고, 기존 parity E2E를 재실행해 회귀 없음을 확인함
@@ -1300,10 +1350,11 @@ accumulation, multi-GPU/distributed training, `mps`/`xpu`/`hip` 등 CUDA
 * resume 시 config 자유 변경 (optimizer/learning_rate/momentum/
   weight_decay/lr_scheduler/lr_scheduler_factor/lr_scheduler_patience/
   batch_size는 checkpoint와 반드시 일치해야 함 -- weight_decay만 Phase 4L
-  이전 checkpoint에 한해 누락 시 0.0으로 간주하는 좁은 예외가 있음), CUDA
-  RNG state 저장(따라서 CUDA를 포함한 resume은 portable하지만 bitwise
-  exact-resume은 미지원 -- 위 "Phase 4Q" 절 참고), batch-level(worker/sampler
-  iterator) resume, distributed checkpoint
+  이전 checkpoint에 한해 누락 시 0.0으로 간주하는 좁은 예외가 있음),
+  CPU↔CUDA/cross-GPU bitwise exact-resume(same-device CUDA exact-resume
+  자체는 Phase 4R에서 지원 -- 위 "Phase 4R" 절 참고), multi-GPU/distributed
+  training(exact-resume 이전에 training 기능 자체가 미지원), batch-level
+  (worker/sampler iterator) resume, distributed checkpoint
 * 기존 `--checkpoint-out` 경로를 명시적으로 덮어쓰도록 강제하는 옵션
   (예: `--overwrite-checkpoint`) -- in-place resume(`--resume-from`과
   `--checkpoint-out`이 같은 경로) 외에는 항상 새 경로가 필요함 (Phase 4J)

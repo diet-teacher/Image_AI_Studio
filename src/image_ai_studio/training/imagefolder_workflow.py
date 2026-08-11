@@ -26,9 +26,10 @@ from __future__ import annotations
 import json
 import os
 import re
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 import torch
 from torch import nn
@@ -146,20 +147,102 @@ def _set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _capture_cuda_rng_state(device: str) -> torch.Tensor | None:
+    """현재 training device의 CUDA RNG state를 캡처한다(Phase 4R,
+    `cpu_rng_state`(`torch.get_rng_state()`) 캡처와 대칭적인 역할).
+    `device == "cpu"`면 CUDA API를 전혀 호출하지 않고 `None`을 반환한다
+    -- CPU 경로가 CUDA API를 절대 건드리지 않는다는 계약을 코드로
+    강제한다. `torch.cuda.get_rng_state_all()`은 쓰지 않는다 -- Phase
+    4Q가 single-device training만 지원하므로, 이 학습이 실제로 쓰는
+    device 하나만 캡처하는 것으로 충분하다(multi-GPU RNG 저장은 범위
+    밖)."""
+    if device == "cpu":
+        return None
+    return torch.cuda.get_rng_state(device).clone()
+
+
+def _restore_cuda_rng_state(state: torch.Tensor | None, device: str) -> None:
+    """캡처된 CUDA RNG state를 복원한다(Phase 4R). `state`가 `None`이면
+    (fresh training이거나, pre-4R legacy checkpoint에 이 키 자체가 없던
+    경우) 아무 것도 하지 않고 조용히 넘어간다 -- warning/error 없이
+    portable-only resume을 그대로 허용한다(기존 `cpu_rng_state`의
+    fresh-path 처리와 동일한 정책). `device == "cpu"`면 `state`와
+    무관하게 CUDA API를 절대 호출하지 않는다."""
+    if device == "cpu" or state is None:
+        return
+    torch.cuda.set_rng_state(state, device)
+
+
+@contextmanager
+def _cuda_deterministic_context(enabled: bool) -> Iterator[None]:
+    """CUDA training 구간에서만(Phase 4R) `torch.use_deterministic_algorithms(True)`
+    /`cudnn.deterministic=True`/`cudnn.benchmark=False`를 적용하고, 정상
+    종료든 예외 종료든 caller의 기존 전역 설정을 정확히 복원한다(로컬
+    CUDA 실측으로 양쪽 경로 모두 sentinel 값이 정확히 복원됨을 직접
+    확인함). 이 설정들은 process-global이라 scoped하게 관리하지 않으면
+    이 workflow 호출 한 번이 caller의 이후 모든 PyTorch 실행에 영향을
+    준다.
+
+    `enabled=False`(CPU training)면 이 전역 설정을 읽지도 쓰지도 않는다
+    -- CPU 경로는 deterministic 설정과 완전히 무관해야 한다는 계약을
+    코드로 강제한다(실측: 이 분기를 타면 sentinel 값이 함수 진입 전과
+    후에 완전히 동일함을 확인).
+
+    context 내부 정책은 `warn_only=False`(strict fail-fast)이다 --
+    지원 ModelSpec에 향후 deterministic 구현이 없는 CUDA 연산이
+    추가되면, `warn_only=True`로 경고만 내고 계속 실행해 exact-resume
+    계약을 조용히 깨뜨리는 대신 명확한 RuntimeError로 즉시 실패해야
+    한다(의도된 strict behavior). 이 `warn_only=False`는 context
+    내부에서만 강제되는 정책이며, caller가 context 진입 전에
+    `warn_only=True`를 쓰고 있었다면 context 종료 시 그 원래 값을
+    정확히 복원한다(진입 전 값을 그대로 덮어써 기본값 `False`로
+    고정하지 않는다). `CUBLAS_WORKSPACE_CONFIG` 환경변수는 이 함수가
+    건드리지 않는다 -- 로컬 실측(subprocess)에서 이 프로젝트가 실제
+    쓰는 연산은 설정 유무와 무관하게 동일하게 동작했고, CUDA context
+    초기화 이후 환경변수를 바꾸는 것은 반영이 보장되지 않아 근거 없는
+    설계이기 때문이다."""
+    if not enabled:
+        yield
+        return
+
+    previous_algorithms_enabled = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    previous_cudnn_deterministic = torch.backends.cudnn.deterministic
+    previous_cudnn_benchmark = torch.backends.cudnn.benchmark
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=False)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        yield
+    finally:
+        torch.use_deterministic_algorithms(
+            previous_algorithms_enabled, warn_only=previous_warn_only
+        )
+        torch.backends.cudnn.deterministic = previous_cudnn_deterministic
+        torch.backends.cudnn.benchmark = previous_cudnn_benchmark
+
+
 def _prepare_resume(
     request: ImageFolderWorkflowRequest,
     model_spec: ModelSpec,
     splits: ImageFolderSplits,
-) -> tuple[nn.Module, torch.Generator, TrainingResumeState | None, torch.Tensor | None]:
+) -> tuple[nn.Module, torch.Generator, TrainingResumeState | None, torch.Tensor | None, torch.Tensor | None]:
     """`request.resume_from`이 None이면 (신규 model, 신규 generator, None,
-    None)을 반환한다. 있으면 metadata 로드/검증 -> model build+load ->
+    None, None)을 반환한다. 있으면 metadata 로드/검증 -> model build+load ->
     generator 복원 -> ResumeState 조립 -> config 검증까지 전부 수행한 뒤
-    (model, restored_generator, resume_state, payload["cpu_rng_state"])를
-    반환한다.
+    (model, restored_generator, resume_state, payload["cpu_rng_state"],
+    payload.get("cuda_rng_state"))를 반환한다.
 
-    **이 함수는 전역 CPU RNG를 절대 건드리지 않는다.** 네 번째 반환값
-    (cpu_rng_state)은 호출자가 DataLoader 생성을 전부 마친 뒤,
-    run_training() 호출 바로 직전에 torch.set_rng_state()로 직접 적용해야
+    다섯 번째 반환값(cuda_rng_state, Phase 4R)은 pre-4R checkpoint처럼
+    이 키 자체가 없으면 `None`이다 -- `dict.get()`을 쓰므로 legacy
+    checkpoint에서도 KeyError 없이 그냥 `None`이 된다(구조적 필수
+    key가 아님, checkpoint.py의 structural validation도 이 키를 요구하지
+    않는다).
+
+    **이 함수는 전역 CPU/CUDA RNG를 절대 건드리지 않는다.** 네 번째/
+    다섯 번째 반환값(cpu_rng_state/cuda_rng_state)은 호출자가 DataLoader
+    생성을 전부 마친 뒤, run_training() 호출 바로 직전에
+    torch.set_rng_state()/torch.cuda.set_rng_state()로 직접 적용해야
     한다 -- 이 함수 안에서 미리 복원하면, 함수가 반환된 뒤 호출자가 하는
     DataLoader 생성이 복원 시점과 run_training() 사이에 끼어들게 되어
     "RNG 복원은 항상 마지막"이라는 불변조건이 함수 경계 때문에 깨진다."""
@@ -167,7 +250,7 @@ def _prepare_resume(
         _set_seed(request.seed)
         model = build_model(model_spec)
         loader_generator = torch.Generator().manual_seed(request.seed)
-        return model, loader_generator, None, None
+        return model, loader_generator, None, None, None
 
     saved_metadata = load_imagefolder_resume_metadata(metadata_path_for_checkpoint(request.resume_from))
     payload = load_training_checkpoint(request.resume_from)
@@ -195,7 +278,7 @@ def _prepare_resume(
     )
     require_compatible_resume_config(resume_state.training_config, request.training_config)
 
-    return model, restored_generator, resume_state, payload["cpu_rng_state"]
+    return model, restored_generator, resume_state, payload["cpu_rng_state"], payload.get("cuda_rng_state")
 
 
 def _validate_checkpoint_every(value: int | None) -> None:
@@ -327,6 +410,13 @@ def _make_checkpoint_hook(
             training_config=request.training_config,
             loader_generator_state=view.loader_generator.get_state(),
             cpu_rng_state=torch.get_rng_state(),
+            # Phase 4R: cpu_rng_state와 동일하게 이 hook이 호출되는 시점(=
+            # epoch train+validate가 이미 끝난 뒤)의 CUDA RNG state를 그대로
+            # 읽기만 한다(torch.cuda.get_rng_state()도 읽기 전용 호출이라
+            # EpochCheckpointView 계약을 위반하지 않는다). device="cpu"면
+            # _capture_cuda_rng_state()가 CUDA API를 호출하지 않고 None을
+            # 반환한다.
+            cuda_rng_state=_capture_cuda_rng_state(request.device),
         )
 
     return hook
@@ -384,7 +474,9 @@ def run_imagefolder_training_workflow(
         save_imagefolder_resume_metadata(current_metadata, metadata_path)  # 원자적(§7-2)
         metadata_ready = True
 
-    model, loader_generator, resume_state, cpu_rng_state = _prepare_resume(request, model_spec, splits)
+    model, loader_generator, resume_state, cpu_rng_state, cuda_rng_state = _prepare_resume(
+        request, model_spec, splits
+    )
     # Phase 4Q: _prepare_resume()은 항상 CPU model을 build/load한다
     # (map_location 기본값과 build_model()의 기존 동작 유지) -- 여기서
     # 학습에 실제로 쓸 device로 옮긴다. run_training()의 기존 계약("model은
@@ -406,23 +498,35 @@ def run_imagefolder_training_workflow(
     val_loader = DataLoader(splits.val, batch_size=batch_size, shuffle=False, num_workers=0)
     test_loader = DataLoader(splits.test, batch_size=batch_size, shuffle=False, num_workers=0)
 
-    # DataLoader 생성이 전부 끝난 뒤, 다른 RNG 소비 작업 없이 즉시
-    # run_training()을 호출한다 -- fresh 경로에서는 cpu_rng_state가 None이라
-    # 이 블록이 아무 일도 하지 않는다.
-    if cpu_rng_state is not None:
-        torch.set_rng_state(cpu_rng_state)
-
     checkpoint_hook = (
         _make_checkpoint_hook(request, ensure_checkpoint_metadata) if request.checkpoint_every is not None else None
     )
-    training_result = run_training(
-        model, train_loader, val_loader, request.training_config, device=request.device, resume_state=resume_state,
-        progress_callback=progress_callback, should_stop=should_stop, checkpoint_hook=checkpoint_hook,
-    )
-    # checkpoint 저장에 쓸 RNG snapshot -- 이후 코드(TorchScript export의
-    # set_seed() 등)가 전역 RNG를 다시 바꾸기 전에, 학습이 실제로 끝난
-    # 시점의 상태를 독립적인 snapshot으로 캡처해 둔다.
-    cpu_rng_state_after = torch.get_rng_state().clone()
+    # Phase 4R: CUDA training 구간(RNG 복원 -> run_training() -> 최종 RNG
+    # 캡처)만 scoped deterministic context로 감싼다 -- device="cpu"면
+    # 이 context는 전역 설정을 전혀 읽거나 쓰지 않는다. model JSON
+    # 검증/dataset 스캔이나 아래의 best_model CPU 최종 test/export는
+    # 이 context 밖이다 -- deterministic 설정은 CUDA stochastic training
+    # 자체에만 의미가 있고, CPU 전용 코드에 적용할 이유가 없다.
+    with _cuda_deterministic_context(enabled=request.device != "cpu"):
+        # DataLoader 생성이 전부 끝난 뒤, 다른 RNG 소비 작업 없이 즉시
+        # run_training()을 호출한다 -- fresh 경로에서는 cpu_rng_state/
+        # cuda_rng_state가 둘 다 None이라 이 블록이 아무 일도 하지 않는다.
+        if cpu_rng_state is not None:
+            torch.set_rng_state(cpu_rng_state)
+        _restore_cuda_rng_state(cuda_rng_state, request.device)
+
+        training_result = run_training(
+            model, train_loader, val_loader, request.training_config, device=request.device,
+            resume_state=resume_state, progress_callback=progress_callback, should_stop=should_stop,
+            checkpoint_hook=checkpoint_hook,
+        )
+        # checkpoint 저장에 쓸 RNG snapshot -- 이후 코드(TorchScript export의
+        # set_seed() 등)가 전역 RNG를 다시 바꾸기 전에, 학습이 실제로 끝난
+        # 시점의 상태를 독립적인 snapshot으로 캡처해 둔다. 다음 epoch
+        # continuation 지점을 나타내야 하므로, deterministic context를
+        # 벗어나기 전, final test/export가 전역 RNG를 건드리기 전에 캡처한다.
+        cpu_rng_state_after = torch.get_rng_state().clone()
+        cuda_rng_state_after = _capture_cuda_rng_state(request.device)
     loader_generator_state_after = loader_generator.get_state().clone()
     history = training_result.history
 
@@ -457,6 +561,7 @@ def run_imagefolder_training_workflow(
             training_config=request.training_config,
             loader_generator_state=loader_generator_state_after,
             cpu_rng_state=cpu_rng_state_after,
+            cuda_rng_state=cuda_rng_state_after,
         )
 
     # run_training()은 best_state_dict를 메모리로만 반환한다 -- 여기서 새
