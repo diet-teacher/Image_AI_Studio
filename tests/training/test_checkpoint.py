@@ -379,7 +379,9 @@ def test_checkpoint_distinguishes_current_model_from_best_model(
 
     call_count = {"value": 0}
 
-    def fake_train_one_epoch(model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None):
+    def fake_train_one_epoch(
+        model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None, scaler=None
+    ):
         call_count["value"] += 1
         epoch_value = float(call_count["value"])
         for param in model.parameters():
@@ -711,6 +713,116 @@ def test_load_training_checkpoint_rejects_invalid_cuda_rng_state_type(tmp_path: 
     torch.save(payload, checkpoint_path)
 
     with pytest.raises(ValueError, match="cuda_rng_state"):
+        load_training_checkpoint(checkpoint_path)
+
+
+# -- Phase 4S: scaler_state_dict -------------------------------------------------
+#
+# scaler_state_dict는 cuda_rng_state와 달리 save_training_checkpoint()의 별도
+# 키워드 인자가 아니다 -- training_result.scaler_state_dict(loop.py의
+# run_training()이 이미 채워서 반환함)를 그대로 payload에 쓴다. 그래도 최소
+# 검증/legacy 처리 철학은 cuda_rng_state와 완전히 동일하다(GPU 없이도 전부
+# 검증 가능 -- 실제 값은 순수 Python float/int로 구성된 작은 dict이지 CUDA
+# API를 호출해야만 얻을 수 있는 값이 아니다).
+
+
+def test_checkpoint_round_trips_scaler_state_dict_none(tmp_path: Path) -> None:
+    """precision="fp32"(기본값)로 학습하면 TrainingResult.scaler_state_dict가
+    None이고, checkpoint에도 그대로 None이 저장/로드된다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+    checkpoint_path, result, _ = _run_and_save_checkpoint(tmp_path, config)
+    assert result.scaler_state_dict is None
+
+    payload = load_training_checkpoint(checkpoint_path)
+
+    assert payload["scaler_state_dict"] is None
+
+
+def test_checkpoint_round_trips_scaler_state_dict_value(tmp_path: Path) -> None:
+    """실제 CUDA 없이도(GPU 없는 CI에서도) scaler_state_dict가 진짜
+    torch.amp.GradScaler.state_dict()가 반환하는 것과 같은 형태(순수
+    Python float/int로 구성된 작은 dict)의 가짜 값으로 정확히
+    round-trip됨을 확인한다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+    torch.manual_seed(0)
+    spec = _mlp_spec()
+    model = build_model(spec)
+    train_loader, val_loader, generator = _make_loaders(seed=0)
+    result = run_training(model, train_loader, val_loader, config)
+
+    fake_scaler_state_dict = {
+        "scale": 2048.0, "growth_factor": 2.0, "backoff_factor": 0.5,
+        "growth_interval": 2000, "_growth_tracker": 3,
+    }
+    result_with_scaler = TrainingResult(
+        history=result.history,
+        best_state_dict=result.best_state_dict,
+        optimizer_state_dict=result.optimizer_state_dict,
+        scheduler_state_dict=result.scheduler_state_dict,
+        epochs_without_improvement=result.epochs_without_improvement,
+        scaler_state_dict=fake_scaler_state_dict,
+    )
+    checkpoint_path = tmp_path / "checkpoint_with_scaler.pt"
+    save_training_checkpoint(
+        checkpoint_path,
+        model=model,
+        training_result=result_with_scaler,
+        training_config=config,
+        loader_generator_state=generator.get_state(),
+        cpu_rng_state=torch.get_rng_state(),
+    )
+
+    payload = load_training_checkpoint(checkpoint_path)
+
+    assert payload["scaler_state_dict"] == fake_scaler_state_dict
+
+
+def _strip_scaler_state_dict_from_saved_checkpoint(checkpoint_path: Path) -> None:
+    payload = torch.load(checkpoint_path, weights_only=True)
+    del payload["scaler_state_dict"]
+    torch.save(payload, checkpoint_path)
+
+
+def test_load_training_checkpoint_accepts_legacy_file_missing_scaler_state_dict(tmp_path: Path) -> None:
+    """Phase 4S 이전 checkpoint 파일에는 scaler_state_dict 키가 아예 없다 --
+    structural 필수 key가 아니므로 이 파일을 정상 로드해야 하고, 없는 키는
+    그냥 없는 채로 반환되어야 한다(checkpoint.py가 임의로 None을 채워 넣지
+    않는다 -- 그건 caller, 즉 imagefolder_workflow.py의 payload.get() 책임)."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+    checkpoint_path, _, _ = _run_and_save_checkpoint(tmp_path, config)
+    _strip_scaler_state_dict_from_saved_checkpoint(checkpoint_path)
+
+    payload = load_training_checkpoint(checkpoint_path)  # 실패하면 안 됨
+
+    assert "scaler_state_dict" not in payload
+
+
+def test_new_checkpoint_writer_always_writes_scaler_state_dict_key(tmp_path: Path) -> None:
+    """새 writer는 FP32 checkpoint에도 scaler_state_dict key를 명시적으로
+    쓴다(값은 None) -- "legacy라 키가 아예 없음"과 "새 checkpoint인데
+    FP32라서 값이 None임"을 명확히 구분할 수 있다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+    checkpoint_path, _, _ = _run_and_save_checkpoint(tmp_path, config)
+
+    raw_payload = torch.load(checkpoint_path, weights_only=True)
+
+    assert "scaler_state_dict" in raw_payload
+    assert raw_payload["scaler_state_dict"] is None
+
+
+def test_load_training_checkpoint_rejects_invalid_scaler_state_dict_type(tmp_path: Path) -> None:
+    """scaler_state_dict가 존재하는데 None도 dict도 아니면 명확한
+    ValueError로 거부한다. 내부 key(scale/growth_factor/...)는 PyTorch
+    버전에 따라 달라질 수 있어 검증하지 않는다(cuda_rng_state와 동일한
+    최소 검증 철학)."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+    checkpoint_path, _, _ = _run_and_save_checkpoint(tmp_path, config)
+
+    payload = torch.load(checkpoint_path, weights_only=True)
+    payload["scaler_state_dict"] = "not-a-dict"
+    torch.save(payload, checkpoint_path)
+
+    with pytest.raises(ValueError, match="scaler_state_dict"):
         load_training_checkpoint(checkpoint_path)
 
 

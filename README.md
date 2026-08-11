@@ -1237,11 +1237,81 @@ training과 split+resume training이 bitwise exact하도록 만듭니다.
   deterministic 관련 오류가 발생한다면 process 시작 전 환경변수 설정이
   필요할 수 있으나, workflow가 실행 중 이 환경변수를 조용히 바꾸지는
   않습니다.
-* AMP/Mixed Precision은 아직 미지원입니다.
+* AMP/Mixed Precision은 이 Phase에서는 미지원입니다(CUDA FP16 AMP는
+  Phase 4S에서 지원 -- 아래 "Phase 4S" 절 참고).
 
 설계 배경과 상세 계약(RNG inventory, positive/negative control 실측,
 Conv2d/BatchNorm 비결정성 실측, deterministic context 설계, 성능
 tradeoff)은 `docs/phase4r_cuda_exact_resume_design.md`를 참고하세요.
+
+---
+
+## Phase 4S: Same-device CUDA AMP (FP16) Training
+
+single CUDA device ImageFolder training에 `torch.amp.autocast`(FP16)+
+`torch.amp.GradScaler`를 도입하고, checkpoint에 `scaler_state_dict`를
+추가해 Phase 4R의 same-device exact-resume 계약을 AMP-enabled training
+까지 확장합니다. `precision="fp32"`(기본값)에서는 CPU/CUDA 기존 FP32
+학습 semantics와 numerical behavior를 그대로 유지합니다(기존 5개 E2E
+numerical anchor 무변경, 기존 Phase 4R CUDA FP32 exact-resume test
+PASS로 확인).
+
+* `TrainingConfig.precision`(`"fp32"`(기본값) | `"fp16"`) -- CLI
+  `--precision {fp32,fp16}`으로도 선택 가능합니다. `RESUME_CONFIG_FIELDS`
+  에는 포함되지 않습니다 -- `gradient_clip_norm`/`label_smoothing`/
+  `class_weights`와 같은 범주(자유롭게 바뀔 수 있는 training semantics)로,
+  optimizer/scheduler 구조를 바꾸지 않기 때문입니다(현재 지원 optimizer와
+  실측한 AMP 경로에서는 optimizer momentum buffer 등이 precision과
+  무관하게 float32로 유지됨을 확인했습니다).
+* `precision="fp16"`은 CUDA에서만 허용됩니다 -- `device="cpu"`와 조합하면
+  (`ImageFolderWorkflowRequest`를 거치는 workflow 경로든, `TrainingConfig`
+  +`run_training()`을 직접 쓰는 generic 경로든) silent fallback 없이
+  명확히 거부됩니다(CPU AMP는 이번 Phase 범위 밖).
+* CUDA FP16 AMP training은 `torch.amp.autocast(device_type="cuda",
+  dtype=torch.float16)`로 forward+loss 계산을 감싸고,
+  `torch.amp.GradScaler("cuda")`로 backward/step을 수행합니다(현재
+  PyTorch가 권장하는 API -- `torch.cuda.amp.autocast`/`GradScaler`는
+  FutureWarning으로 deprecated임을 직접 실측 확인했습니다).
+* gradient clipping(Phase 4M)과 AMP를 함께 쓰면 `scaler.unscale_(optimizer)`
+  를 clipping 직전에 정확히 한 번 호출합니다 -- 생략하면 grad norm이
+  `scale`배로 부풀어 clipping 임계값이 무의미해짐을 실측으로 확인했습니다.
+* validation/test 평가와 TorchScript export/C++ parity는 이 값과 무관하게
+  항상 FP32(train에만 AMP 적용)로 수행됩니다 -- Phase 4Q/4R의 "최종 평가는
+  항상 CPU" 원칙과 같은 이유로, scheduler/early stopping/best model
+  selection의 기존 수치적 의미를 그대로 지킵니다.
+* checkpoint의 새 optional 필드 `scaler_state_dict`(`torch.amp.GradScaler
+  .state_dict()`, FP32/CPU checkpoint에서는 `None`) -- `cuda_rng_state`와
+  달리 caller가 별도로 채취하는 게 아니라 `TrainingResult.scaler_state_dict`
+  (loop.py의 `run_training()`이 이미 채워서 반환)에서 그대로 읽습니다.
+  positive/negative control 실측으로 GradScaler state 복원이 same-device
+  AMP exact-resume에 **필수**임을 직접 증명했습니다(state를 복원하지
+  않으면 이어지는 학습 결과가 실제로 갈라짐).
+* same physical CUDA device / 같은 머신 / 같은 소프트웨어 환경 기준의 AMP
+  exact-resume은 **scaler_state_dict가 있는 새 checkpoint에서만** 보장됩니다.
+  precision을 바꿔 resume(FP32↔AMP)하거나 legacy(pre-4S) checkpoint를
+  AMP로 resume하는 것은 여전히 허용되지만(portable, silent fallback
+  없음), exact 계약 대상은 아닙니다 -- 실측으로 양방향 모두 model/optimizer
+  state가 깨지지 않고 정상 동작함을 확인했으며, bitwise exact는 same
+  precision끼리만 보장합니다. **이 precision 변경 resume 정책은
+  "resume에 쓸 새 precision이 무엇이든 허용"이라는 뜻일 뿐, `cpu`+`fp16`
+  처럼 애초에 유효하지 않은 device/precision 조합까지 허용한다는 뜻은
+  아닙니다** -- resume 시 새로 지정한 device/precision도 위 조합 규칙을
+  그대로 따라야 합니다.
+* Phase 4R의 scoped deterministic context(`use_deterministic_algorithms`/
+  `cudnn.deterministic`/`cudnn.benchmark`)를 그대로 재사용합니다 -- AMP
+  전용 별도 deterministic 설정은 추가하지 않았습니다(실측: FP16 autocast+
+  GradScaler가 기존 context 안에서 RuntimeError 없이 정상 동작).
+* deterministic FP16 kernel을 쓰므로 CUDA training 속도/메모리 사용량이
+  하드웨어에 따라 달라질 수 있습니다 -- 특정 GPU에서의 speedup을
+  보장하지 않습니다(Tensor Core가 없는 GPU에서는 이득이 작거나 없을 수
+  있습니다).
+* BF16, CPU AMP, multi-GPU/distributed, gradient accumulation, GradScaler
+  tuning parameter(`init_scale`/`growth_interval` 등) 노출, AMP
+  inference/export는 아직 미지원입니다.
+
+설계 배경과 상세 계약(AMP API 조사, GradScaler lifecycle 실측,
+positive/negative control, gradient clipping 통합, exact-resume 계약)은
+`docs/phase4s_amp_mixed_precision_design.md`를 참고하세요.
 
 ---
 
@@ -1312,6 +1382,14 @@ tradeoff)은 `docs/phase4r_cuda_exact_resume_design.md`를 참고하세요.
   전역 설정 원복) -- CPU↔CUDA는 Phase 4Q state portability 계약만 유지
   (exact 아님), cross-GPU architecture는 bitwise exact 미검증/미보장,
   multi-GPU/distributed는 training 자체가 미지원 (Phase 4R)
+* `--precision {fp32,fp16}`(기본값 `fp32`)로 CUDA FP16 AMP training
+  (`torch.amp.autocast`+`torch.amp.GradScaler`) 선택 -- `RESUME_CONFIG_FIELDS`
+  와 무관(gradient_clip_norm/label_smoothing/class_weights와 같은 범주),
+  `cpu`+`fp16` 조합은 명확히 거부(silent CPU fallback 없음), AMP+gradient
+  clipping 통합(`scaler.unscale_()` 순서 보장), validation/test/export는
+  항상 FP32 유지, checkpoint의 `scaler_state_dict`로 same-device AMP
+  exact-resume 지원(scaler state가 있는 신규 checkpoint만 exact 보장,
+  precision을 바꾼 resume은 portable-only) (Phase 4S)
 * TorchScript 배포, C++(LibTorch) CPU/CUDA 추론
 * Python/C++ parity 검증 (Phase 0~4E 배포 경로; Phase 4F는 export/parity
   코드를 변경하지 않았고, 기존 parity E2E를 재실행해 회귀 없음을 확인함
@@ -1361,7 +1439,9 @@ tradeoff)은 `docs/phase4r_cuda_exact_resume_design.md`를 참고하세요.
 * `SIGTERM`/`SIGHUP` graceful shutdown, batch 중간 cancellation, GUI stop
   button(Ctrl+C cooperative stop 자체는 Phase 4K에서 지원 -- 위 "Phase 4K"
   절 참고)
-* mixed precision, multi-GPU/distributed training
+* BF16/CPU AMP(CUDA FP16 AMP 자체는 Phase 4S에서 지원 -- 위 "Phase 4S"
+  절 참고), multi-GPU/distributed training, gradient accumulation,
+  GradScaler tuning parameter CLI/config 노출, AMP inference/export
 * 일반 DAG(`GraphSpec`/`NodeSpec`/`EdgeSpec`), long skip connection,
   중첩 `BranchSpec`
 * Detection/Segmentation training

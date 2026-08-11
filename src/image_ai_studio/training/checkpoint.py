@@ -10,7 +10,12 @@
   파일에 담는다. Phase 4R부터 CUDA training의 same-device exact-resume을
   위한 `cuda_rng_state`(optional, CPU checkpoint에서는 `None`)도 담는다
   -- `cpu_rng_state`와 대칭적인 execution state이며 `TrainingConfig`
-  필드가 아니다.
+  필드가 아니다. Phase 4S부터 CUDA FP16 AMP training의 same-device
+  exact-resume을 위한 `scaler_state_dict`(optional, `torch.amp.GradScaler
+  .state_dict()`, FP32/CPU checkpoint에서는 `None`)도 담는다 -- 이 값은
+  `cuda_rng_state`와 달리 caller가 별도로 채취하는 게 아니라
+  `training_result.scaler_state_dict`(loop.py의 `run_training()`이 이미
+  채워 옴)에서 그대로 읽는다.
 
 두 포맷은 서로 다른 용도이므로 섞어 쓰면 안 된다 -- load_training_checkpoint()/
 load_state_dict() 둘 다 상대방 포맷이 들어오면 명확한 에러로 거부한다
@@ -151,6 +156,13 @@ def save_training_checkpoint(
     device를 모르므로 스스로 채취하지 않는다). `RESUME_CONFIG_FIELDS`와
     무관한 순수 실행 state이므로 `training_config`에는 나타나지 않는다.
 
+    scaler_state_dict(Phase 4S)는 `cuda_rng_state`와 달리 이 함수의
+    별도 키워드 인자가 아니다 -- `training_result.scaler_state_dict`
+    (loop.py의 `run_training()`이 이미 `TrainingResult`에 채워서 반환함,
+    optimizer_state_dict/scheduler_state_dict와 동일한 위치)를 그대로
+    payload에 쓴다. `config.precision != "fp16"`이거나 CPU training이면
+    `None`이다.
+
     저장은 원자적이다(Phase 4J, docs/phase4j_epoch_checkpoint_design.md
     §7-2) -- 임시 파일에 다 쓴 뒤 os.replace()로 교체하므로, 이 함수가
     예외를 던지면 `path`의 기존 내용은 전혀 바뀌지 않는다(재시도/
@@ -169,6 +181,7 @@ def save_training_checkpoint(
         "loader_generator_state": loader_generator_state,
         "cpu_rng_state": cpu_rng_state,
         "cuda_rng_state": cuda_rng_state,
+        "scaler_state_dict": training_result.scaler_state_dict,
     }
     _atomic_torch_save(payload, path)
 
@@ -198,6 +211,17 @@ def load_training_checkpoint(path: str | Path, *, map_location: str = "cpu") -> 
     책임이다. 이 값의 부재는 "CPU checkpoint" 또는 "same-device CUDA
     exact 계약이 없는 pre-4R CUDA checkpoint"라는 뜻이며, 어느 쪽이든
     resume 자체를 막지 않는다(portable-only).
+
+    `scaler_state_dict`(Phase 4S)도 `cuda_rng_state`와 완전히 같은
+    최소 검증 철학을 따른다 -- structural 필수 key가 아니고(pre-4S
+    checkpoint에는 이 키 자체가 없음), 있으면 `None` 또는 `dict`인지만
+    확인한다(`scale`/`growth_factor`/`_growth_tracker` 등 내부 key
+    구조는 PyTorch 버전에 따라 달라질 수 있는 implementation detail이라
+    검증하지 않는다). 이 함수는 키가 없어도 payload에 새로 삽입하지
+    않는다. 부재는 "FP32/CPU checkpoint" 또는 "same-device AMP exact
+    계약이 없는 pre-4S checkpoint"라는 뜻이며, resume 자체를 막지
+    않는다(portable-only, precision을 바꿔 resume하는 것도 포함 --
+    docs/phase4s_amp_mixed_precision_design.md 참고).
 
     **`history.stopped_early`가 True여도 거부하지 않는다** -- 이 함수의
     책임은 "이 파일이 구조적으로 유효한 checkpoint인가"까지다. 사용자가
@@ -303,6 +327,17 @@ def load_training_checkpoint(path: str | Path, *, map_location: str = "cpu") -> 
             raise ValueError(
                 f"{path}: 'cuda_rng_state' must be None or a torch.Tensor, "
                 f"got {type(cuda_rng_state).__name__}"
+            )
+
+    # scaler_state_dict(Phase 4S)도 optional -- 키 자체가 없는 pre-4S
+    # checkpoint는 여기서 아무것도 검증하지 않고 그대로 통과시킨다(위
+    # docstring 참고). 내부 key(scale/growth_factor/...)는 검증하지 않는다.
+    if "scaler_state_dict" in loaded:
+        scaler_state_dict = loaded["scaler_state_dict"]
+        if scaler_state_dict is not None and not isinstance(scaler_state_dict, dict):
+            raise ValueError(
+                f"{path}: 'scaler_state_dict' must be None or a dict, "
+                f"got {type(scaler_state_dict).__name__}"
             )
 
     scheduler_configured = training_config.get("lr_scheduler") is not None

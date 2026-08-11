@@ -128,6 +128,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="생략하면 early stopping 없음 (기본값)",
     )
+    parser.add_argument(
+        "--precision",
+        choices=["fp32", "fp16"],
+        default="fp32",
+        help=(
+            "training precision -- 'fp32'(기본값) 또는 'fp16'(CUDA FP16 autocast+GradScaler, "
+            "Phase 4S). 'fp16'은 --device가 'cuda'/'cuda:N'일 때만 허용된다(CPU AMP 미지원). "
+            "validation/test 평가와 TorchScript export는 이 값과 무관하게 항상 FP32로 수행된다"
+        ),
+    )
 
     parser.add_argument(
         "--resume-from",
@@ -272,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
                 lr_scheduler_factor=args.lr_scheduler_factor,
                 lr_scheduler_patience=args.lr_scheduler_patience,
                 early_stopping_patience=args.early_stopping_patience,
+                precision=args.precision,
             )
             request = ImageFolderWorkflowRequest(
                 model_json_path=args.model_json,

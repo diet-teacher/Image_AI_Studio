@@ -14,7 +14,19 @@ RESUME_CONFIG_FIELDS에 포함되지 않는다. Phase 4P부터 class별 명시�
 weight(class_weights)를 선택할 수 있다 -- label_smoothing과 마찬가지로
 training loss(CrossEntropyLoss(weight=...))에만 적용되고, criterion은
 매번 config로 새로 생성될 뿐 checkpoint subsystem이 그 state를 저장/
-복원하지 않으므로 RESUME_CONFIG_FIELDS에 포함되지 않는다."""
+복원하지 않으므로 RESUME_CONFIG_FIELDS에 포함되지 않는다. Phase 4S부터
+precision("fp32"|"fp16")을 선택할 수 있다 -- CUDA training에서만 의미가
+있고, non-CUDA device+"fp16" 조합은 ImageFolderWorkflowRequest를
+거치는 workflow 레벨(`_validate_precision_device_compatibility()`,
+이 프로젝트가 다루는 device 값 중 "cpu"만 해당)과, workflow를 우회한
+generic `run_training()` 호출(`"cpu"`뿐 아니라 이 프로젝트가 인식하지
+않는 다른 backend 문자열까지 포함) 양쪽 모두에서 거부된다 -- loop.py의
+`_build_grad_scaler()` 참고. optimizer/scheduler의
+load_state_dict() 호환성에 영향을 주지 않음을 실측으로 확인했으므로
+(현재 지원 optimizer와 실측한 AMP 경로에서는 momentum buffer 등
+optimizer state가 precision과 무관하게 float32로 유지됨)
+gradient_clip_norm/label_smoothing/class_weights와 같은 이유로
+RESUME_CONFIG_FIELDS에 포함되지 않는다."""
 from __future__ import annotations
 
 import math
@@ -22,6 +34,9 @@ from dataclasses import dataclass
 
 OPTIMIZER_CHOICES = ("adam", "sgd", "adamw")
 LR_SCHEDULER_CHOICES = ("plateau",)
+# Phase 4S: CUDA FP16 autocast + GradScaler만 지원(BF16/CPU AMP는 이번
+# Phase의 non-goal -- docs/phase4s_amp_mixed_precision_design.md 참고).
+PRECISION_CHOICES = ("fp32", "fp16")
 
 # Phase 4F: resume 시 checkpoint와 반드시 일치해야 하는 필드.
 # optimizer.load_state_dict()/scheduler.load_state_dict()가 다른 종류의
@@ -178,6 +193,8 @@ class TrainingConfig:
 
     early_stopping_patience: int | None = None  # None => 비활성화 (현재 동작)
 
+    precision: str = "fp32"  # "fp32" | "fp16", CUDA에서만 "fp16" 허용 (Phase 4S)
+
     def __post_init__(self) -> None:
         _require_positive_int("epochs", self.epochs)
         _require_positive_int("batch_size", self.batch_size)
@@ -208,6 +225,11 @@ class TrainingConfig:
 
         if self.early_stopping_patience is not None:
             _require_positive_int("early_stopping_patience", self.early_stopping_patience)
+
+        # device와 무관하게 항상 검증 (momentum/weight_decay와 같은 이유) --
+        # device 조합("cpu"+"fp16" 거부)은 device를 모르는 이 dataclass가
+        # 아니라 workflow 레벨(imagefolder_workflow.py)의 책임이다.
+        _require_one_of("precision", self.precision, PRECISION_CHOICES)
 
 
 def require_compatible_resume_config(checkpoint_config: dict, resume_config: TrainingConfig) -> None:

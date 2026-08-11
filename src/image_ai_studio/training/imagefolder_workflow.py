@@ -239,6 +239,13 @@ def _prepare_resume(
     key가 아님, checkpoint.py의 structural validation도 이 키를 요구하지
     않는다).
 
+    scaler_state_dict(Phase 4S)는 이 함수의 반환 tuple에 별도로 담기지
+    않는다 -- `cuda_rng_state`와 달리 이 값은 `TrainingResumeState`의
+    필드이므로(위 `resume_state` 조립에서 `payload.get("scaler_state_dict")`
+    로 채워짐), 이미 반환하는 `resume_state` 안에 포함돼 있다. 반환
+    tuple의 arity를 Phase 4R에서 이미 5로 확장했으므로, Phase 4S는 이
+    함수의 반환 형태를 다시 바꿀 필요가 없다.
+
     **이 함수는 전역 CPU/CUDA RNG를 절대 건드리지 않는다.** 네 번째/
     다섯 번째 반환값(cpu_rng_state/cuda_rng_state)은 호출자가 DataLoader
     생성을 전부 마친 뒤, run_training() 호출 바로 직전에
@@ -275,6 +282,14 @@ def _prepare_resume(
         epochs_without_improvement=payload["epochs_without_improvement"],
         best_state_dict=payload["best_state_dict"],
         training_config=payload["training_config"],
+        # Phase 4S: pre-4S checkpoint처럼 이 키 자체가 없으면 .get()이
+        # None을 반환한다 -- run_training()이 scaler=None(FP32)이거나
+        # precision="fp16"인데 이 값이 None이면 fresh GradScaler로
+        # 시작한다(portable-only, 위 checkpoint.py의 최소 검증 철학과
+        # 동일하게 반환값 arity/tuple을 늘리지 않는다 -- cuda_rng_state와
+        # 달리 scaler state는 TrainingResumeState의 필드이지 이 함수의
+        # 반환 tuple에 별도로 담지 않는다).
+        scaler_state_dict=payload.get("scaler_state_dict"),
     )
     require_compatible_resume_config(resume_state.training_config, request.training_config)
 
@@ -325,6 +340,31 @@ def _validate_device(value: str) -> None:
             raise ValueError(
                 f"device={value!r} is out of range -- torch.cuda.device_count()=={device_count}"
             )
+
+
+def _validate_precision_device_compatibility(precision: str, device: str) -> None:
+    """`precision="fp16"`은 CUDA에서만 허용한다(Phase 4S). `TrainingConfig`
+    자신은 device를 모르므로(`_require_one_of()`가 "fp32"/"fp16" 값
+    자체만 검증) 이 cross-field 검증은 device를 이미 아는 workflow
+    레벨에서 한다 -- `class_weights` 길이를 dataset 크기와 여기서
+    검증하는 것과 같은 이유(`require_matching_num_classes()` 근처 참고).
+    CPU AMP(`torch.amp.autocast(device_type="cpu", ...)`)는 이번 Phase의
+    범위 밖이라 silent CPU fallback 없이 명확히 거부한다. BF16은
+    `TrainingConfig.PRECISION_CHOICES`에 아예 없으므로 여기서 다시
+    거부할 필요가 없다(config 생성 시점에 이미 거부됨).
+
+    이 함수는 `run_training()`이 내부적으로 강제하는
+    `loop.py`의 `_build_grad_scaler()`(같은 조합을 `ValueError`로 거부)
+    와 같은 검증을 중복하는 것이 아니라, 서로 다른 경계를 보호하는
+    defense-in-depth다 -- 이 함수는 dataset/model 준비 전 user-facing
+    fail-fast(workflow 진입 즉시 거부)이고, `_build_grad_scaler()`는
+    이 workflow를 거치지 않고 `TrainingConfig`+`run_training()`을 직접
+    호출하는 generic caller까지 보호한다."""
+    if precision == "fp16" and device == "cpu":
+        raise ValueError(
+            f"precision={precision!r} requires a CUDA device, but device={device!r} -- "
+            "CPU AMP is not supported in this phase"
+        )
 
 
 def _normalized_path(path: str | Path) -> str:
@@ -402,6 +442,11 @@ def _make_checkpoint_hook(
             optimizer_state_dict=view.optimizer.state_dict(),
             scheduler_state_dict=(view.scheduler.state_dict() if view.scheduler is not None else None),
             epochs_without_improvement=view.epochs_without_improvement,
+            # Phase 4S: view.scaler_state_dict는 run_training()의 epoch
+            # 루프가 이 hook 호출 직전에 이미 scaler.state_dict()로 채워 온
+            # 읽기 전용 snapshot이다(EpochCheckpointView 참고) -- 여기서
+            # 다시 계산하지 않는다.
+            scaler_state_dict=view.scaler_state_dict,
         )
         save_training_checkpoint(  # 원자적(§7-2)
             request.checkpoint_out,
@@ -433,6 +478,7 @@ def run_imagefolder_training_workflow(
         raise ValueError("checkpoint_every requires checkpoint_out to be set")
     _validate_checkpoint_output_paths(request)
     _validate_device(request.device)
+    _validate_precision_device_compatibility(request.training_config.precision, request.device)
 
     model_spec = load_model_spec(request.model_json_path)
     shape_trace = validate_model_spec(model_spec)

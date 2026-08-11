@@ -509,3 +509,75 @@ def test_require_compatible_resume_config_rejects_missing_weight_decay_when_resu
         require_compatible_resume_config(checkpoint_config, resume_config)
 
     assert checkpoint_config == original  # checkpoint_config 자체는 mutate되지 않는다
+
+
+# -- Phase 4S: precision --------------------------------------------------------
+
+
+def test_default_precision_is_fp32() -> None:
+    """Phase 4S 이전 caller가 precision을 몰라도 기존(FP32) 동작 그대로여야
+    한다는 회귀 계약."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3)
+    assert config.precision == "fp32"
+
+
+def test_accepts_fp16_precision() -> None:
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, precision="fp16")
+    assert config.precision == "fp16"
+
+
+def test_rejects_unknown_precision() -> None:
+    """BF16은 이번 Phase의 non-goal이라 choices에 아예 없다(docs/
+    phase4s_amp_mixed_precision_design.md 참고) -- device 조합과 무관하게
+    이 dataclass 레벨에서 항상 거부된다."""
+    with pytest.raises(TrainingConfigError, match="precision"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, precision="bf16")
+
+
+def test_rejects_uppercase_precision_variant() -> None:
+    with pytest.raises(TrainingConfigError, match="precision"):
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, precision="FP16")
+
+
+def test_precision_not_in_resume_config_fields() -> None:
+    """precision은 gradient_clip_norm/label_smoothing/class_weights와 같은
+    범주(자유롭게 바뀔 수 있는 training semantics)다 -- optimizer/scheduler
+    구조를 바꾸지 않으므로 RESUME_CONFIG_FIELDS에 포함되지 않는다(현재
+    지원 optimizer와 이번 Phase에서 실제로 검증한 FP32↔FP16 AMP resume
+    경로에서는 momentum buffer 등 관련 optimizer state가 precision과
+    무관하게 float32로 유지되어 optimizer.load_state_dict()가 깨지지
+    않음을 확인했다 -- PyTorch 전체에 대한 일반적 불변식으로 확대하지
+    않는다)."""
+    assert "precision" not in RESUME_CONFIG_FIELDS
+
+
+def test_require_compatible_resume_config_allows_precision_mismatch() -> None:
+    """precision이 RESUME_CONFIG_FIELDS가 아니므로, checkpoint의
+    training_config에 precision이 없거나(legacy) 다른 값이어도
+    require_compatible_resume_config()는 이 필드 때문에 거부하지 않는다
+    (P2 정책: precision 변경 resume은 허용, exact만 미보장)."""
+    checkpoint_config = {
+        "optimizer": "adam",
+        "learning_rate": 1e-3,
+        "momentum": 0.9,
+        "weight_decay": 0.0,
+        "lr_scheduler": None,
+        "lr_scheduler_factor": 0.1,
+        "lr_scheduler_patience": 1,
+        "batch_size": 8,
+        "precision": "fp16",  # checkpoint was AMP
+    }
+    resume_config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, precision="fp32")
+
+    require_compatible_resume_config(checkpoint_config, resume_config)  # 예외 없이 통과해야 함
+
+
+def test_require_compatible_resume_config_allows_missing_precision_key() -> None:
+    """pre-4S checkpoint의 training_config에는 precision 키 자체가 없다 --
+    RESUME_CONFIG_FIELDS가 아니므로 '필수 필드 누락'으로 거부되지 않는다."""
+    checkpoint_config = _base_checkpoint_config_without_weight_decay()
+    checkpoint_config["weight_decay"] = 0.0
+    assert "precision" not in checkpoint_config
+    resume_config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, precision="fp16")
+
+    require_compatible_resume_config(checkpoint_config, resume_config)  # 예외 없이 통과해야 함

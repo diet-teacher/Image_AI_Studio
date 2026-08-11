@@ -25,6 +25,7 @@ from image_ai_studio.training.loop import (
     TrainingResult,
     TrainingResumeState,
     _build_criterion,
+    _build_grad_scaler,
     _build_optimizer,
     _build_scheduler,
     evaluate,
@@ -572,7 +573,9 @@ def test_run_training_early_stopping_preserves_best_epoch_parameters(
 
     call_count = {"value": 0}
 
-    def fake_train_one_epoch(model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None):
+    def fake_train_one_epoch(
+        model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None, scaler=None
+    ):
         call_count["value"] += 1
         epoch_value = float(call_count["value"])
         for param in model.parameters():
@@ -697,6 +700,7 @@ def _make_resume_state(result: TrainingResult, config: TrainingConfig) -> Traini
         epochs_without_improvement=result.epochs_without_improvement,
         best_state_dict=result.best_state_dict,
         training_config=asdict(config),
+        scaler_state_dict=result.scaler_state_dict,
     )
 
 
@@ -1414,7 +1418,9 @@ def test_run_training_passes_build_criterion_result_to_train_one_epoch(monkeypat
     `criterion` keyword 인자를 검사하는 것으로 이 연결을 직접 증명한다."""
     captured: dict = {}
 
-    def fake_train_one_epoch(model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None):
+    def fake_train_one_epoch(
+        model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None, scaler=None
+    ):
         captured["criterion"] = criterion
         return 0.5
 
@@ -1690,7 +1696,9 @@ def test_run_training_passes_class_weights_criterion_to_train_one_epoch(monkeypa
     잇는 한 줄이 production 코드에서 실수로 빠지는 회귀를 잡지 못한다)."""
     captured: dict = {}
 
-    def fake_train_one_epoch(model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None):
+    def fake_train_one_epoch(
+        model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None, scaler=None
+    ):
         captured["criterion"] = criterion
         return 0.5
 
@@ -2036,7 +2044,9 @@ def test_run_training_checkpoint_hook_view_matches_epoch_state(monkeypatch: pyte
 
     call_count = {"value": 0}
 
-    def fake_train_one_epoch(model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None):
+    def fake_train_one_epoch(
+        model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None, scaler=None
+    ):
         call_count["value"] += 1
         epoch_value = float(call_count["value"])
         for param in model.parameters():
@@ -2853,3 +2863,276 @@ def test_run_training_user_stop_then_resume_matches_continuous_run_exactly() -> 
 
     _assert_deep_equal(result_a.optimizer_state_dict, result_b2.optimizer_state_dict)
     _assert_deep_equal(result_a.scheduler_state_dict, result_b2.scheduler_state_dict)
+
+
+# -- Phase 4S: precision / GradScaler -------------------------------------------
+
+
+def test_build_grad_scaler_returns_none_for_fp32_precision() -> None:
+    """precision="fp32"(기본값)이면 device 문자열이 "cuda"여도 CUDA API를
+    전혀 건드리지 않고 None을 반환한다 -- config.precision 검사가 device
+    검사보다 먼저이므로 CUDA 하드웨어 없이도 이 분기만은 항상 안전하게
+    실행 가능하다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, precision="fp32")
+    assert _build_grad_scaler(config, "cpu") is None
+    assert _build_grad_scaler(config, "cuda") is None
+
+
+def test_build_grad_scaler_rejects_cpu_device_with_fp16() -> None:
+    """precision="fp16"인데 device="cpu"면 None을 반환해 조용히 FP32로
+    대체하지 않고 ValueError로 명확히 거부한다(CPU AMP는 이번 Phase
+    범위 밖) -- ImageFolderWorkflowRequest를 거치지 않고 이 함수(또는
+    run_training())를 직접 호출하는 generic caller까지 이 규칙을
+    강제하기 위한 lower-level invariant다. 이 분기는 실제
+    torch.amp.GradScaler("cuda")를 생성하지 않으므로 CUDA 하드웨어 없이
+    안전하다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, precision="fp16")
+    with pytest.raises(ValueError, match="precision"):
+        _build_grad_scaler(config, "cpu")
+
+
+@pytest.mark.parametrize("device", ["mps", "xpu"])
+def test_build_grad_scaler_rejects_non_cuda_backend_strings_with_fp16(device: str) -> None:
+    """precision="fp16"인데 device가 "cpu"가 아닌 다른 non-CUDA backend
+    문자열(예: "mps"/"xpu")이어도 ValueError로 명확히 거부해야 한다 --
+    최초 구현은 `device == "cpu"`만 검사해서, CUDA가 전혀 아닌 이런
+    backend 문자열이 조용히 torch.amp.GradScaler("cuda")를 받아버리는
+    버그가 있었다(실측으로 재현). 실제 MPS/XPU 하드웨어 없이도 이
+    문자열 비교만으로 안전하게 검증 가능하다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, precision="fp16")
+    with pytest.raises(ValueError, match="precision"):
+        _build_grad_scaler(config, device)
+
+
+def test_run_training_rejects_non_cuda_backend_with_fp16_precision_without_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """generic run_training() 회귀 계약(CPU 케이스의 일반화) --
+    device="mps"처럼 이 프로젝트가 인식하지 않는 non-CUDA backend
+    문자열로 TrainingConfig(precision="fp16")+run_training()을 직접
+    호출해도 silent fallback 없이 _build_grad_scaler() 단계에서
+    거부되어야 한다. train_one_epoch()가 호출되지 않음을 monkeypatch로
+    직접 증명해 실제 batch forward 전에 거부됨을 보장한다."""
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("train_one_epoch() must not be called when precision='fp16'+device='mps'")
+
+    monkeypatch.setattr("image_ai_studio.training.loop.train_one_epoch", fail_if_called)
+
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2, precision="fp16")
+
+    with pytest.raises(ValueError, match="precision"):
+        run_training(model, train_loader, val_loader, config, device="mps")
+
+
+def test_run_training_rejects_cpu_device_with_fp16_precision_without_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """generic run_training() 회귀 계약 -- ImageFolderWorkflowRequest/
+    _validate_precision_device_compatibility()를 거치지 않고
+    TrainingConfig(precision="fp16")+device="cpu"로 run_training()을
+    직접 호출해도 silent FP32 fallback이 일어나면 안 된다. 실제 batch
+    forward(train_one_epoch)가 시작되기 전에 거부됨을 monkeypatch로
+    직접 증명한다."""
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("train_one_epoch() must not be called when precision='fp16'+device='cpu'")
+
+    monkeypatch.setattr("image_ai_studio.training.loop.train_one_epoch", fail_if_called)
+
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2, precision="fp16")
+
+    with pytest.raises(ValueError, match="precision"):
+        run_training(model, train_loader, val_loader, config, device="cpu")
+
+
+def test_train_one_epoch_default_scaler_none_matches_omitted_argument() -> None:
+    """scaler=None을 명시하는 것과 아예 생략하는 것이 완전히 동일한 FP32
+    경로를 타야 한다(하위호환 계약) -- 같은 seed로 두 번 학습해 손실이
+    정확히 일치하는지로 증명한다."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model_a = build_model(spec)
+    train_loader_a, _ = _make_loaders(spec, seed=0)
+
+    torch.manual_seed(0)
+    model_b = build_model(spec)
+    train_loader_b, _ = _make_loaders(spec, seed=0)
+
+    optimizer_a = torch.optim.Adam(model_a.parameters(), lr=1e-3)
+    optimizer_b = torch.optim.Adam(model_b.parameters(), lr=1e-3)
+
+    torch.manual_seed(1)
+    loss_omitted = train_one_epoch(model_a, train_loader_a, optimizer_a)
+    torch.manual_seed(1)
+    loss_explicit_none = train_one_epoch(model_b, train_loader_b, optimizer_b, scaler=None)
+
+    assert loss_omitted == loss_explicit_none
+    for name, tensor in model_a.state_dict().items():
+        assert torch.equal(tensor, model_b.state_dict()[name])
+
+
+def test_train_one_epoch_fp32_path_never_calls_amp_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    """scaler=None(FP32, 기본값)이면 train_one_epoch()이 torch.amp.autocast를
+    전혀 호출하지 않아야 한다 -- monkeypatch로 "호출되면 fail"을 강제해
+    production CPU/CUDA FP32 경로가 새 AMP 코드 경로를 아예 거치지 않는다는
+    계약을 직접 고정한다."""
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("torch.amp.autocast must not be called when scaler is None")
+
+    monkeypatch.setattr("torch.amp.autocast", _fail_if_called)
+
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, _ = _make_loaders(spec, seed=0)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    loss = train_one_epoch(model, train_loader, optimizer)  # scaler 생략 -- 기본값 None
+
+    assert math.isfinite(loss)
+
+
+def test_run_training_default_precision_produces_no_scaler_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """production run_training()을 기본 TrainingConfig(precision="fp32")로
+    호출하면 TrainingResult.scaler_state_dict가 None이고, AMP API가 전혀
+    호출되지 않아야 한다."""
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("torch.amp API must not be called when precision='fp32'")
+
+    monkeypatch.setattr("torch.amp.autocast", _fail_if_called)
+    monkeypatch.setattr("torch.amp.GradScaler", _fail_if_called)
+
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+
+    result = run_training(model, train_loader, val_loader, config)
+
+    assert result.scaler_state_dict is None
+
+
+def test_training_result_default_scaler_state_is_none() -> None:
+    """TrainingResult를 기존(Phase 4S 이전) 위치/키워드 인자만으로 만들어도
+    scaler_state_dict가 기본값 None으로 채워져야 한다(하위호환 계약)."""
+    result = TrainingResult(
+        history=TrainingHistory(),
+        best_state_dict={},
+        optimizer_state_dict={},
+        scheduler_state_dict=None,
+        epochs_without_improvement=0,
+    )
+    assert result.scaler_state_dict is None
+
+
+def test_training_resume_state_default_scaler_state_is_none() -> None:
+    """TrainingResumeState도 마찬가지로 기존 keyword 인자만으로 생성 가능하고
+    scaler_state_dict 기본값이 None이어야 한다(하위호환 계약)."""
+    history = TrainingHistory(
+        train_losses=[1.0], val_losses=[1.0], val_accuracies=[0.5], best_epoch=1, best_val_loss=1.0
+    )
+    resume_state = TrainingResumeState(
+        optimizer_state_dict={},
+        scheduler_state_dict=None,
+        history=history,
+        epochs_without_improvement=0,
+        best_state_dict={},
+        training_config={},
+    )
+    assert resume_state.scaler_state_dict is None
+
+
+def test_epoch_checkpoint_view_default_scaler_state_is_none() -> None:
+    """EpochCheckpointView도 기존 keyword 인자만으로 생성 가능하고
+    scaler_state_dict 기본값이 None이어야 한다(하위호환 계약)."""
+    view = EpochCheckpointView(
+        model=build_model(_mlp_classifier_spec()),
+        history=TrainingHistory(),
+        best_state_dict={},
+        optimizer=torch.optim.Adam([torch.nn.Parameter(torch.zeros(1))]),
+        scheduler=None,
+        epochs_without_improvement=0,
+        loader_generator=None,
+    )
+    assert view.scaler_state_dict is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a local CUDA device")
+def test_build_grad_scaler_returns_gradscaler_for_cuda_fp16() -> None:
+    """optional CUDA smoke test -- precision="fp16"+device="cuda"/"cuda:0"
+    양쪽 모두 실제 torch.amp.GradScaler가 만들어짐을 확인한다(ordinal이
+    붙은 device 문자열도 그대로 받아들이는지 실측 확인 -- 별도
+    ordinal-specific scaler 설계는 없다)."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, precision="fp16")
+    assert isinstance(_build_grad_scaler(config, "cuda"), torch.amp.GradScaler)
+    assert isinstance(_build_grad_scaler(config, "cuda:0"), torch.amp.GradScaler)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a local CUDA device")
+def test_run_training_cuda_fp16_amp_completes_one_epoch_with_clipping() -> None:
+    """optional CUDA smoke test(Phase 4S) -- CUDA FP16 AMP + gradient
+    clipping이 함께 정상 완료되는지 최소 확인한다(Phase 4M의 clip_grad_norm_
+    이 scaler.unscale_() 이후 정확히 호출되는 실제 production 경로).
+    same-device exact-resume 전체 증명은 test_imagefolder_workflow.py의
+    production workflow 테스트가 담당한다."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec).to("cuda")
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(
+        epochs=1, batch_size=8, learning_rate=1e-2, gradient_clip_norm=1.0, precision="fp16"
+    )
+
+    result = run_training(model, train_loader, val_loader, config, device="cuda")
+
+    assert len(result.history.train_losses) == 1
+    assert math.isfinite(result.history.train_losses[0])
+    assert math.isfinite(result.history.val_losses[0])
+    # scaler_state_dict의 정확한 내부 key 구성(scale/growth_factor/...)은
+    # PyTorch 버전에 따라 달라질 수 있는 implementation detail이라
+    # regression contract로 강제하지 않는다(checkpoint loader의 최소
+    # 검증 철학과 동일) -- 여기서는 "실제로 non-empty scaler state가
+    # 존재한다"만 확인한다.
+    assert result.scaler_state_dict  # not None, not empty
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a local CUDA device")
+def test_run_training_cuda_fp16_amp_resume_accepts_missing_scaler_state() -> None:
+    """optional CUDA smoke test -- resume_state.scaler_state_dict가 None이어도
+    (legacy 또는 FP32 checkpoint를 AMP로 resume하는 상황을 흉내) config가
+    precision="fp16"이면 에러 없이 fresh scaler로 진행되어야 한다(비대칭
+    처리 계약, scheduler의 엄격한 mismatch 검증과 다름)."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec).to("cuda")
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2, precision="fp16")
+
+    result_a = run_training(model, train_loader, val_loader, config, device="cuda")
+    resume_state = _make_resume_state(result_a, config)
+    resume_state.scaler_state_dict = None  # legacy/FP32 checkpoint를 흉내
+
+    model_b = build_model(spec).to("cuda")
+    model_b.load_state_dict(model.state_dict())
+    train_loader_b, val_loader_b = _make_loaders(spec, seed=0)
+
+    result_b = run_training(
+        model_b, train_loader_b, val_loader_b, TrainingConfig(epochs=1, **{
+            k: v for k, v in asdict(config).items() if k != "epochs"
+        }),
+        device="cuda", resume_state=resume_state,
+    )
+
+    assert result_b.scaler_state_dict is not None  # fresh scaler로 시작했지만 여전히 존재

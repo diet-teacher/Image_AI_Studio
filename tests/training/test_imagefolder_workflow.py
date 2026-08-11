@@ -42,6 +42,7 @@ from image_ai_studio.training.imagefolder_workflow import (
     _validate_checkpoint_every,
     _validate_checkpoint_output_paths,
     _validate_device,
+    _validate_precision_device_compatibility,
     run_imagefolder_training_workflow,
 )
 from image_ai_studio.training.loop import TrainingHistory, evaluate_classification_metrics, run_training
@@ -1984,3 +1985,214 @@ def test_workflow_cuda_same_device_exact_resume_conv_bn_dropout(tmp_path: Path) 
     assert payload_a["cuda_rng_state"] is not None
     assert payload_b["cuda_rng_state"] is not None
     assert torch.equal(payload_a["cuda_rng_state"], payload_b["cuda_rng_state"])
+
+
+# -- Phase 4S: CUDA FP16 AMP training --------------------------------------------
+
+
+def test_validate_precision_device_compatibility_rejects_cpu_fp16() -> None:
+    with pytest.raises(ValueError, match="precision"):
+        _validate_precision_device_compatibility("fp16", "cpu")
+
+
+@pytest.mark.parametrize(
+    ("precision", "device"),
+    [("fp32", "cpu"), ("fp32", "cuda"), ("fp16", "cuda"), ("fp16", "cuda:0")],
+)
+def test_validate_precision_device_compatibility_accepts_valid_combinations(
+    precision: str, device: str
+) -> None:
+    _validate_precision_device_compatibility(precision, device)  # raise 없이 통과해야 함
+
+
+def test_workflow_rejects_cpu_fp16_before_training_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """device="cpu"+precision="fp16" 조합은 run_training()이 호출되기 전에
+    조기 거부돼야 한다(_validate_device()와 동일한 "학습 시작 전 명확한
+    에러" 패턴)."""
+    called = {"value": False}
+
+    def fail_if_called(*args, **kwargs):
+        called["value"] = True
+        raise AssertionError("run_training() must not be called for device='cpu'+precision='fp16'")
+
+    monkeypatch.setattr("image_ai_studio.training.imagefolder_workflow.run_training", fail_if_called)
+
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    request = ImageFolderWorkflowRequest(
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2, precision="fp16"),
+        output_dir=tmp_path / "out",
+        export_torchscript=False,
+        seed=SEED,
+        device="cpu",
+    )
+
+    with pytest.raises(ValueError, match="precision"):
+        run_imagefolder_training_workflow(request)
+
+    assert called["value"] is False
+
+
+def test_workflow_cpu_fp32_path_never_calls_amp_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """production CPU workflow(precision="fp32" 기본값) 전체 경로에서
+    torch.amp.autocast/torch.amp.GradScaler가 한 번도 호출되지 않음을
+    monkeypatch로 직접 증명한다 -- Phase 4A~4R CPU/FP32 회귀 방지의 핵심
+    계약."""
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("torch.amp API must not be called on the CPU FP32 workflow path")
+
+    monkeypatch.setattr("torch.amp.autocast", fail_if_called)
+    monkeypatch.setattr("torch.amp.GradScaler", fail_if_called)
+
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+
+    result = run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+            output_dir=tmp_path / "out",
+            export_torchscript=False,
+            seed=SEED,
+            device="cpu",
+        )
+    )
+
+    assert len(result.history.train_losses) == 1
+
+
+def _fast_growth_grad_scaler(config: TrainingConfig, device: str):
+    """optional CUDA exact-resume test 전용 GradScaler builder(T1 monkeypatch
+    방식) -- production `_build_grad_scaler()`와 동일한 의미의 조건
+    분기를 쓰되(fp32 -> None, fp16+CUDA -> scaler, fp16+non-CUDA ->
+    거부) `growth_interval`을 작게 줘서 몇 step 안에 `scale`/
+    `_growth_tracker`가 실제로 바뀌게 한다(조사 라운드 실측 근거).
+    production `TrainingConfig`/CLI에는 이 tuning parameter를 노출하지
+    않는다 -- 이 값은 이 테스트 파일에만 존재한다. 이 helper는 이 파일의
+    optional CUDA exact-resume fixture 전용이라(항상 device="cuda"로만
+    호출됨) production의 device 문자열 파싱을 그대로 재사용하지 않고
+    최소한의 동일 조건만 복제한다."""
+    if config.precision != "fp16":
+        return None
+    if device == "cuda" or device.startswith("cuda:"):
+        return torch.amp.GradScaler(device, growth_interval=2, init_scale=1024.0)
+    raise ValueError(f"precision={config.precision!r} requires a CUDA device, but device={device!r}")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a local CUDA device")
+def test_workflow_cuda_amp_fp16_same_device_exact_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phase 4S 핵심 regression. Phase 4R의 Conv2d+BatchNorm2d+Dropout
+    fixture와 production checkpoint 경로(run_imagefolder_training_workflow()
+    + checkpoint_out)를 그대로 재사용해, precision="fp16" AMP +
+    gradient_clip_norm이 함께 걸린 continuous CUDA 5 epoch와 split(3+2)
+    CUDA resume이 same physical CUDA device 기준 bitwise exact함을
+    증명한다. `_build_grad_scaler()`를 growth_interval=2로 monkeypatch해
+    GradScaler state(scale/_growth_tracker)가 checkpoint 저장 전에 실제로
+    변하도록 강제한다(조사 라운드의 positive control과 동일한 근거 --
+    state가 우연히 초기값과 같아 차이가 드러나지 않는 상황을 피한다)."""
+    monkeypatch.setattr(
+        "image_ai_studio.training.loop._build_grad_scaler", _fast_growth_grad_scaler
+    )
+
+    _make_standard_dataset(tmp_path, count_per_class=8)
+    spec = _conv_bn_dropout_spec()
+    model_json_path = _write_model_json(tmp_path, spec)
+    config_kwargs = dict(
+        batch_size=4, learning_rate=1e-2, optimizer="sgd", momentum=0.9,
+        lr_scheduler="plateau", lr_scheduler_factor=0.5, lr_scheduler_patience=1,
+        gradient_clip_norm=1.0, precision="fp16",
+    )
+
+    checkpoint_a = tmp_path / "a_checkpoint.pt"
+    result_a = run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=5, **config_kwargs),
+            output_dir=tmp_path / "a",
+            checkpoint_out=checkpoint_a,
+            export_torchscript=False,
+            seed=SEED,
+            device="cuda",
+        )
+    )
+
+    checkpoint_b = tmp_path / "b_checkpoint.pt"
+    run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=3, **config_kwargs),
+            output_dir=tmp_path / "b1",
+            checkpoint_out=checkpoint_b,
+            export_torchscript=False,
+            seed=SEED,
+            device="cuda",
+        )
+    )
+    result_b2 = run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=2, **config_kwargs),
+            output_dir=tmp_path / "b2",
+            resume_from=checkpoint_b,
+            checkpoint_out=checkpoint_b,
+            export_torchscript=False,
+            seed=SEED,
+            device="cuda",
+        )
+    )
+
+    assert len(result_b2.history.train_losses) == 5
+    assert result_b2.history.train_losses == result_a.history.train_losses
+    assert result_b2.history.val_losses == result_a.history.val_losses
+    assert result_b2.history.val_accuracies == result_a.history.val_accuracies
+    assert result_b2.history.best_epoch == result_a.history.best_epoch
+    assert result_b2.history.best_val_loss == result_a.history.best_val_loss
+    assert result_b2.history.stopped_early == result_a.history.stopped_early
+
+    payload_a = load_training_checkpoint(checkpoint_a)
+    payload_b = load_training_checkpoint(checkpoint_b)
+
+    for name, tensor in payload_a["model_state_dict"].items():
+        assert torch.equal(tensor, payload_b["model_state_dict"][name]), f"model param mismatch: {name}"
+
+    bn_buffer_keys = [
+        key for key in payload_a["model_state_dict"]
+        if "running_mean" in key or "running_var" in key or "num_batches_tracked" in key
+    ]
+    assert len(bn_buffer_keys) > 0, "fixture must actually contain BatchNorm buffers"
+    for key in bn_buffer_keys:
+        assert torch.equal(payload_a["model_state_dict"][key], payload_b["model_state_dict"][key])
+
+    for name, tensor in payload_a["best_state_dict"].items():
+        assert torch.equal(tensor, payload_b["best_state_dict"][name]), f"best_state_dict mismatch: {name}"
+
+    _assert_deep_equal(payload_a["optimizer_state_dict"], payload_b["optimizer_state_dict"])
+    _assert_deep_equal(payload_a["scheduler_state_dict"], payload_b["scheduler_state_dict"])
+
+    assert payload_a["cuda_rng_state"] is not None
+    assert payload_b["cuda_rng_state"] is not None
+    assert torch.equal(payload_a["cuda_rng_state"], payload_b["cuda_rng_state"])
+
+    # Phase 4S 핵심 계약: GradScaler state 자체도 정확히 일치해야 한다 --
+    # growth_interval=2로 강제했으므로 scale/_growth_tracker가 초기값에서
+    # 실제로 변한 뒤의 상태를 비교한다(우연한 일치가 아님을 보장).
+    assert payload_a["scaler_state_dict"] is not None
+    assert payload_b["scaler_state_dict"] is not None
+    assert payload_a["scaler_state_dict"] != {
+        "scale": 1024.0, "growth_factor": 2.0, "backoff_factor": 0.5,
+        "growth_interval": 2, "_growth_tracker": 0,
+    }, "fixture must actually change scaler state before checkpointing"
+    _assert_deep_equal(payload_a["scaler_state_dict"], payload_b["scaler_state_dict"])

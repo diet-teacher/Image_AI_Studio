@@ -1581,3 +1581,121 @@ def test_cli_keyboard_interrupt_after_workflow_return_during_result_output_retur
     assert current_handler["value"] is previous_handler
     stderr = capsys.readouterr().err
     assert "Interrupted" in stderr
+
+
+# -- Phase 4S: --precision --------------------------------------------------------
+
+
+def test_precision_forwards_exact_value_to_workflow_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, "cli_precision_forward_model")
+
+    captured: dict = {}
+
+    def fake_workflow(request, *, progress_callback=None, should_stop=None):
+        captured["request"] = request
+        history = TrainingHistory(
+            train_losses=[0.5], val_losses=[0.5], val_accuracies=[0.5],
+            best_epoch=1, best_val_loss=0.5,
+        )
+        return ImageFolderWorkflowResult(
+            history=history,
+            test_loss=0.5,
+            test_accuracy=0.5,
+            best_model_state_dict_path=tmp_path / "best_model_state_dict.pt",
+            training_history_path=tmp_path / "training_history.json",
+            class_mapping_path=tmp_path / "class_mapping.json",
+            test_result_path=tmp_path / "test_result.json",
+            checkpoint_path=None,
+            checkpoint_metadata_path=None,
+            torchscript_model_path=None,
+            torchscript_metadata_path=None,
+        )
+
+    monkeypatch.setattr(cli, "run_imagefolder_training_workflow", fake_workflow)
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "1",
+            "--batch-size", "4",
+            "--precision", "fp16",
+            "--no-export-torchscript",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["request"].training_config.precision == "fp16"
+
+
+def test_precision_defaults_to_fp32_when_flag_omitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, "cli_precision_default_model")
+
+    captured: dict = {}
+
+    def fake_workflow(request, *, progress_callback=None, should_stop=None):
+        captured["request"] = request
+        history = TrainingHistory(
+            train_losses=[0.5], val_losses=[0.5], val_accuracies=[0.5],
+            best_epoch=1, best_val_loss=0.5,
+        )
+        return ImageFolderWorkflowResult(
+            history=history,
+            test_loss=0.5,
+            test_accuracy=0.5,
+            best_model_state_dict_path=tmp_path / "best_model_state_dict.pt",
+            training_history_path=tmp_path / "training_history.json",
+            class_mapping_path=tmp_path / "class_mapping.json",
+            test_result_path=tmp_path / "test_result.json",
+            checkpoint_path=None,
+            checkpoint_metadata_path=None,
+            torchscript_model_path=None,
+            torchscript_metadata_path=None,
+        )
+
+    monkeypatch.setattr(cli, "run_imagefolder_training_workflow", fake_workflow)
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "1",
+            "--batch-size", "4",
+            "--no-export-torchscript",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["request"].training_config.precision == "fp32"
+
+
+def test_precision_invalid_choice_fails_cleanly(tmp_path: Path, capsys) -> None:
+    """argparse choices=["fp32","fp16"]가 그 외 값(예: "bf16")을 명확히
+    거부해야 한다(BF16은 이번 Phase의 non-goal)."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, "cli_precision_invalid_model")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(
+            [
+                "--model-json", str(model_json_path),
+                "--dataset-root", str(tmp_path),
+                "--output-dir", str(tmp_path / "out"),
+                "--epochs", "1",
+                "--batch-size", "4",
+                "--precision", "bf16",
+                "--no-export-torchscript",
+            ]
+        )
+
+    assert excinfo.value.code == 2
+    stderr = capsys.readouterr().err
+    assert "--precision" in stderr
