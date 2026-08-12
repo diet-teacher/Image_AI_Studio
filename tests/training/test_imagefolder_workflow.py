@@ -138,6 +138,46 @@ def test_fresh_training_creates_expected_artifacts_and_result(tmp_path: Path) ->
     assert len(result.history.train_losses) == 2
     assert isinstance(result.test_loss, float)
     assert isinstance(result.test_accuracy, float)
+    # Phase 4V: 정상 완료 시 ImageFolderWorkflowResult.stop_reason forwarding.
+    assert result.stop_reason == "completed"
+
+
+def test_phase_4v_observability_fields_do_not_leak_into_artifact_schema(tmp_path: Path) -> None:
+    """docs/phase4v_progress_runtime_observability_design.md §15 artifact
+    schema regression: Phase 4V가 추가한 두 관찰값
+    (epoch_duration_seconds/stop_reason)은 TrainingProgress/TrainingResult
+    에만 존재하는 순수 runtime 값이고, TrainingHistory에는 추가되지
+    않았다 -- training_history.json과 checkpoint payload의 "history"
+    서브딕트 양쪽 다 기존 key 집합 그대로여야 하고, checkpoint payload에
+    새 top-level key("stop_reason"/"epoch_duration_seconds")가 생기지도
+    않아야 한다."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    checkpoint_path = tmp_path / "checkpoint.pt"
+
+    run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+            output_dir=tmp_path / "out",
+            checkpoint_out=checkpoint_path,
+            export_torchscript=False,
+            seed=SEED,
+        )
+    )
+
+    history_json = json.loads((tmp_path / "out" / "training_history.json").read_text())
+    expected_history_keys = {
+        "train_losses", "val_losses", "val_accuracies",
+        "best_epoch", "best_val_loss", "stopped_early", "stopped_by_user",
+    }
+    assert set(history_json.keys()) == expected_history_keys
+
+    payload = load_training_checkpoint(checkpoint_path)
+    assert "stop_reason" not in payload
+    assert "epoch_duration_seconds" not in payload
+    assert set(payload["history"].keys()) == expected_history_keys
 
 
 def test_output_dir_reuse_overwrites_fixed_filenames(tmp_path: Path) -> None:
@@ -793,6 +833,9 @@ def test_workflow_user_stopped_run_produces_full_artifact_set(tmp_path: Path) ->
 
     assert len(result.history.train_losses) == 1
     assert result.history.stopped_by_user is True
+    # Phase 4V: ImageFolderWorkflowResult.stop_reason이 run_training()의
+    # authoritative 판정을 그대로 forwarding하는지 확인한다.
+    assert result.stop_reason == "user_stopped"
     for path in (
         result.best_model_state_dict_path,
         result.training_history_path,

@@ -1427,6 +1427,61 @@ caveat)은 `docs/phase4u_cuda_h2d_transfer_optimization_design.md`를
 
 ---
 
+## Phase 4V: Progress / Runtime Observability
+
+향후 GUI를 포함한 caller가 training engine 내부 로직을 재현하지
+않고도 학습 진행 상황과 종료 상태를 알 수 있도록, 기존
+`TrainingProgress`/`TrainingResult`에 관찰값 두 가지만 최소로
+추가했습니다. `TrainingProgress`는 이미 Phase 4I부터 `run_epoch`/
+`total_run_epochs`/`global_epoch`/`train_loss`/`val_loss`/
+`val_accuracy`/`learning_rate`/`best_epoch`/`best_val_loss`/
+`epochs_without_improvement`/`stopped_early`를 매 epoch 제공하고
+있었습니다.
+
+* `TrainingProgress.epoch_duration_seconds`(신규) -- 그 epoch의
+  engine wall-clock duration(초, `time.perf_counter()` 기준
+  monotonic 측정). `train_one_epoch()` 시작부터 `checkpoint_hook`
+  호출 완료까지를 포함하고, `progress_callback` 자신과 그 이후의
+  `should_stop()` 실행 시간은 포함하지 않습니다. session-local
+  값입니다 -- resume해도 이전 호출의 duration을 복원/누적하지
+  않고, 이번 호출에서 새로 측정한 값만 담습니다. deterministic한
+  학습 state가 아니므로 checkpoint에 저장되지 않고 exact-resume
+  비교 대상도 아닙니다.
+* `TrainingResult.stop_reason`(신규, 기본값 `"completed"`) --
+  `"completed"`/`"early_stopped"`/`"user_stopped"` 중 하나인
+  authoritative 최종 종료 사유입니다. caller가 매번
+  `history.stopped_early`/`stopped_by_user`를 직접 조합해
+  재추론할 필요가 없습니다. **`TrainingProgress`에는 대응하는
+  필드를 추가하지 않았습니다** -- `should_stop()`이 항상 마지막
+  `progress_callback` 호출 이후에만 평가되는 기존 ordering(Phase
+  4I) 때문에, 어떤 epoch의 progress event도 "user가 멈췄다"는
+  사실을 알 수 있는 시점에 존재하지 않습니다(구조적으로 불가능 --
+  이 ordering 자체를 바꾸지 않았습니다).
+* `run_imagefolder_training_workflow()`가 이 프로젝트의 GUI-facing
+  public entrypoint이므로, `ImageFolderWorkflowResult.stop_reason`
+  (신규, 기본값 `"completed"`)도 `TrainingResult.stop_reason`을
+  그대로 forwarding합니다(재계산하지 않음, single source of truth).
+* checkpoint/`CHECKPOINT_FORMAT_VERSION`/`RESUME_CONFIG_FIELDS`/
+  `TrainingHistory`(→ `training_history.json` 및 checkpoint payload의
+  `history` 서브딕트) 스키마는 전부 무수정입니다 -- 두 값 모두 어디에도
+  직렬화되지 않는 순수 runtime 값입니다.
+* 기존 `learning_rate`(scheduler.step() 이전 값), resume epoch
+  numbering(`global_epoch`은 절대, `run_epoch`/`total_run_epochs`는
+  호출-local), callback ordering(checkpoint_hook → progress_callback
+  → should_stop), callback contract(동기, 예외 그대로 propagate,
+  frozen snapshot) 전부 무변경입니다.
+* batch-level progress, stage/phase event, completion event,
+  device/precision을 progress에 포함, resume 간 누적(cumulative)
+  elapsed time, ETA는 이번 Phase의 범위 밖입니다.
+
+설계 배경과 상세 계약(callback ordering 재구성, early stopping vs
+user stop ordering의 구조적 차이, duration 측정 경계, checkpoint/
+artifact schema 무영향 근거, GUI worker-thread 예상 사용 방식)은
+`docs/phase4v_progress_runtime_observability_design.md`를
+참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
@@ -1515,6 +1570,12 @@ caveat)은 `docs/phase4u_cuda_h2d_transfer_optimization_design.md`를
   달라져도 exact-resume 유지(새 checkpoint field 없음), `num_workers`/
   `persistent_workers`는 이번 Phase에서 의도적으로 미노출, 성능 향상
   비보장 (Phase 4U)
+* `TrainingProgress.epoch_duration_seconds`(session-local wall-clock,
+  checkpoint_hook까지 포함/progress_callback 자신은 제외)와
+  `TrainingResult`/`ImageFolderWorkflowResult`의 `stop_reason`
+  (`"completed"`/`"early_stopped"`/`"user_stopped"`) -- 기존 callback
+  ordering/checkpoint/`TrainingHistory` JSON schema 전부 무변경
+  (Phase 4V)
 * TorchScript 배포, C++(LibTorch) CPU/CUDA 추론
 * Python/C++ parity 검증 (Phase 0~4E 배포 경로; Phase 4F는 export/parity
   코드를 변경하지 않았고, 기존 parity E2E를 재실행해 회귀 없음을 확인함
@@ -1566,6 +1627,11 @@ caveat)은 `docs/phase4u_cuda_h2d_transfer_optimization_design.md`를
   -- host→device 전송 최적화(`pin_memory`/`non_blocking`) 자체는 Phase
   4U에서 지원, 위 "Phase 4U" 절 참고), worker RNG state/prefetch queue
   checkpoint
+* batch-level progress streaming, stage/phase event(training/
+  validation/checkpoint saving 등 epoch 중간 상태), 별도 completion
+  event, resume 간 누적(cumulative) elapsed time, ETA 추정(epoch 단위
+  `epoch_duration_seconds`/`stop_reason` 자체는 Phase 4V에서 지원 --
+  위 "Phase 4V" 절 참고)
 * 기존 `--checkpoint-out` 경로를 명시적으로 덮어쓰도록 강제하는 옵션
   (예: `--overwrite-checkpoint`) -- in-place resume(`--resume-from`과
   `--checkpoint-out`이 같은 경로) 외에는 항상 새 경로가 필요함 (Phase 4J)

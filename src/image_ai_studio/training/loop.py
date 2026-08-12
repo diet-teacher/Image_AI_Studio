@@ -21,8 +21,9 @@ CUDA가 아니면(`"cpu"`뿐 아니라 `"mps"`/`"xpu"` 등 이 프로젝트가 �
 from __future__ import annotations
 
 import copy
+import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Literal
 
 import torch
 from torch import nn
@@ -432,6 +433,17 @@ class TrainingHistory:
     stopped_by_user: bool = False
 
 
+TrainingStopReason = Literal["completed", "early_stopped", "user_stopped"]
+"""Phase 4V: run_training() 호출이 어떤 이유로 끝났는지 나타내는 authoritative
+final 값(정확히 이 세 값 중 하나) -- `TrainingResult.stop_reason`의 타입이다.
+값이 정확히 3개뿐이고 runtime-only(직렬화/checkpoint 대상 아님)이라 별도 Enum
+class를 두지 않는다(과설계 방지, `TrainingConfig.PRECISION_CHOICES` 등 이
+프로젝트의 기존 "선택지가 적으면 tuple/Literal로 충분" 관례와 동일한 판단).
+exception/failure는 이 값에 포함하지 않는다 -- 예외가 나면 `TrainingResult`
+자체가 반환되지 않으므로 `"failed"`류 값이 필요 없다(callback이 예외를 던지면
+그대로 propagate하는 기존 정책, 아래 `TrainingProgressCallback` 참고)."""
+
+
 @dataclass
 class TrainingResult:
     """run_training()의 전체 반환값.
@@ -453,7 +465,25 @@ class TrainingResult:
     쓰인다(positive/negative control 실측으로 GradScaler state 복원이
     exact-resume에 필수임을 확인함 -- docs/
     phase4s_amp_mixed_precision_design.md 참고).
-    """
+
+    stop_reason(Phase 4V, 기본값 `"completed"`)은 이 호출이 정상 완료됐는지
+    (`"completed"`), early stopping으로 끝났는지(`"early_stopped"`),
+    cooperative user stop으로 끝났는지(`"user_stopped"`)를 나타내는
+    authoritative 값이다 -- caller가 매번 `history.stopped_early`/
+    `history.stopped_by_user`를 직접 조합해 재추론할 필요가 없다(아래
+    run_training() 본문의 판정 로직 참고). **`TrainingProgress`에는 이
+    값과 대응하는 필드(`stop_reason`/`stopped_by_user`)를 두지 않는다**
+    -- `should_stop()`이 항상 마지막 `progress_callback` 호출 *이후에만*
+    평가되므로(Phase 4I 기존 ordering, 아래 `run_training()` 참고), 어떤
+    epoch의 progress event도 "user가 멈췄다"는 사실을 알 수 있는 시점에
+    존재하지 않는다 -- 이 ordering을 바꾸면서까지 progress event에 넣을
+    가치가 없다고 판단했다(Phase 4V 조사 결론). 기본값이 있는 이유는
+    이 필드를 모르는 기존 manual `TrainingResult(...)` 생성 코드(예:
+    `imagefolder_workflow.py`의 scheduled checkpoint 저장용 임시 결과,
+    일부 테스트의 fixture 조립)와의 생성자 하위 호환을 위해서다 -- 그런
+    코드는 애초에 "이 호출이 어떻게 끝났는가"라는 질문과 무관하므로
+    기본값 `"completed"`가 의미상으로도 무해하다. `run_training()`이
+    실제로 반환하는 production 결과는 이 값을 항상 명시적으로 채운다."""
 
     history: TrainingHistory
     best_state_dict: dict[str, torch.Tensor]
@@ -461,6 +491,7 @@ class TrainingResult:
     scheduler_state_dict: dict | None
     epochs_without_improvement: int
     scaler_state_dict: dict | None = None
+    stop_reason: TrainingStopReason = "completed"
 
 
 @dataclass(frozen=True)
@@ -470,14 +501,15 @@ class TrainingProgress:
     phase4i_training_progress_and_stop_design.md §3/§4/§7).
 
     관찰/UI 갱신 전용이다 -- model 객체, state_dict, optimizer/scheduler
-    상태와 시간 정보는 담지 않고, 완료된 epoch의 지표만 전달한다(나중에
-    필요해지면 기본값 있는 필드를 추가해도 하위 호환이 깨지지 않는다).
-    완전한 학습 상태(model.state_dict()가 아니라 best_state_dict,
-    optimizer_state_dict, scheduler_state_dict, history 전체)는 이
-    dataclass가 아니라 학습이 끝난 뒤 반환되는 TrainingResult가 담당한다.
-    run_training()을 직접 호출하는 코드는 자신이 넘긴 model 참조를 계속
-    들고 있으므로 필요하면 그쪽에서 별도로 들여다볼 수 있지만, 그건 이
-    dataclass의 책임이 아니다.
+    상태는 담지 않고, 완료된 epoch의 지표(+ Phase 4V부터 그 epoch의
+    engine wall-clock duration)만 전달한다(나중에 필요해지면 기본값 있는
+    필드를 추가해도 하위 호환이 깨지지 않는다). 완전한 학습 상태
+    (model.state_dict()가 아니라 best_state_dict, optimizer_state_dict,
+    scheduler_state_dict, history 전체)는 이 dataclass가 아니라 학습이
+    끝난 뒤 반환되는 TrainingResult가 담당한다. run_training()을 직접
+    호출하는 코드는 자신이 넘긴 model 참조를 계속 들고 있으므로 필요하면
+    그쪽에서 별도로 들여다볼 수 있지만, 그건 이 dataclass의 책임이
+    아니다.
 
     run_epoch: 이번 run_training() 호출 안에서 몇 번째 epoch인지(1부터).
     total_run_epochs: 이번 호출에서 실행 예정인 전체 epoch 수(config.epochs).
@@ -488,9 +520,19 @@ class TrainingProgress:
         LR을 바꿨다면 그 바뀐 값은 다음 콜백에서 보인다.
     stopped_early: 이번 epoch에서 early stopping이 발동했으면 True.
         사용자 중단 여부는 이 dataclass가 아니라 학습이 끝난 뒤
-        TrainingResult.history.stopped_by_user로만 확인한다(콜백
-        호출 시점에는 아직 should_stop()을 평가하지 않았으므로 이
-        dataclass에는 그 값을 담을 수 없다, §3/§4/§7).
+        TrainingResult.stop_reason(Phase 4V)/history.stopped_by_user로만
+        확인한다(콜백 호출 시점에는 아직 should_stop()을 평가하지
+        않았으므로 이 dataclass에는 그 값을 담을 수 없다, §3/§4/§7).
+    epoch_duration_seconds(Phase 4V): 이 epoch의 engine wall-clock
+        duration(초). `time.perf_counter()` 기준 monotonic 측정값이며
+        `train_one_epoch()` 시작 직후부터 `checkpoint_hook` 호출 완료
+        직후까지를 포함하고, `progress_callback` 자신과 그 이후의
+        `should_stop()` 실행 시간은 포함하지 않는다(아래 run_training()
+        본문의 실제 캡처 위치 참고). session-local 값이다 -- resume해도
+        이전 호출의 duration을 복원/누적하지 않고, 이번 호출에서 새로
+        측정한 값만 담는다. deterministic한 학습 state가 아니므로
+        checkpoint에 저장되지 않고 exact-resume 비교 대상도 아니다
+        (매 실행마다 다른 값이 나오는 것이 정상).
     """
 
     run_epoch: int
@@ -507,6 +549,7 @@ class TrainingProgress:
     epochs_without_improvement: int
 
     stopped_early: bool
+    epoch_duration_seconds: float
 
 
 TrainingProgressCallback = Callable[[TrainingProgress], None]
@@ -771,12 +814,23 @@ def run_training(
     독립적이며, checkpoint state에 포함되지 않는다(자유롭게 바뀌어도
     exact-resume에 영향 없음을 실측 확인).
 
+    Phase 4V(runtime observability)는 기존 ordering/semantics를 전혀
+    바꾸지 않고 관찰값 두 가지만 추가한다: 매 epoch
+    `TrainingProgress.epoch_duration_seconds`(session-local wall-clock,
+    `time.perf_counter()` 기준, checkpoint_hook까지 포함하고
+    progress_callback 자신은 제외 -- 아래 progress_callback 문단과
+    TrainingProgress docstring 참고)와, 호출 종료 시 `TrainingResult.
+    stop_reason`("completed"/"early_stopped"/"user_stopped", 아래
+    should_stop 문단 뒤 참고). 둘 다 checkpoint에 저장되지 않고
+    exact-resume 비교 대상도 아니다.
+
     매 epoch의 순서는 train -> validation -> history 기록 -> best
     model/개선 카운터 갱신 -> scheduler.step(val_loss) -> early stopping
-    조건 확인 -> checkpoint_hook 호출 -> progress_callback 호출 ->
-    (early stopping이 아니고 다음 epoch가 남아 있을 때만) should_stop()
-    평가다(Phase 4I/4J, docs/phase4i_training_progress_and_stop_design.md
-    §4/§7, docs/phase4j_epoch_checkpoint_design.md §3-1). 즉 마지막으로
+    조건 확인 -> checkpoint_hook 호출 -> epoch_duration_seconds 캡처 ->
+    progress_callback 호출 -> (early stopping이 아니고 다음 epoch가
+    남아 있을 때만) should_stop() 평가다(Phase 4I/4J, docs/
+    phase4i_training_progress_and_stop_design.md §4/§7, docs/
+    phase4j_epoch_checkpoint_design.md §3-1). 즉 마지막으로
     실행된 epoch에서 scheduler가 LR을 바꿨더라도, 그 직후 early
     stopping으로 멈추면 바뀐 LR은 실제로 쓰이지 않을 수 있다 -- 이는
     의도된 동작이다(다음 epoch이 없으므로 바뀐 LR을 쓸 기회 자체가
@@ -812,6 +866,16 @@ def run_training(
     `stopped_by_user`는 `False`로 남는다. early stopping과
     `stopped_by_user`는 동시에 True가 될 수 없다(early stopping이
     항상 우선).
+
+    **`stop_reason`이 `TrainingProgress`가 아니라 `TrainingResult`에만
+    있는 이유(Phase 4V)**: should_stop()이 항상 마지막 progress_callback
+    호출 이후에만 평가되므로, 어떤 epoch의 progress event도 "user가
+    멈췄다"는 사실이 결정된 시점에 존재하지 않는다 -- 이 ordering을
+    바꾸면서까지 progress event에 stop 관련 필드를 넣지 않는다. 호출이
+    끝나면 `history.stopped_early`/`history.stopped_by_user`로부터
+    `stop_reason`을 정확히 한 번만 계산해 `TrainingResult`에 담는다
+    (아래 함수 본문 참고) -- caller가 이 두 flag를 매번 직접 조합해
+    재추론할 필요가 없다.
 
     checkpoint_hook(Phase 4J, docs/phase4j_epoch_checkpoint_design.md
     §3/§4)이 주어지면, 완료된 epoch마다(early stopping으로 끝난 epoch
@@ -914,6 +978,11 @@ def run_training(
 
     for epoch in range(completed_epochs + 1, completed_epochs + config.epochs + 1):
         run_epoch = epoch - completed_epochs
+        # Phase 4V: epoch_duration_seconds의 시작점. train_one_epoch()부터
+        # checkpoint_hook 호출 완료 직후까지를 측정 범위로 삼는다(아래
+        # progress_callback 직전의 캡처 지점 참고) -- progress_callback 자신과
+        # 그 이후의 should_stop() 실행 시간은 의도적으로 제외한다.
+        epoch_started_at = time.perf_counter()
 
         train_loss = train_one_epoch(
             model, train_loader, optimizer, device=device,
@@ -957,6 +1026,11 @@ def run_training(
                 )
             )
 
+        # Phase 4V: checkpoint_hook까지 포함하고 progress_callback 자신은
+        # 제외한 채로 duration을 캡처한다(위 시작점 주석 및 TrainingProgress
+        # docstring 참고).
+        epoch_duration_seconds = time.perf_counter() - epoch_started_at
+
         if progress_callback is not None:
             progress_callback(
                 TrainingProgress(
@@ -971,6 +1045,7 @@ def run_training(
                     best_val_loss=history.best_val_loss,
                     epochs_without_improvement=epochs_without_improvement,
                     stopped_early=history.stopped_early,
+                    epoch_duration_seconds=epoch_duration_seconds,
                 )
             )
 
@@ -994,6 +1069,22 @@ def run_training(
     # 루프가 최소 1회는 돌고, resume이 아닌 한(또는 resume_state가 이미
     # best_state_dict를 채워 온 경우) epoch 1에서 best_val_loss가 None이라
     # 항상 best_state_dict가 채워진다.
+
+    # Phase 4V: authoritative stop_reason은 루프 종료 직후 한 번만 계산한다
+    # (single source of truth -- caller가 history.stopped_early/
+    # stopped_by_user를 매번 재조합할 필요가 없다). early stopping을 먼저
+    # 검사하는 순서는 기존 semantics를 그대로 반영한다 -- 위 should_stop()
+    # 평가 조건이 `not history.stopped_early`를 이미 요구하므로
+    # stopped_early=True인 epoch에서는 should_stop() 자체가 평가되지 않아
+    # 두 flag가 동시에 True가 되는 경우는 현재 없지만, 혹시 모를 향후
+    # 변경에도 안전하도록 우선순위를 명시적으로 고정해 둔다.
+    if history.stopped_early:
+        stop_reason: TrainingStopReason = "early_stopped"
+    elif history.stopped_by_user:
+        stop_reason = "user_stopped"
+    else:
+        stop_reason = "completed"
+
     return TrainingResult(
         history=history,
         best_state_dict=best_state_dict,
@@ -1001,4 +1092,5 @@ def run_training(
         scheduler_state_dict=copy.deepcopy(scheduler.state_dict()) if scheduler is not None else None,
         epochs_without_improvement=epochs_without_improvement,
         scaler_state_dict=copy.deepcopy(scaler.state_dict()) if scaler is not None else None,
+        stop_reason=stop_reason,
     )

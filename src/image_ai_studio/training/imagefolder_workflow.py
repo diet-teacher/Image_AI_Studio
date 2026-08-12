@@ -62,6 +62,7 @@ from image_ai_studio.training.loop import (
     TrainingProgressCallback,
     TrainingResult,
     TrainingResumeState,
+    TrainingStopReason,
     evaluate_classification_metrics,
     run_training,
 )
@@ -164,6 +165,17 @@ class ImageFolderWorkflowResult:
     # 수 있다. `run_imagefolder_training_workflow()`가 정상 완료해 반환하는
     # production 결과의 test_metrics는 항상 실제 ClassificationMetrics다.
     test_metrics: ClassificationMetrics | None = None
+    # Phase 4V: run_training()이 이미 계산한 `TrainingResult.stop_reason`을
+    # 그대로 전달만 한다(single source of truth -- 이 workflow가
+    # `history.stopped_early`/`stopped_by_user`로부터 다시 계산하지
+    # 않는다). `run_imagefolder_training_workflow()`가 이 프로젝트의
+    # GUI-facing public entrypoint이므로, 향후 caller(GUI 포함)가 최종
+    # 종료 사유를 알기 위해 `TrainingResult`까지 직접 들여다볼 필요가
+    # 없게 한다. `test_metrics`와 같은 이유로 기본값을 둬 기존 manual/fake
+    # constructor 호출과의 생성자 하위호환을 유지한다 -- production
+    # 결과는 항상 실제 "completed"/"early_stopped"/"user_stopped" 중
+    # 하나다.
+    stop_reason: TrainingStopReason = "completed"
 
 
 def _set_seed(seed: int) -> None:
@@ -744,4 +756,5 @@ def run_imagefolder_training_workflow(
         torchscript_model_path=torchscript_model_path,
         torchscript_metadata_path=torchscript_metadata_path,
         test_metrics=test_metrics,
+        stop_reason=training_result.stop_reason,
     )

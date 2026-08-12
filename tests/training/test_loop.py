@@ -3354,3 +3354,178 @@ def test_run_training_cuda_non_blocking_completes_one_epoch_with_finite_loss() -
     assert len(result.history.train_losses) == 1
     assert math.isfinite(result.history.train_losses[0])
     assert math.isfinite(result.history.val_losses[0])
+
+
+# -- Phase 4V: progress / runtime observability ------------------------------
+
+
+def test_stop_reason_completed_on_normal_finish() -> None:
+    """early stopping도, should_stop도 없이 config.epochs만큼 정상 완료되면
+    stop_reason은 "completed"여야 한다 -- history.stopped_early/
+    stopped_by_user 둘 다 False인 케이스와 정확히 대응한다."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=2, batch_size=8, learning_rate=1e-2)
+
+    result = run_training(model, train_loader, val_loader, config)
+
+    assert result.stop_reason == "completed"
+    assert result.history.stopped_early is False
+    assert result.history.stopped_by_user is False
+
+
+def test_stop_reason_early_stopped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """early stopping으로 끝나면 stop_reason은 "early_stopped"여야 한다 --
+    test_run_training_progress_callback_fires_even_on_early_stopping_epoch와
+    동일한 deterministic val_loss fixture를 재사용한다(patience=2, 3번째
+    epoch에서 early stopping 발동)."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=10, batch_size=8, learning_rate=1e-2, early_stopping_patience=2)
+    fixed_val_results = iter([(1.0, 1.0), (1.0, 1.0), (1.0, 1.0), (0.5, 1.0)])
+    monkeypatch.setattr(
+        "image_ai_studio.training.loop.evaluate",
+        lambda model, loader, device="cpu", non_blocking=False: next(fixed_val_results),
+    )
+
+    result = run_training(model, train_loader, val_loader, config)
+
+    assert result.stop_reason == "early_stopped"
+    assert result.history.stopped_early is True
+
+
+def test_stop_reason_user_stopped_and_progress_never_reflects_it() -> None:
+    """docs/phase4v_progress_runtime_observability_design.md §4의 핵심
+    계약: cooperative user stop으로 끝나면 stop_reason은
+    "user_stopped"이지만, 그 어떤 TrainingProgress도 이 사실을 담지
+    않는다(should_stop()이 항상 마지막 progress_callback 호출 이후에
+    평가되므로 구조적으로 불가능하다) -- 이것은 버그가 아니라 의도된
+    책임 분리다(TrainingProgress: epoch-level dynamic snapshot,
+    TrainingResult.stop_reason: 호출 종료 후의 authoritative 최종 값)."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=5, batch_size=8, learning_rate=1e-2)
+
+    progresses: list = []
+    result = run_training(
+        model, train_loader, val_loader, config,
+        progress_callback=progresses.append, should_stop=lambda: True,
+    )
+
+    assert result.stop_reason == "user_stopped"
+    assert result.history.stopped_by_user is True
+    assert len(progresses) == 1
+    assert progresses[-1].stopped_early is False
+
+
+def test_epoch_duration_seconds_is_non_negative_for_every_epoch() -> None:
+    """실제 wall-clock 측정값이므로 정확한 값을 assert하지 않는다 -- 큰
+    `time.sleep()`이나 특정 값에 의존하지 않고, 매 epoch마다 float이고
+    0 이상이라는 최소 계약만 고정한다(정확한 경계 값 자체는 아래
+    `test_epoch_duration_seconds_boundary_...`가 deterministic
+    timestamp로 별도 검증한다)."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=3, batch_size=8, learning_rate=1e-2)
+
+    progresses: list = []
+    run_training(model, train_loader, val_loader, config, progress_callback=progresses.append)
+
+    assert len(progresses) == 3
+    for p in progresses:
+        assert isinstance(p.epoch_duration_seconds, float)
+        assert p.epoch_duration_seconds >= 0.0
+
+
+def test_epoch_duration_seconds_boundary_includes_checkpoint_hook_excludes_progress_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """duration 측정 경계를 deterministic timestamp sequence로 직접 고정한다:
+    `time.perf_counter()`를 [10.0, 12.5] 두 값만 반환하도록 monkeypatch하면
+    (epoch 시작 캡처 1회 + checkpoint_hook 이후/progress_callback 이전의
+    캡처 1회, 정확히 2회만 소비되어야 함), epoch_duration_seconds는 정확히
+    2.5여야 한다. progress_callback이나 그 이후 should_stop()이 perf_counter
+    를 다시 호출한다면 iterator가 소진돼 StopIteration이 발생해 이 테스트가
+    실패한다 -- 그 자체가 "progress_callback 이후에는 duration 측정을 위한
+    perf_counter를 다시 부르지 않는다"는 negative-control 증명이다."""
+    timestamps = iter([10.0, 12.5])
+    monkeypatch.setattr("image_ai_studio.training.loop.time.perf_counter", lambda: next(timestamps))
+
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+
+    checkpoint_hook_calls: list = []
+
+    def hook(view: EpochCheckpointView) -> None:
+        checkpoint_hook_calls.append(view)
+
+    progresses: list = []
+    run_training(
+        model, train_loader, val_loader, config,
+        checkpoint_hook=hook, progress_callback=progresses.append,
+    )
+
+    assert len(checkpoint_hook_calls) == 1
+    assert len(progresses) == 1
+    assert progresses[0].epoch_duration_seconds == 2.5
+
+
+def test_resume_progress_epoch_semantics_unchanged_by_phase_4v() -> None:
+    """Phase 4V가 docs/phase4v_progress_runtime_observability_design.md
+    §11의 기존 resume epoch numbering 계약(global_epoch은
+    절대, run_epoch/total_run_epochs는 호출-local)을 건드리지 않았음을
+    production regression으로 명문화한다."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model_a = build_model(spec)
+    train_loader_a, val_loader_a = _make_loaders(spec, seed=0)
+    first_config = TrainingConfig(epochs=3, batch_size=8, learning_rate=1e-2)
+
+    progresses_a: list = []
+    result_a = run_training(
+        model_a, train_loader_a, val_loader_a, first_config, progress_callback=progresses_a.append
+    )
+    assert [p.global_epoch for p in progresses_a] == [1, 2, 3]
+    assert [p.run_epoch for p in progresses_a] == [1, 2, 3]
+    assert [p.total_run_epochs for p in progresses_a] == [3, 3, 3]
+
+    resume_state = _make_resume_state(result_a, first_config)
+    model_b = build_model(spec)
+    model_b.load_state_dict(model_a.state_dict())
+    train_loader_b, val_loader_b = _make_loaders(spec, seed=0)
+    resume_config = TrainingConfig(epochs=2, batch_size=8, learning_rate=1e-2)
+
+    progresses_b: list = []
+    run_training(
+        model_b, train_loader_b, val_loader_b, resume_config,
+        resume_state=resume_state, progress_callback=progresses_b.append,
+    )
+    assert [p.global_epoch for p in progresses_b] == [4, 5]
+    assert [p.run_epoch for p in progresses_b] == [1, 2]
+    assert [p.total_run_epochs for p in progresses_b] == [2, 2]
+
+
+def test_workflow_result_stop_reason_defaults_to_completed_for_manual_construction() -> None:
+    """docs/phase4v_progress_runtime_observability_design.md §9의 backward
+    compatibility 계약: 기존 manual/fake `TrainingResult(...)` 생성
+    코드가 stop_reason을 몰라도(생략해도) 여전히 생성자가 성공하고,
+    기본값이 "completed"여야 한다."""
+    result = TrainingResult(
+        history=TrainingHistory(),
+        best_state_dict={},
+        optimizer_state_dict={},
+        scheduler_state_dict=None,
+        epochs_without_improvement=0,
+    )
+    assert result.stop_reason == "completed"
