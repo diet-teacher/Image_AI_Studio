@@ -1702,3 +1702,72 @@ def test_precision_invalid_choice_fails_cleanly(tmp_path: Path, capsys) -> None:
     assert excinfo.value.code == 2
     stderr = capsys.readouterr().err
     assert "--precision" in stderr
+
+
+# -- Phase 4U: --pin-memory / --non-blocking ---------------------------------
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected_pin_memory", "expected_non_blocking"),
+    [
+        ([], False, False),
+        (["--pin-memory"], True, False),
+        (["--non-blocking"], False, True),
+        (["--pin-memory", "--non-blocking"], True, True),
+    ],
+)
+def test_pin_memory_and_non_blocking_forward_exact_values_to_workflow_request(
+    flags: list[str],
+    expected_pin_memory: bool,
+    expected_non_blocking: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """두 flag는 서로 독립적으로 설정 가능해야 한다(§6 -- 한쪽만 켜는
+    조합을 거부하지 않는다) -- 네 조합(둘 다 생략/pin_memory만/
+    non_blocking만/둘 다) 모두 정확한 값이 그대로
+    `ImageFolderWorkflowRequest`에 전달되는지 확인한다. 생략 시 기본값
+    False/False(Phase 4T까지의 기존 동작과 동일)도 이 parametrize의
+    첫 케이스로 함께 고정한다."""
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, "cli_pin_memory_non_blocking_model")
+
+    captured: dict = {}
+
+    def fake_workflow(request, *, progress_callback=None, should_stop=None):
+        captured["request"] = request
+        history = TrainingHistory(
+            train_losses=[0.5], val_losses=[0.5], val_accuracies=[0.5],
+            best_epoch=1, best_val_loss=0.5,
+        )
+        return ImageFolderWorkflowResult(
+            history=history,
+            test_loss=0.5,
+            test_accuracy=0.5,
+            best_model_state_dict_path=tmp_path / "best_model_state_dict.pt",
+            training_history_path=tmp_path / "training_history.json",
+            class_mapping_path=tmp_path / "class_mapping.json",
+            test_result_path=tmp_path / "test_result.json",
+            checkpoint_path=None,
+            checkpoint_metadata_path=None,
+            torchscript_model_path=None,
+            torchscript_metadata_path=None,
+        )
+
+    monkeypatch.setattr(cli, "run_imagefolder_training_workflow", fake_workflow)
+
+    exit_code = cli.main(
+        [
+            "--model-json", str(model_json_path),
+            "--dataset-root", str(tmp_path),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "1",
+            "--batch-size", "4",
+            "--no-export-torchscript",
+            *flags,
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["request"].pin_memory is expected_pin_memory
+    assert captured["request"].non_blocking is expected_non_blocking

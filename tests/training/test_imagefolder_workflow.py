@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import json
 import math
+import warnings
 from pathlib import Path
 
 import pytest
 import torch
 from PIL import Image
+from torch.utils.data import DataLoader
 
 from image_ai_studio.model_definition.builder import build_model
 from image_ai_studio.model_definition.serialization import save_model_spec
@@ -37,6 +39,7 @@ from image_ai_studio.training.imagefolder_workflow import (
     ImageFolderWorkflowResult,
     _capture_cuda_rng_state,
     _cuda_deterministic_context,
+    _is_cuda_device,
     _is_in_place_resume,
     _normalized_path,
     _restore_cuda_rng_state,
@@ -186,7 +189,7 @@ def test_checkpoint_stores_current_model_not_best_model(
     # (a) 기준: run_training()을 직접 호출한 마지막 epoch model.
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(val_sequence_for_reference),
+        lambda model, loader, device="cpu", non_blocking=False: next(val_sequence_for_reference),
     )
     # 워크플로우의 fresh 경로는 set_seed()를 한 번만 호출한다(모델 생성 직전,
     # run_training() 직전에 다시 하지 않음) -- 기준 실행도 정확히 같은
@@ -201,7 +204,7 @@ def test_checkpoint_stores_current_model_not_best_model(
     # (b) workflow: 같은 seed/설정, checkpoint_out 지정.
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(val_sequence_for_workflow),
+        lambda model, loader, device="cpu", non_blocking=False: next(val_sequence_for_workflow),
     )
     checkpoint_path = tmp_path / "checkpoint.pt"
     request = ImageFolderWorkflowRequest(
@@ -1656,6 +1659,133 @@ def test_workflow_resume_from_cpu_checkpoint_on_cuda_completes(tmp_path: Path) -
     assert len(result.history.train_losses) == 2
 
 
+# -- Phase 4U: pin_memory/non_blocking request defaults + CPU effective behavior --
+
+
+def test_workflow_request_pin_memory_and_non_blocking_default_to_false() -> None:
+    request = ImageFolderWorkflowRequest(
+        model_json_path=Path("model.json"),
+        dataset_root=Path("dataset"),
+        training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+        output_dir=Path("out"),
+    )
+    assert request.pin_memory is False
+    assert request.non_blocking is False
+
+
+@pytest.mark.parametrize(
+    ("device", "expected"),
+    [("cpu", False), ("cuda", True), ("cuda:0", True), ("cuda:12", True)],
+)
+def test_is_cuda_device_predicate(device: str, expected: bool) -> None:
+    """`_is_cuda_device()`가 `loop.py`의 `_build_precision_execution()`과
+    동일한 판별 기준(`device == "cuda" or device.startswith("cuda:")`)을
+    쓰는지 직접 고정한다 -- 이 값이 effective pin_memory/non_blocking
+    계산의 유일한 분기점이다."""
+    assert _is_cuda_device(device) is expected
+
+
+def test_workflow_cpu_device_forces_effective_pin_memory_and_non_blocking_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§4 CPU/CUDA effective option contract 핵심 regression: request가
+    `device="cpu"`이면서 `pin_memory=True`/`non_blocking=True`를 요청해도,
+    실제 train/val/test DataLoader에 넘어가는 `pin_memory` kwarg와
+    `run_training()`에 넘어가는 `non_blocking` kwarg는 항상 `False`여야
+    한다. `DataLoader`/`run_training()` 생성자를 monkeypatch해 실제로
+    전달되는 kwarg를 직접 가로챈다 -- production에 이 값을 노출하는
+    새 API를 추가하지 않는다. 동시에 CPU pin_memory=True로 인한 PyTorch
+    accelerator 경고가 전혀 발생하지 않는지도 함께 확인한다(§4, effective
+    값을 미리 걸러 DataLoader에 True를 넘기지 않으므로 애초에 경고가
+    발생할 수 없다는 계약)."""
+    real_data_loader = DataLoader
+    captured_loader_kwargs: list[dict] = []
+
+    def spying_data_loader(dataset, **kwargs):
+        captured_loader_kwargs.append(dict(kwargs))
+        return real_data_loader(dataset, **kwargs)
+
+    monkeypatch.setattr("image_ai_studio.training.imagefolder_workflow.DataLoader", spying_data_loader)
+
+    real_run_training = run_training
+    captured_run_training_kwargs: dict = {}
+
+    def spying_run_training(model, train_loader, val_loader, config, device="cpu", **kwargs):
+        captured_run_training_kwargs.update(kwargs)
+        return real_run_training(model, train_loader, val_loader, config, device=device, **kwargs)
+
+    monkeypatch.setattr("image_ai_studio.training.imagefolder_workflow.run_training", spying_run_training)
+
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        run_imagefolder_training_workflow(
+            ImageFolderWorkflowRequest(
+                model_json_path=model_json_path,
+                dataset_root=tmp_path,
+                training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+                output_dir=tmp_path / "out",
+                export_torchscript=False,
+                seed=SEED,
+                device="cpu",
+                pin_memory=True,
+                non_blocking=True,
+            )
+        )
+
+    assert len(captured_loader_kwargs) == 3, "workflow must construct exactly train/val/test DataLoaders"
+    train_kwargs, val_kwargs, test_kwargs = captured_loader_kwargs
+    assert train_kwargs.get("pin_memory", False) is False
+    assert val_kwargs.get("pin_memory", False) is False
+    assert test_kwargs.get("pin_memory", False) is False
+
+    assert captured_run_training_kwargs.get("non_blocking") is False
+
+    accelerator_warnings = [w for w in caught if "accelerator" in str(w.message).lower()]
+    assert accelerator_warnings == [], (
+        f"device='cpu' + pin_memory=True request must not trigger PyTorch accelerator "
+        f"warnings: {accelerator_warnings}"
+    )
+
+
+def test_workflow_train_and_val_loader_receive_same_effective_pin_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§5 train/val loader 둘 다 같은 effective_pin_memory를 받아야 한다는
+    wiring 계약을 CPU에서 직접 고정한다(둘 다 False인 케이스). CUDA에서
+    둘 다 실제로 pinned tensor를 만드는지는 별도의 CUDA-only smoke test
+    (test_workflow_cuda_pin_memory_train_and_val_loader_tensors_are_pinned)
+    가 담당한다."""
+    real_data_loader = DataLoader
+    captured_loader_kwargs: list[dict] = []
+
+    def spying_data_loader(dataset, **kwargs):
+        captured_loader_kwargs.append(dict(kwargs))
+        return real_data_loader(dataset, **kwargs)
+
+    monkeypatch.setattr("image_ai_studio.training.imagefolder_workflow.DataLoader", spying_data_loader)
+
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+
+    run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+            output_dir=tmp_path / "out",
+            export_torchscript=False,
+            seed=SEED,
+            device="cpu",
+        )
+    )
+
+    train_kwargs, val_kwargs, _test_kwargs = captured_loader_kwargs
+    assert train_kwargs.get("pin_memory", False) == val_kwargs.get("pin_memory", False)
+
+
 # -- Phase 4R: same-device CUDA exact resume -----------------------------------
 
 
@@ -2348,5 +2478,233 @@ def test_workflow_cuda_bf16_same_device_exact_resume(tmp_path: Path) -> None:
     # Phase 4T 핵심 계약: BF16은 GradScaler를 쓰지 않으므로 checkpoint의
     # scaler_state_dict는 항상 None이다 -- 새 checkpoint execution-state가
     # 전혀 필요 없다는 조사 라운드 결론을 production 경로에서 재확인한다.
+    assert payload_a["scaler_state_dict"] is None
+    assert payload_b["scaler_state_dict"] is None
+
+
+# -- Phase 4U: pin_memory/non_blocking (CUDA H2D transfer optimization) -----
+
+
+class _PinRecordingLoaderProxy:
+    """`DataLoader`를 감싸 소비되는 매 배치의 `is_pinned()`를 `sink`에
+    기록만 하고 그대로 넘겨주는 얇은 iteration proxy(Phase 4U). loader를
+    두 번 순회(먼저 검사용으로 한 번, production 코드가 다시 한 번)하면
+    `shuffle=True`+`generator=` 조합에서 매 `iter()` 호출마다 permutation이
+    새로 뽑히므로(train_one_epoch()가 실제로 학습에 쓰는 순서가 이
+    proxy의 검사 때문에 달라짐), 반드시 단 한 번의 순회 안에서 가로채야
+    한다."""
+
+    def __init__(self, loader: DataLoader, sink: list[bool]) -> None:
+        self._loader = loader
+        self._sink = sink
+
+    def __iter__(self):
+        for images, labels in self._loader:
+            self._sink.append(images.is_pinned())
+            self._sink.append(labels.is_pinned())
+            yield images, labels
+
+    def __getattr__(self, name):
+        return getattr(self._loader, name)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a local CUDA device")
+def test_workflow_cuda_pin_memory_train_and_val_loader_tensors_are_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CUDA smoke(Phase 4U): pin_memory=True인 production workflow의 train/
+    val DataLoader 둘 다 실제로 pinned host tensor를 내보내는지 직접
+    확인한다(§5 train/val loader 둘 다 effective_pin_memory 적용). production
+    API를 새로 추가하지 않고, `train_one_epoch()`/`evaluate()`가 받는
+    `loader` 인자를 `_PinRecordingLoaderProxy`로 감싸 실제 학습/검증에
+    쓰이는 바로 그 순회 안에서 `tensor.is_pinned()`를 기록한다(도구를
+    위해 production code를 바꾸지 않고, loader를 이중으로 순회해 generator
+    소비 순서를 어긋나게 만들지도 않는다)."""
+    import image_ai_studio.training.loop as loop_module
+
+    train_pinned: list[bool] = []
+    val_pinned: list[bool] = []
+    original_train_one_epoch = loop_module.train_one_epoch
+    original_evaluate = loop_module.evaluate
+
+    def spying_train_one_epoch(model, loader, optimizer, **kwargs):
+        return original_train_one_epoch(model, _PinRecordingLoaderProxy(loader, train_pinned), optimizer, **kwargs)
+
+    def spying_evaluate(model, loader, **kwargs):
+        return original_evaluate(model, _PinRecordingLoaderProxy(loader, val_pinned), **kwargs)
+
+    monkeypatch.setattr(loop_module, "train_one_epoch", spying_train_one_epoch)
+    monkeypatch.setattr(loop_module, "evaluate", spying_evaluate)
+
+    _make_standard_dataset(tmp_path, count_per_class=8)
+    spec = _conv_bn_dropout_spec()
+    model_json_path = _write_model_json(tmp_path, spec)
+
+    run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+            output_dir=tmp_path / "out",
+            export_torchscript=False,
+            seed=SEED,
+            device="cuda",
+            pin_memory=True,
+        )
+    )
+
+    assert len(train_pinned) > 0, "fixture must actually iterate at least one train batch"
+    assert all(train_pinned), "pin_memory=True must produce pinned host tensors for every train batch"
+    assert len(val_pinned) > 0, "fixture must actually iterate at least one val batch"
+    assert all(val_pinned), "pin_memory=True must produce pinned host tensors for every val batch"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a local CUDA device")
+def test_workflow_cuda_pin_memory_and_non_blocking_one_epoch_completes(tmp_path: Path) -> None:
+    """CUDA smoke(Phase 4U): pin_memory=True + non_blocking=True + FP32
+    production workflow가 한 epoch 정상 완료되는지 확인한다(precision-
+    independent optimization이므로 FP16/BF16으로 동일 smoke를 반복하지
+    않는다 -- 사전 조사에서 이미 precision과 독립임을 확인했다)."""
+    _make_standard_dataset(tmp_path, count_per_class=8)
+    spec = _conv_bn_dropout_spec()
+    model_json_path = _write_model_json(tmp_path, spec)
+
+    result = run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+            output_dir=tmp_path / "out",
+            export_torchscript=False,
+            seed=SEED,
+            device="cuda",
+            pin_memory=True,
+            non_blocking=True,
+        )
+    )
+
+    assert len(result.history.train_losses) == 1
+    assert math.isfinite(result.history.train_losses[0])
+    assert math.isfinite(result.history.val_losses[0])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a local CUDA device")
+def test_workflow_cuda_pin_memory_non_blocking_resume_boundary_option_change_exact_resume(
+    tmp_path: Path,
+) -> None:
+    """Phase 4U 핵심 regression 이자 README/design doc §8의 공식 contract를
+    직접 고정한다: pin_memory/non_blocking은 checkpoint execution state가
+    아니므로, **resume 경계에서 값이 바뀌어도** bitwise exact-resume이
+    유지되어야 한다(단순히 "같은 값을 유지하면 exact"보다 강한 계약).
+
+    continuous 5 epoch와 split(3+2) 첫 3 epoch는 둘 다
+    pin_memory=False/non_blocking=False(Phase 4T까지의 baseline 경로)로
+    실행하고, resume 2 epoch만 pin_memory=True/non_blocking=True로 바꾼다
+    -- checkpoint 저장 시점과 다른 옵션으로 resume해도, 두 run이 여전히
+    physical CUDA device 기준 bitwise exact해야 한다는 것이 이 테스트의
+    핵심 주장이다. precision은 기본값 fp32로 둔다(사전 조사에서
+    pin_memory/non_blocking이 precision과 독립적임을 확인했으므로 대표
+    케이스로 충분하다). `loader_generator_state`까지 비교하는 것은 이
+    옵션들이 checkpoint schema를 전혀 바꾸지 않고도 exact-resume을
+    유지한다는 핵심 결론을 production 경로에서 직접 고정하기 위해서다."""
+    _make_standard_dataset(tmp_path, count_per_class=8)
+    spec = _conv_bn_dropout_spec()
+    model_json_path = _write_model_json(tmp_path, spec)
+    config_kwargs = dict(
+        batch_size=4, learning_rate=1e-2, optimizer="sgd", momentum=0.9,
+        lr_scheduler="plateau", lr_scheduler_factor=0.5, lr_scheduler_patience=1,
+    )
+
+    checkpoint_a = tmp_path / "a_checkpoint.pt"
+    result_a = run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=5, **config_kwargs),
+            output_dir=tmp_path / "a",
+            checkpoint_out=checkpoint_a,
+            export_torchscript=False,
+            seed=SEED,
+            device="cuda",
+            pin_memory=False,
+            non_blocking=False,
+        )
+    )
+
+    checkpoint_b = tmp_path / "b_checkpoint.pt"
+    run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=3, **config_kwargs),
+            output_dir=tmp_path / "b1",
+            checkpoint_out=checkpoint_b,
+            export_torchscript=False,
+            seed=SEED,
+            device="cuda",
+            pin_memory=False,
+            non_blocking=False,
+        )
+    )
+    result_b2 = run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=2, **config_kwargs),
+            output_dir=tmp_path / "b2",
+            resume_from=checkpoint_b,
+            checkpoint_out=checkpoint_b,
+            export_torchscript=False,
+            seed=SEED,
+            device="cuda",
+            # 핵심 계약: checkpoint 저장 당시(False/False)와 다른 값으로
+            # resume한다. pin_memory/non_blocking은 loader generator를
+            # 전혀 소비하지 않는 순수 host-memory 전송 최적화이므로
+            # (checkpoint execution state가 아니므로), 이 변경이
+            # exact-resume을 깨지 않아야 한다.
+            pin_memory=True,
+            non_blocking=True,
+        )
+    )
+
+    assert len(result_b2.history.train_losses) == 5
+    assert result_b2.history.train_losses == result_a.history.train_losses
+    assert result_b2.history.val_losses == result_a.history.val_losses
+    assert result_b2.history.val_accuracies == result_a.history.val_accuracies
+    assert result_b2.history.best_epoch == result_a.history.best_epoch
+    assert result_b2.history.best_val_loss == result_a.history.best_val_loss
+    assert result_b2.history.stopped_early == result_a.history.stopped_early
+
+    payload_a = load_training_checkpoint(checkpoint_a)
+    payload_b = load_training_checkpoint(checkpoint_b)
+
+    for name, tensor in payload_a["model_state_dict"].items():
+        assert torch.equal(tensor, payload_b["model_state_dict"][name]), f"model param mismatch: {name}"
+
+    bn_buffer_keys = [
+        key for key in payload_a["model_state_dict"]
+        if "running_mean" in key or "running_var" in key or "num_batches_tracked" in key
+    ]
+    assert len(bn_buffer_keys) > 0, "fixture must actually contain BatchNorm buffers"
+    for key in bn_buffer_keys:
+        assert torch.equal(payload_a["model_state_dict"][key], payload_b["model_state_dict"][key])
+
+    for name, tensor in payload_a["best_state_dict"].items():
+        assert torch.equal(tensor, payload_b["best_state_dict"][name]), f"best_state_dict mismatch: {name}"
+
+    _assert_deep_equal(payload_a["optimizer_state_dict"], payload_b["optimizer_state_dict"])
+    _assert_deep_equal(payload_a["scheduler_state_dict"], payload_b["scheduler_state_dict"])
+
+    assert payload_a["cuda_rng_state"] is not None
+    assert payload_b["cuda_rng_state"] is not None
+    assert torch.equal(payload_a["cuda_rng_state"], payload_b["cuda_rng_state"])
+
+    # Phase 4U 핵심 계약: checkpoint schema를 전혀 바꾸지 않았으므로, 이미
+    # 존재하는 loader_generator_state만으로도 exact-resume이 성립해야 한다.
+    assert torch.equal(payload_a["loader_generator_state"], payload_b["loader_generator_state"])
+
+    # pin_memory/non_blocking은 checkpoint execution-state가 아니므로
+    # (docs/phase4u_cuda_h2d_transfer_optimization_design.md §7/§8),
+    # scaler_state_dict는 FP32 기본값 그대로 항상 None이다.
     assert payload_a["scaler_state_dict"] is None
     assert payload_b["scaler_state_dict"] is None

@@ -1367,6 +1367,66 @@ exact-resume 실측, cross-precision resume matrix, compatibility matrix)
 
 ---
 
+## Phase 4U: CUDA H2D Transfer Optimization
+
+CUDA ImageFolder training의 host(CPU) → device(CUDA) batch 전송 경로에
+`pin_memory`/`non_blocking` 두 가지 순수 runtime 최적화 옵션을
+지원합니다. `device`(Phase 4Q)와 같은 계층의 실행 파라미터라
+`TrainingConfig`/`RESUME_CONFIG_FIELDS`와 무관합니다.
+
+* `ImageFolderWorkflowRequest.pin_memory`/`.non_blocking`(기본값 둘 다
+  `False`) -- CLI `--pin-memory`/`--non-blocking`으로도 선택 가능하며,
+  서로 독립적으로 설정할 수 있습니다(한쪽만 켜는 조합을 거부하지
+  않습니다). `--device cpu`면 두 값 모두 항상 무시되고 effective 값은
+  강제로 `False`입니다 -- CPU에는 host→device 전송 자체가 없어
+  optimization hint가 의미를 갖지 못하며, 이 강제 처리 덕분에 PyTorch의
+  "no accelerator found" 경고도 애초에 발생하지 않습니다.
+* train/val DataLoader 둘 다 같은 effective `pin_memory`를 받습니다.
+  최종 test 평가는 Phase 4Q부터 항상 CPU 고정이라 이 optimization을
+  적용하지 않습니다.
+* `pin_memory`/`non_blocking`은 서로 독립적인 runtime optimization
+  hint입니다. `non_blocking=True`는 training/validation의
+  `images.to(device, non_blocking=...)`/`labels.to(...)` 호출에 그대로
+  전달되며, host-side synchronization을 줄일 수 있어 pageable
+  (unpinned) source에서도 의미가 있을 수 있습니다("unpinned면 항상
+  blocking으로 강등된다"고 일반화하지 않습니다). `pin_memory=True`는
+  DataLoader가 반환하는 host tensor를 page-locked memory에 배치해
+  CUDA H2D transfer를 더 효율적으로 만들 수 있습니다. 다만 이
+  프로젝트는 항상 default CUDA stream만 쓰므로(별도 stream 없음), 두
+  값을 함께 켜더라도 H2D copy와 model kernel execution의 GPU-side
+  overlap을 보장하지는 않습니다 -- **정확성**은 동일 stream 내 커널
+  실행 순서 보장으로 실측 확인했지만(blocking과 non_blocking(pinned)의
+  forward 결과가 bit-identical), 이는 "정확하다"는 보장이지 "겹쳐
+  실행되어 더 빠르다"는 보장이 아닙니다. 별도 CUDA stream을 도입하면
+  이 전제가 깨지므로 그 시점에 재검증이 필요합니다.
+* `pin_memory`/`non_blocking`은 loader generator를 전혀 소비하지 않는
+  순수 host-memory 전송 최적화라, **resume 경계에서 값이 checkpoint
+  저장 당시와 달라져도** bitwise exact-resume에 영향이 없습니다
+  (`RESUME_CONFIG_FIELDS`와도 무관) -- 기존 checkpoint 필드
+  (`loader_generator_state` 등)만으로 이미 충분함을, continuous 5 epoch
+  (`pin_memory=False`/`non_blocking=False`) vs split(3+2, resume 2 epoch만
+  `True`/`True`로 전환) 조합으로 production 경로에서 직접 실측
+  확인했고, 새 checkpoint field/`CHECKPOINT_FORMAT_VERSION` 변경은
+  없습니다.
+* `num_workers`/`persistent_workers`/`prefetch_factor`는 이번 Phase에서
+  의도적으로 미노출입니다 -- `persistent_workers=True`는 현재
+  checkpoint/resume 설계와 구조적으로 충돌해(continuous run과 resume
+  사이 DataLoader worker seed 소비 횟수가 어긋남) exact-resume이
+  깨지고, `num_workers>0` 자체는 exact-resume은 안전하지만 이
+  프로젝트의 전형적인 작은 데이터셋 규모 + Windows spawn 환경에서
+  오히려 뚜렷하게 느려짐을 실측했습니다.
+* **성능 향상을 보장하지 않습니다.** 실제 효과는 dataset 크기/storage
+  I/O/GPU/batch size에 따라 다르며, 로컬 GTX 1080 + 이 프로젝트의
+  작은 CIFAR-10 ImageFolder 규모에서는 뚜렷한 speedup을 보이지
+  않았습니다.
+
+설계 배경과 상세 계약(PyTorch DataLoader base_seed 소스 분석,
+persistent_workers 비호환 메커니즘, exact-resume 실측, 성능 측정
+caveat)은 `docs/phase4u_cuda_h2d_transfer_optimization_design.md`를
+참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
@@ -1448,6 +1508,13 @@ exact-resume 실측, cross-precision resume matrix, compatibility matrix)
   checkpoint `scaler_state_dict`는 항상 `None`(새 checkpoint field
   없음), same-device BF16 exact-resume 지원, hardware capability를
   강제 검증하지 않음(기능 지원과 속도 보장은 별개) (Phase 4T)
+* `--pin-memory`/`--non-blocking`(둘 다 기본값 `False`, 서로 독립적으로
+  설정 가능)으로 CUDA ImageFolder training의 host→device batch 전송을
+  선택적으로 최적화 -- `--device cpu`면 항상 무시(effective 값 강제
+  `False`), `RESUME_CONFIG_FIELDS`와 무관하며 resume 전후로 값이
+  달라져도 exact-resume 유지(새 checkpoint field 없음), `num_workers`/
+  `persistent_workers`는 이번 Phase에서 의도적으로 미노출, 성능 향상
+  비보장 (Phase 4U)
 * TorchScript 배포, C++(LibTorch) CPU/CUDA 추론
 * Python/C++ parity 검증 (Phase 0~4E 배포 경로; Phase 4F는 export/parity
   코드를 변경하지 않았고, 기존 parity E2E를 재실행해 회귀 없음을 확인함
@@ -1491,6 +1558,14 @@ exact-resume 실측, cross-precision resume matrix, compatibility matrix)
   자체는 Phase 4R에서 지원 -- 위 "Phase 4R" 절 참고), multi-GPU/distributed
   training(exact-resume 이전에 training 기능 자체가 미지원), batch-level
   (worker/sampler iterator) resume, distributed checkpoint
+* DataLoader `num_workers`/`persistent_workers`/`prefetch_factor` 노출
+  (`num_workers>0` 자체는 exact-resume이 안전함을 실측 확인했지만, 이
+  프로젝트의 전형적인 작은 데이터셋 규모 + Windows spawn 환경에서
+  오히려 뚜렷하게 느려져 의도적으로 미노출, `persistent_workers=True`는
+  현재 checkpoint/resume 설계와 구조적으로 충돌해 exact-resume이 깨짐
+  -- host→device 전송 최적화(`pin_memory`/`non_blocking`) 자체는 Phase
+  4U에서 지원, 위 "Phase 4U" 절 참고), worker RNG state/prefetch queue
+  checkpoint
 * 기존 `--checkpoint-out` 경로를 명시적으로 덮어쓰도록 강제하는 옵션
   (예: `--overwrite-checkpoint`) -- in-place resume(`--resume-from`과
   `--checkpoint-out`이 같은 경로) 외에는 항상 새 경로가 필요함 (Phase 4J)

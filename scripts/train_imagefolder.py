@@ -186,6 +186,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--pin-memory",
+        action="store_true",
+        default=False,
+        help=(
+            "train/val DataLoader의 host tensor를 pinned memory에 배치한다(Phase 4U). "
+            "--device가 'cuda'/'cuda:N'일 때만 의미가 있다 -- --device cpu면 이 값은 "
+            "무시되고 항상 미적용이다(no-op). 최종 test 평가는 항상 CPU라 이 값과 무관하다"
+        ),
+    )
+    parser.add_argument(
+        "--non-blocking",
+        action="store_true",
+        default=False,
+        help=(
+            "train/validation batch의 host->device 전송에 non_blocking=True를 쓴다(Phase 4U). "
+            "--device가 'cuda'/'cuda:N'일 때만 의미가 있다 -- --device cpu면 이 값은 "
+            "무시되고 항상 미적용이다(no-op). host-side synchronization을 줄이는 효과라 "
+            "--pin-memory 없이도 의미가 있을 수 있지만, 이 프로젝트는 default CUDA stream만 "
+            "쓰므로 --pin-memory와 함께 써도 H2D 전송과 model 연산의 GPU-side 겹침(overlap)을 "
+            "보장하지 않는다. 성능 향상을 보장하지 않는다 -- dataset 크기/storage/GPU/batch "
+            "size에 따라 다르다"
+        ),
+    )
+    parser.add_argument(
         "--export-torchscript",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -296,6 +320,8 @@ def main(argv: list[str] | None = None) -> int:
                 seed=args.seed,
                 checkpoint_every=args.checkpoint_every,
                 device=args.device,
+                pin_memory=args.pin_memory,
+                non_blocking=args.non_blocking,
             )
 
             # Phase 4K: 첫 번째 Ctrl+C를 cooperative stop request로 변환하는

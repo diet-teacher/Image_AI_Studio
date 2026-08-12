@@ -99,7 +99,30 @@ class ImageFolderWorkflowRequest:
     차이가 있다(checkpoint의 `training_config`/`RESUME_CONFIG_FIELDS`와는
     둘 다 무관). training(fresh/resume)에만 적용되고, 최종 test 평가/
     TorchScript export/C++ parity는 이 값과 무관하게 항상 CPU를
-    유지한다(아래 `run_imagefolder_training_workflow()` 참고)."""
+    유지한다(아래 `run_imagefolder_training_workflow()` 참고).
+
+    pin_memory/non_blocking(Phase 4U)은 CUDA training의 host->device
+    batch 전송을 최적화하는 순수 runtime 실행 힌트다 -- `device`와 같은
+    계층(학습 objective를 바꾸지 않으므로 `TrainingConfig`에 두지 않고,
+    checkpoint의 `training_config`/`RESUME_CONFIG_FIELDS`와도 무관하다).
+    사전 조사(docs/phase4u_cuda_h2d_transfer_optimization_design.md)에서
+    두 값 모두 resume 전후로 자유롭게 바뀌어도 bitwise exact-resume이
+    깨지지 않음을 실측으로 확인했다. `device == "cpu"`면 이 두 값은 항상
+    무시되고 effective pin_memory/non_blocking은 강제로 `False`다 --
+    CPU에는 host->device 전송 자체가 없어 순수 optimization hint가
+    의미를 갖지 못하므로(`run_imagefolder_training_workflow()`가 이
+    effective 값을 계산해 실제 DataLoader/`run_training()`에 전달한다).
+    최종 test 평가(항상 CPU)에는 이 값들이 전달되지 않는다. 둘은
+    서로 독립적인 runtime optimization hint로 설정 가능하다(한쪽만
+    켜는 조합을 거부하지 않는다) -- `non_blocking=True`는 host-side
+    synchronization을 줄일 수 있어 pageable(unpinned) source에서도
+    의미가 있을 수 있고, `pin_memory=True`는 DataLoader가 반환하는
+    host tensor를 page-locked memory에 배치해 CUDA H2D transfer를 더
+    효율적으로 만들 수 있다. 다만 이 프로젝트는 항상 default CUDA
+    stream만 쓰므로, 두 값을 함께 켜도 H2D copy와 model kernel
+    execution의 GPU-side overlap을 보장하지는 않는다(정확성 관점에서는
+    어떤 조합도 안전함이 실측됐다 -- docs/
+    phase4u_cuda_h2d_transfer_optimization_design.md 참고)."""
 
     model_json_path: Path
     dataset_root: Path
@@ -111,6 +134,8 @@ class ImageFolderWorkflowRequest:
     seed: int = SEED
     checkpoint_every: int | None = None
     device: str = "cpu"
+    pin_memory: bool = False
+    non_blocking: bool = False
 
 
 @dataclass
@@ -342,6 +367,15 @@ def _validate_device(value: str) -> None:
             )
 
 
+def _is_cuda_device(device: str) -> bool:
+    """`device`가 CUDA 계열("cuda"/"cuda:N")인지 판별한다(Phase 4U). 이미
+    `_validate_device()`가 통과시킨 값에만 적용되므로 별도 형식 검증은
+    하지 않는다. `loop.py`의 `_build_precision_execution()`이 쓰는 것과
+    동일한 판별 predicate다(그쪽은 fp16/bf16 CUDA 전용 여부, 이쪽은
+    pin_memory/non_blocking effective 여부 -- 판별 기준 자체는 같다)."""
+    return device == "cuda" or device.startswith("cuda:")
+
+
 _CUDA_ONLY_PRECISIONS = ("fp16", "bf16")
 
 
@@ -484,6 +518,14 @@ def run_imagefolder_training_workflow(
     _validate_checkpoint_output_paths(request)
     _validate_device(request.device)
     _validate_precision_device_compatibility(request.training_config.precision, request.device)
+    # Phase 4U: pin_memory/non_blocking은 CUDA에서만 의미 있는 순수 runtime
+    # 최적화 힌트다 -- device="cpu"면 request 값과 무관하게 항상 False로
+    # 강제한다(§4 CPU/CUDA effective option contract). CPU DataLoader에
+    # pin_memory=True를 그대로 넘기면 PyTorch가 "no accelerator found"
+    # 경고를 내므로, 여기서 미리 걸러 그 경고 자체가 발생하지 않게 한다.
+    is_cuda = _is_cuda_device(request.device)
+    effective_pin_memory = request.pin_memory if is_cuda else False
+    effective_non_blocking = request.non_blocking if is_cuda else False
 
     model_spec = load_model_spec(request.model_json_path)
     shape_trace = validate_model_spec(model_spec)
@@ -545,8 +587,16 @@ def run_imagefolder_training_workflow(
         generator=loader_generator,
         drop_last=True,
         num_workers=0,
+        pin_memory=effective_pin_memory,
     )
-    val_loader = DataLoader(splits.val, batch_size=batch_size, shuffle=False, num_workers=0)
+    # val은 training 동안 request.device에서 평가되므로(run_training() 내부
+    # evaluate() 호출) train과 동일한 effective_pin_memory를 적용한다.
+    val_loader = DataLoader(
+        splits.val, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=effective_pin_memory
+    )
+    # test는 Phase 4Q부터 항상 CPU 고정 평가라(아래 evaluate_classification_metrics()
+    # 호출 참고) Phase 4U optimization을 적용하지 않는다 -- pin_memory=True를
+    # 줘도 CUDA로 옮겨질 일이 없어 항상 무의미하다.
     test_loader = DataLoader(splits.test, batch_size=batch_size, shuffle=False, num_workers=0)
 
     checkpoint_hook = (
@@ -569,7 +619,7 @@ def run_imagefolder_training_workflow(
         training_result = run_training(
             model, train_loader, val_loader, request.training_config, device=request.device,
             resume_state=resume_state, progress_callback=progress_callback, should_stop=should_stop,
-            checkpoint_hook=checkpoint_hook,
+            checkpoint_hook=checkpoint_hook, non_blocking=effective_non_blocking,
         )
         # checkpoint 저장에 쓸 RNG snapshot -- 이후 코드(TorchScript export의
         # set_seed() 등)가 전역 RNG를 다시 바꾸기 전에, 학습이 실제로 끝난

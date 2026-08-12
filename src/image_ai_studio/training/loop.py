@@ -209,6 +209,7 @@ def train_one_epoch(
     criterion: nn.Module | None = None,
     autocast_dtype: torch.dtype | None = None,
     scaler: torch.amp.GradScaler | None = None,
+    non_blocking: bool = False,
 ) -> float:
     """1 epoch 학습 (model.train() -> forward -> CrossEntropyLoss -> backward
     -> [gradient_clip_norm이 있으면 L2 norm clipping] -> step). 반환값: epoch
@@ -247,15 +248,30 @@ def train_one_epoch(
     `None`이면(Phase 4T, CUDA BF16) autocast로 감싼 forward+loss
     이후 `loss.backward()` -> (clipping 있으면) `clip_grad_norm_` ->
     `optimizer.step()`을 그대로 쓴다 -- FP32 경로와 동일한 순서이며
-    scaled-backward 관련 API를 전혀 호출하지 않는다."""
+    scaled-backward 관련 API를 전혀 호출하지 않는다.
+
+    `non_blocking`(Phase 4U, 기본값 `False`)은 host->device batch 전송
+    (`images.to(device, non_blocking=...)`/`labels.to(...)`)에 그대로
+    전달된다. `non_blocking=True`는 host-side synchronization을 줄일 수
+    있어 pageable(unpinned) source에서도 의미가 있을 수 있다 --
+    "unpinned면 항상 blocking으로 강등된다"는 일반화는 하지 않는다.
+    다만 이 프로젝트는 항상 default CUDA stream만 쓰므로(별도 stream
+    없음), `pin_memory`와 함께 쓰더라도 H2D copy와 model kernel
+    execution의 GPU-side overlap을 보장하지는 않는다 -- 정확성은 동일
+    stream 내 커널 실행 순서 보장으로 실측 확인했지만(docs/
+    phase4u_cuda_h2d_transfer_optimization_design.md), 이는 "정확하다"는
+    보장이지 "겹쳐 실행되어 더 빠르다"는 보장이 아니다.
+    `device="cpu"`에서는 이 인자가 아무 의미도 없다 -- CPU `.to()`는
+    비동기 개념이 없어 사실상 no-op이며, 별도 분기 없이 항상 그대로
+    전달해도 안전하다."""
     model.train()
     criterion = criterion if criterion is not None else nn.CrossEntropyLoss()
     total_loss = 0.0
     total_samples = 0
 
     for images, labels in loader:
-        images = images.to(device)
-        labels = labels.to(device)
+        images = images.to(device, non_blocking=non_blocking)
+        labels = labels.to(device, non_blocking=non_blocking)
 
         optimizer.zero_grad()
         if autocast_dtype is not None:
@@ -288,8 +304,17 @@ def train_one_epoch(
     return total_loss / total_samples
 
 
-def evaluate(model: nn.Module, loader: DataLoader, device: str = "cpu") -> tuple[float, float]:
-    """model.eval()로 validation loss/accuracy 계산 (parameter 변경 없음). 반환값: (avg_loss, accuracy)."""
+def evaluate(
+    model: nn.Module, loader: DataLoader, device: str = "cpu", non_blocking: bool = False
+) -> tuple[float, float]:
+    """model.eval()로 validation loss/accuracy 계산 (parameter 변경 없음). 반환값: (avg_loss, accuracy).
+
+    `non_blocking`(Phase 4U, 기본값 `False`)은 `train_one_epoch()`과
+    동일한 의미로 batch `.to()` 호출에 전달된다 -- validation도
+    training epoch 중 `request.device`에서 수행되므로 같은 effective
+    값을 받는다(imagefolder_workflow.py의 `run_imagefolder_training_workflow()`
+    참고). `evaluate_classification_metrics()`(항상 CPU 최종 test 평가)에는
+    이 인자가 없다 -- 그 경로에는 Phase 4U optimization을 전달하지 않는다."""
     model.eval()
     criterion = nn.CrossEntropyLoss()
     total_loss = 0.0
@@ -298,8 +323,8 @@ def evaluate(model: nn.Module, loader: DataLoader, device: str = "cpu") -> tuple
 
     with torch.inference_mode():
         for images, labels in loader:
-            images = images.to(device)
-            labels = labels.to(device)
+            images = images.to(device, non_blocking=non_blocking)
+            labels = labels.to(device, non_blocking=non_blocking)
 
             outputs = model(images)
             loss = criterion(outputs, labels)
@@ -667,6 +692,7 @@ def run_training(
     progress_callback: TrainingProgressCallback | None = None,
     should_stop: ShouldStopCallback | None = None,
     checkpoint_hook: CheckpointHook | None = None,
+    non_blocking: bool = False,
 ) -> TrainingResult:
     """train_one_epoch/evaluate를 config.epochs만큼 반복하는 얇은 조립 함수.
 
@@ -738,6 +764,12 @@ def run_training(
        4, 5이고 best_epoch도 이 절대 번호 기준으로 기록된다.
 
     model은 호출 전에 이미 device로 옮겨져 있어야 함.
+
+    `non_blocking`(Phase 4U, 기본값 `False`)은 매 epoch의
+    `train_one_epoch()`/`evaluate()`(validation) 호출 둘 다에 그대로
+    전달된다 -- checkpoint/resume/precision/RNG 로직과는 완전히
+    독립적이며, checkpoint state에 포함되지 않는다(자유롭게 바뀌어도
+    exact-resume에 영향 없음을 실측 확인).
 
     매 epoch의 순서는 train -> validation -> history 기록 -> best
     model/개선 카운터 갱신 -> scheduler.step(val_loss) -> early stopping
@@ -886,10 +918,10 @@ def run_training(
         train_loss = train_one_epoch(
             model, train_loader, optimizer, device=device,
             gradient_clip_norm=config.gradient_clip_norm, criterion=criterion,
-            autocast_dtype=autocast_dtype, scaler=scaler,
+            autocast_dtype=autocast_dtype, scaler=scaler, non_blocking=non_blocking,
         )
         history.train_losses.append(train_loss)
-        val_loss, val_accuracy = evaluate(model, val_loader, device=device)
+        val_loss, val_accuracy = evaluate(model, val_loader, device=device, non_blocking=non_blocking)
         history.val_losses.append(val_loss)
         history.val_accuracies.append(val_accuracy)
         learning_rate = optimizer.param_groups[0]["lr"]

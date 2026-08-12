@@ -319,7 +319,7 @@ def test_run_training_tie_keeps_first_epoch(monkeypatch: pytest.MonkeyPatch) -> 
     fixed_val_results = iter([(0.5, 1.0), (0.5, 1.0), (0.6, 1.0)])
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(fixed_val_results),
+        lambda model, loader, device="cpu", non_blocking=False: next(fixed_val_results),
     )
 
     result = run_training(model, train_loader, val_loader, config)
@@ -341,7 +341,7 @@ def test_run_training_first_epoch_fallback_when_never_improves(monkeypatch: pyte
     fixed_val_results = iter([(0.1, 1.0), (0.5, 1.0), (0.9, 1.0)])
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(fixed_val_results),
+        lambda model, loader, device="cpu", non_blocking=False: next(fixed_val_results),
     )
 
     result = run_training(model, train_loader, val_loader, config)
@@ -533,7 +533,7 @@ def test_run_training_stops_exactly_after_patience_non_improving_epochs(
     fixed_val_results = iter([(1.0, 1.0), (1.0, 1.0), (1.0, 1.0), (0.5, 1.0)])
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(fixed_val_results),
+        lambda model, loader, device="cpu", non_blocking=False: next(fixed_val_results),
     )
 
     result = run_training(model, train_loader, val_loader, config)
@@ -575,7 +575,7 @@ def test_run_training_early_stopping_preserves_best_epoch_parameters(
 
     def fake_train_one_epoch(
         model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None,
-        autocast_dtype=None, scaler=None,
+        autocast_dtype=None, scaler=None, non_blocking=False,
     ):
         call_count["value"] += 1
         epoch_value = float(call_count["value"])
@@ -587,7 +587,7 @@ def test_run_training_early_stopping_preserves_best_epoch_parameters(
     monkeypatch.setattr("image_ai_studio.training.loop.train_one_epoch", fake_train_one_epoch)
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(fixed_val_results),
+        lambda model, loader, device="cpu", non_blocking=False: next(fixed_val_results),
     )
 
     result = run_training(model, train_loader, val_loader, config)
@@ -618,7 +618,7 @@ def test_run_training_early_stopping_tie_is_not_improvement(monkeypatch: pytest.
     fixed_val_results = iter([(1.0, 1.0), (1.0, 1.0), (0.1, 1.0)])
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(fixed_val_results),
+        lambda model, loader, device="cpu", non_blocking=False: next(fixed_val_results),
     )
 
     result = run_training(model, train_loader, val_loader, config)
@@ -643,7 +643,7 @@ def test_run_training_early_stopping_patience_one_stops_after_first_non_improvem
     fixed_val_results = iter([(0.9, 1.0), (1.0, 1.0), (0.1, 1.0)])
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(fixed_val_results),
+        lambda model, loader, device="cpu", non_blocking=False: next(fixed_val_results),
     )
 
     result = run_training(model, train_loader, val_loader, config)
@@ -739,7 +739,7 @@ def test_run_training_resume_records_best_epoch_using_absolute_epoch_number(
     first_val_results = iter([(1.0, 1.0), (0.9, 1.0), (0.8, 1.0)])
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(first_val_results),
+        lambda model, loader, device="cpu", non_blocking=False: next(first_val_results),
     )
     first_config = TrainingConfig(epochs=3, batch_size=8, learning_rate=1e-2)
     first = run_training(model, train_loader, val_loader, first_config)
@@ -748,7 +748,7 @@ def test_run_training_resume_records_best_epoch_using_absolute_epoch_number(
     second_val_results = iter([(0.5, 1.0), (0.99, 1.0)])
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(second_val_results),
+        lambda model, loader, device="cpu", non_blocking=False: next(second_val_results),
     )
     second = run_training(
         model, train_loader, val_loader,
@@ -775,7 +775,7 @@ def test_run_training_resume_preserves_best_state_dict_when_no_new_best(
     first_val_results = iter([(1.0, 1.0), (0.5, 1.0)])
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(first_val_results),
+        lambda model, loader, device="cpu", non_blocking=False: next(first_val_results),
     )
     first_config = TrainingConfig(epochs=2, batch_size=8, learning_rate=1e-2)
     first = run_training(model, train_loader, val_loader, first_config)
@@ -784,7 +784,7 @@ def test_run_training_resume_preserves_best_state_dict_when_no_new_best(
     second_val_results = iter([(0.9, 1.0), (0.8, 1.0)])  # 둘 다 0.5보다 나쁨 -> 개선 없음
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(second_val_results),
+        lambda model, loader, device="cpu", non_blocking=False: next(second_val_results),
     )
     second = run_training(
         model, train_loader, val_loader,
@@ -811,7 +811,7 @@ def test_run_training_resume_restores_early_stopping_counter(monkeypatch: pytest
     first_val_results = iter([(1.0, 1.0), (1.0, 1.0), (1.0, 1.0)])
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(first_val_results),
+        lambda model, loader, device="cpu", non_blocking=False: next(first_val_results),
     )
     config = TrainingConfig(epochs=3, batch_size=8, learning_rate=1e-2, early_stopping_patience=3)
     first = run_training(model, train_loader, val_loader, config)
@@ -822,7 +822,7 @@ def test_run_training_resume_restores_early_stopping_counter(monkeypatch: pytest
     second_val_results = iter([(1.0, 1.0)])
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(second_val_results),
+        lambda model, loader, device="cpu", non_blocking=False: next(second_val_results),
     )
     second = run_training(
         model, train_loader, val_loader, config, resume_state=_make_resume_state(first, config)
@@ -1421,7 +1421,7 @@ def test_run_training_passes_build_criterion_result_to_train_one_epoch(monkeypat
 
     def fake_train_one_epoch(
         model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None,
-        autocast_dtype=None, scaler=None,
+        autocast_dtype=None, scaler=None, non_blocking=False,
     ):
         captured["criterion"] = criterion
         return 0.5
@@ -1429,7 +1429,7 @@ def test_run_training_passes_build_criterion_result_to_train_one_epoch(monkeypat
     monkeypatch.setattr("image_ai_studio.training.loop.train_one_epoch", fake_train_one_epoch)
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": (0.5, 0.5),
+        lambda model, loader, device="cpu", non_blocking=False: (0.5, 0.5),
     )
 
     torch.manual_seed(0)
@@ -1700,7 +1700,7 @@ def test_run_training_passes_class_weights_criterion_to_train_one_epoch(monkeypa
 
     def fake_train_one_epoch(
         model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None,
-        autocast_dtype=None, scaler=None,
+        autocast_dtype=None, scaler=None, non_blocking=False,
     ):
         captured["criterion"] = criterion
         return 0.5
@@ -1708,7 +1708,7 @@ def test_run_training_passes_class_weights_criterion_to_train_one_epoch(monkeypa
     monkeypatch.setattr("image_ai_studio.training.loop.train_one_epoch", fake_train_one_epoch)
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": (0.5, 0.5),
+        lambda model, loader, device="cpu", non_blocking=False: (0.5, 0.5),
     )
 
     torch.manual_seed(0)
@@ -2049,7 +2049,7 @@ def test_run_training_checkpoint_hook_view_matches_epoch_state(monkeypatch: pyte
 
     def fake_train_one_epoch(
         model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None,
-        autocast_dtype=None, scaler=None,
+        autocast_dtype=None, scaler=None, non_blocking=False,
     ):
         call_count["value"] += 1
         epoch_value = float(call_count["value"])
@@ -2061,7 +2061,7 @@ def test_run_training_checkpoint_hook_view_matches_epoch_state(monkeypatch: pyte
     monkeypatch.setattr("image_ai_studio.training.loop.train_one_epoch", fake_train_one_epoch)
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(fixed_val_results),
+        lambda model, loader, device="cpu", non_blocking=False: next(fixed_val_results),
     )
 
     recorded: list[dict] = []
@@ -2244,7 +2244,7 @@ def test_run_training_checkpoint_hook_early_stopping_epoch_reports_stopped_early
     fixed_val_results = iter([(1.0, 1.0), (1.0, 1.0), (1.0, 1.0), (0.5, 1.0)])
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(fixed_val_results),
+        lambda model, loader, device="cpu", non_blocking=False: next(fixed_val_results),
     )
 
     seen_stopped_early: list[bool] = []
@@ -2415,7 +2415,7 @@ def test_run_training_resume_scheduler_lr_reduction_crosses_checkpoint_boundary(
     val_results_a = iter([(1.0, 1.0)] * 4)
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(val_results_a),
+        lambda model, loader, device="cpu", non_blocking=False: next(val_results_a),
     )
     result_a = run_training(model_a, train_loader_a, val_loader_a, TrainingConfig(epochs=4, **scheduler_kwargs))
     assert result_a.optimizer_state_dict["param_groups"][0]["lr"] == 0.5
@@ -2428,7 +2428,7 @@ def test_run_training_resume_scheduler_lr_reduction_crosses_checkpoint_boundary(
     val_results_b1 = iter([(1.0, 1.0)] * 3)
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(val_results_b1),
+        lambda model, loader, device="cpu", non_blocking=False: next(val_results_b1),
     )
     result_b1 = run_training(model_b, train_loader_b, val_loader_b, first_config)
     assert result_b1.optimizer_state_dict["param_groups"][0]["lr"] == 1.0  # 아직 감소 전
@@ -2439,7 +2439,7 @@ def test_run_training_resume_scheduler_lr_reduction_crosses_checkpoint_boundary(
     val_results_b2 = iter([(1.0, 1.0)])
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(val_results_b2),
+        lambda model, loader, device="cpu", non_blocking=False: next(val_results_b2),
     )
     result_b2 = run_training(model_b, train_loader_b, val_loader_b, resume_config, resume_state=resume_state)
 
@@ -2546,7 +2546,7 @@ def test_run_training_progress_callback_learning_rate_captured_before_scheduler_
     fixed_val_results = iter([(1.0, 1.0)] * 4)
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(fixed_val_results),
+        lambda model, loader, device="cpu", non_blocking=False: next(fixed_val_results),
     )
 
     progresses: list = []
@@ -2567,7 +2567,7 @@ def test_run_training_progress_callback_fires_even_on_early_stopping_epoch(
     fixed_val_results = iter([(1.0, 1.0), (1.0, 1.0), (1.0, 1.0), (0.5, 1.0)])
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(fixed_val_results),
+        lambda model, loader, device="cpu", non_blocking=False: next(fixed_val_results),
     )
 
     progresses: list = []
@@ -2664,7 +2664,7 @@ def test_run_training_should_stop_not_evaluated_once_early_stopping_triggers(
     fixed_val_results = iter([(1.0, 1.0), (1.0, 1.0), (1.0, 1.0), (0.5, 1.0)])
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(fixed_val_results),
+        lambda model, loader, device="cpu", non_blocking=False: next(fixed_val_results),
     )
 
     should_stop_calls = {"value": 0}
@@ -3212,3 +3212,145 @@ def test_run_training_cuda_fp16_amp_resume_accepts_missing_scaler_state() -> Non
     )
 
     assert result_b.scaler_state_dict is not None  # fresh scaler로 시작했지만 여전히 존재
+
+
+# -- Phase 4U: non_blocking wiring (CUDA H2D transfer optimization) ---------
+
+
+def _spy_tensor_to(monkeypatch: pytest.MonkeyPatch, sink: list[bool | None]) -> None:
+    """`torch.Tensor.to()` 호출에 실제로 전달되는 `non_blocking` kwarg를
+    `sink`에 기록만 하고 원래 동작으로 위임한다(Phase 4U). 이 프로젝트의
+    최소 CPU fixture(nn.Linear 등)는 forward 안에서 `.to()`를 호출하지
+    않으므로, `train_one_epoch()`/`evaluate()`의 `images.to(...)`/
+    `labels.to(...)` 두 호출만 안전하게 가로챌 수 있다."""
+    original_to = torch.Tensor.to
+
+    def spying_to(self, *args, **kwargs):
+        sink.append(kwargs.get("non_blocking"))
+        return original_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", spying_to)
+
+
+@pytest.mark.parametrize("non_blocking", [False, True])
+def test_train_one_epoch_forwards_non_blocking_to_tensor_to(
+    monkeypatch: pytest.MonkeyPatch, non_blocking: bool
+) -> None:
+    """`train_one_epoch(..., non_blocking=...)`이 실제로 `images.to(device,
+    non_blocking=...)`/`labels.to(device, non_blocking=...)` 호출에 그
+    값을 그대로 전달하는지 CPU에서 직접 고정한다(CPU에서도 인자 자체는
+    전달되어야 한다 -- 실제 비동기 여부와 무관하게 wiring 계약)."""
+    recorded: list[bool | None] = []
+    _spy_tensor_to(monkeypatch, recorded)
+
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, _val_loader = _make_loaders(spec, seed=0)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+
+    train_one_epoch(model, train_loader, optimizer, non_blocking=non_blocking)
+
+    calls_with_kwarg = [value for value in recorded if value is not None]
+    assert len(calls_with_kwarg) > 0, "images.to()/labels.to() must pass non_blocking explicitly"
+    assert all(value == non_blocking for value in calls_with_kwarg)
+
+
+@pytest.mark.parametrize("non_blocking", [False, True])
+def test_evaluate_forwards_non_blocking_to_tensor_to(
+    monkeypatch: pytest.MonkeyPatch, non_blocking: bool
+) -> None:
+    """`evaluate(..., non_blocking=...)`도 `train_one_epoch()`과 동일한
+    의미로 `.to()` 호출에 그 값을 전달하는지 직접 고정한다(validation도
+    training epoch 중 같은 effective 값을 받는다는 §5 wiring 계약의
+    evaluate() 쪽 절반)."""
+    recorded: list[bool | None] = []
+    _spy_tensor_to(monkeypatch, recorded)
+
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    _train_loader, val_loader = _make_loaders(spec, seed=0)
+
+    evaluate(model, val_loader, non_blocking=non_blocking)
+
+    calls_with_kwarg = [value for value in recorded if value is not None]
+    assert len(calls_with_kwarg) > 0, "images.to()/labels.to() must pass non_blocking explicitly"
+    assert all(value == non_blocking for value in calls_with_kwarg)
+
+
+def test_train_one_epoch_non_blocking_defaults_to_false() -> None:
+    """기본값(`non_blocking` 생략)에서 Phase 4A~4T까지의 기존 FP32 CPU
+    경로가 그대로 재현되는지 확인한다 -- `non_blocking=False`로 명시한
+    호출과 결과가 완전히 동일해야 한다(existing caller 하위호환)."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model_a = build_model(spec)
+    train_loader_a, _val_loader_a = _make_loaders(spec, seed=0)
+    optimizer_a = torch.optim.Adam(model_a.parameters(), lr=1e-2)
+    loss_omitted = train_one_epoch(model_a, train_loader_a, optimizer_a)  # non_blocking 생략
+
+    torch.manual_seed(0)
+    model_b = build_model(spec)
+    train_loader_b, _val_loader_b = _make_loaders(spec, seed=0)
+    optimizer_b = torch.optim.Adam(model_b.parameters(), lr=1e-2)
+    loss_explicit_false = train_one_epoch(model_b, train_loader_b, optimizer_b, non_blocking=False)
+
+    assert loss_omitted == loss_explicit_false
+
+
+def test_run_training_forwards_non_blocking_to_train_one_epoch_and_evaluate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run_training()이 자신의 `non_blocking` 인자를 매 epoch의
+    `train_one_epoch()`/`evaluate()` 호출 둘 다에 그대로 전달하는
+    연결 계약을 직접 고정한다(criterion 배선 테스트와 동일한 근거 --
+    각 함수가 자기 자신의 non_blocking 인자를 올바르게 처리하는지와,
+    run_training()이 실제로 그 값을 넘기는지는 서로 다른 실패 지점이다)."""
+    captured: dict = {}
+
+    def fake_train_one_epoch(
+        model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None,
+        autocast_dtype=None, scaler=None, non_blocking=False,
+    ):
+        captured["train_non_blocking"] = non_blocking
+        return 0.5
+
+    def fake_evaluate(model, loader, device="cpu", non_blocking=False):
+        captured["evaluate_non_blocking"] = non_blocking
+        return 0.5, 0.5
+
+    monkeypatch.setattr("image_ai_studio.training.loop.train_one_epoch", fake_train_one_epoch)
+    monkeypatch.setattr("image_ai_studio.training.loop.evaluate", fake_evaluate)
+
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec)
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+
+    run_training(model, train_loader, val_loader, config, non_blocking=True)
+
+    assert captured["train_non_blocking"] is True
+    assert captured["evaluate_non_blocking"] is True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a local CUDA device")
+def test_run_training_cuda_non_blocking_completes_one_epoch_with_finite_loss() -> None:
+    """optional CUDA smoke test(Phase 4U) -- non_blocking=True로 generic
+    run_training()이 한 epoch 정상 완료되는지 최소 확인한다. production
+    workflow 경로의 pin_memory+non_blocking exact-resume 전체 증명은
+    test_imagefolder_workflow.py의
+    test_workflow_cuda_pin_memory_non_blocking_resume_boundary_option_change_exact_resume
+    가 담당한다."""
+    torch.manual_seed(0)
+    spec = _mlp_classifier_spec()
+    model = build_model(spec).to("cuda")
+    train_loader, val_loader = _make_loaders(spec, seed=0)
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2)
+
+    result = run_training(model, train_loader, val_loader, config, device="cuda", non_blocking=True)
+
+    assert len(result.history.train_losses) == 1
+    assert math.isfinite(result.history.train_losses[0])
+    assert math.isfinite(result.history.val_losses[0])

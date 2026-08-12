@@ -381,7 +381,7 @@ def test_checkpoint_distinguishes_current_model_from_best_model(
 
     def fake_train_one_epoch(
         model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None,
-        autocast_dtype=None, scaler=None,
+        autocast_dtype=None, scaler=None, non_blocking=False,
     ):
         call_count["value"] += 1
         epoch_value = float(call_count["value"])
@@ -394,7 +394,7 @@ def test_checkpoint_distinguishes_current_model_from_best_model(
     monkeypatch.setattr("image_ai_studio.training.loop.train_one_epoch", fake_train_one_epoch)
     monkeypatch.setattr(
         "image_ai_studio.training.loop.evaluate",
-        lambda model, loader, device="cpu": next(fixed_val_results),
+        lambda model, loader, device="cpu", non_blocking=False: next(fixed_val_results),
     )
 
     result = run_training(model, train_loader, val_loader, config)
