@@ -1482,6 +1482,39 @@ artifact schema 무영향 근거, GUI worker-thread 예상 사용 방식)은
 
 ---
 
+## Phase 4W: Final Training Integration / Graduation
+
+Phase 4A~4V에서 구현한 기능을 하나의 production pipeline으로 통합
+검증하고 Phase 4를 공식 종료했습니다. **새 기능을 추가하지 않았습니다**
+-- 기존 production API를 실제 사용자 흐름으로 조합해 재검증하는 것이
+유일한 목적이었고, production code 변경 없이 검증만으로 완료됐습니다.
+
+* full pytest 719/719 PASS(CUDA 포함, skip 없음).
+* CPU exact-resume(기본 + AdamW/gradient-clip/label-smoothing/
+  class-weights/user-stop 변형 6종), CUDA FP32(Phase 4R)/FP16(Phase 4S)/
+  BF16(Phase 4T)/H2D option-change(Phase 4U) exact-resume 전부 실제
+  GPU에서 PASS.
+* 기존 5개 E2E(`run_phase1_e2e.py`/`run_training_e2e.py`/
+  `run_real_training_e2e.py`/`run_resume_training_e2e.py`/
+  `run_imagefolder_training_e2e.py`) 전부 PASS, numerical anchor
+  (`1.3386→0.2867`, `2.3558→2.0817`, resume epoch5
+  `train_loss=1.017424`, ImageFolder `2.3903→2.1509`) 정확히 일치.
+* legacy checkpoint 하위호환(`weight_decay`/`class_weights`/
+  `cuda_rng_state`/`scaler_state_dict` 키 부재) 전부 정상.
+* 대표 ImageFolder production run의 artifact(checkpoint/metadata/
+  best model/class mapping/TorchScript/test result/training history)
+  전부 정상 생성, `training_history.json`/checkpoint `history`
+  서브딕트 schema가 Phase 4V 계약 그대로(`stop_reason`/
+  `epoch_duration_seconds` 누출 없음) 유지됨을 직접 확인.
+* TorchScript export, Python/C++ parity 전부 PASS.
+
+**PHASE 4 GRADUATED.** 상세 결과와 known limitations/deferred
+항목(Phase 5 backlog), Phase 5 handoff public API 목록은
+`docs/phase4w_final_training_integration_graduation.md`를
+참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
