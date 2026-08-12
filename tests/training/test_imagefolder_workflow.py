@@ -7,6 +7,7 @@ monkeypatch가 필요 없다.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -1987,17 +1988,22 @@ def test_workflow_cuda_same_device_exact_resume_conv_bn_dropout(tmp_path: Path) 
     assert torch.equal(payload_a["cuda_rng_state"], payload_b["cuda_rng_state"])
 
 
-# -- Phase 4S: CUDA FP16 AMP training --------------------------------------------
+# -- Phase 4S/4T: CUDA FP16/BF16 AMP training -------------------------------------
 
 
-def test_validate_precision_device_compatibility_rejects_cpu_fp16() -> None:
+@pytest.mark.parametrize("precision", ["fp16", "bf16"])
+def test_validate_precision_device_compatibility_rejects_cpu(precision: str) -> None:
     with pytest.raises(ValueError, match="precision"):
-        _validate_precision_device_compatibility("fp16", "cpu")
+        _validate_precision_device_compatibility(precision, "cpu")
 
 
 @pytest.mark.parametrize(
     ("precision", "device"),
-    [("fp32", "cpu"), ("fp32", "cuda"), ("fp16", "cuda"), ("fp16", "cuda:0")],
+    [
+        ("fp32", "cpu"), ("fp32", "cuda"),
+        ("fp16", "cuda"), ("fp16", "cuda:0"),
+        ("bf16", "cuda"), ("bf16", "cuda:0"),
+    ],
 )
 def test_validate_precision_device_compatibility_accepts_valid_combinations(
     precision: str, device: str
@@ -2005,17 +2011,18 @@ def test_validate_precision_device_compatibility_accepts_valid_combinations(
     _validate_precision_device_compatibility(precision, device)  # raise 없이 통과해야 함
 
 
-def test_workflow_rejects_cpu_fp16_before_training_starts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("precision", ["fp16", "bf16"])
+def test_workflow_rejects_cpu_amp_precision_before_training_starts(
+    precision: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """device="cpu"+precision="fp16" 조합은 run_training()이 호출되기 전에
-    조기 거부돼야 한다(_validate_device()와 동일한 "학습 시작 전 명확한
-    에러" 패턴)."""
+    """device="cpu"+precision="fp16"/"bf16" 조합은 run_training()이
+    호출되기 전에 조기 거부돼야 한다(_validate_device()와 동일한
+    "학습 시작 전 명확한 에러" 패턴)."""
     called = {"value": False}
 
     def fail_if_called(*args, **kwargs):
         called["value"] = True
-        raise AssertionError("run_training() must not be called for device='cpu'+precision='fp16'")
+        raise AssertionError(f"run_training() must not be called for device='cpu'+precision={precision!r}")
 
     monkeypatch.setattr("image_ai_studio.training.imagefolder_workflow.run_training", fail_if_called)
 
@@ -2024,7 +2031,7 @@ def test_workflow_rejects_cpu_fp16_before_training_starts(
     request = ImageFolderWorkflowRequest(
         model_json_path=model_json_path,
         dataset_root=tmp_path,
-        training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2, precision="fp16"),
+        training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2, precision=precision),
         output_dir=tmp_path / "out",
         export_torchscript=False,
         seed=SEED,
@@ -2069,22 +2076,40 @@ def test_workflow_cpu_fp32_path_never_calls_amp_api(
     assert len(result.history.train_losses) == 1
 
 
-def _fast_growth_grad_scaler(config: TrainingConfig, device: str):
-    """optional CUDA exact-resume test 전용 GradScaler builder(T1 monkeypatch
-    방식) -- production `_build_grad_scaler()`와 동일한 의미의 조건
-    분기를 쓰되(fp32 -> None, fp16+CUDA -> scaler, fp16+non-CUDA ->
-    거부) `growth_interval`을 작게 줘서 몇 step 안에 `scale`/
-    `_growth_tracker`가 실제로 바뀌게 한다(조사 라운드 실측 근거).
-    production `TrainingConfig`/CLI에는 이 tuning parameter를 노출하지
-    않는다 -- 이 값은 이 테스트 파일에만 존재한다. 이 helper는 이 파일의
-    optional CUDA exact-resume fixture 전용이라(항상 device="cuda"로만
-    호출됨) production의 device 문자열 파싱을 그대로 재사용하지 않고
-    최소한의 동일 조건만 복제한다."""
-    if config.precision != "fp16":
-        return None
-    if device == "cuda" or device.startswith("cuda:"):
-        return torch.amp.GradScaler(device, growth_interval=2, init_scale=1024.0)
-    raise ValueError(f"precision={config.precision!r} requires a CUDA device, but device={device!r}")
+def _fast_growth_precision_execution(config: TrainingConfig, device: str):
+    """optional CUDA exact-resume test 전용 precision execution builder
+    (T1 monkeypatch 방식) -- production `_build_precision_execution()`
+    과 동일한 의미의 **explicit** 조건 분기를 쓰되(fp32 -> (None, None),
+    fp16+CUDA -> (float16, fast GradScaler), bf16+CUDA -> (bfloat16,
+    None), 그 외 precision -> 거부, non-CUDA -> 거부) FP16의
+    `growth_interval`을 작게 줘서 몇 step 안에 `scale`/`_growth_tracker`
+    가 실제로 바뀌게 한다(조사 라운드 실측 근거). production
+    `TrainingConfig`/CLI에는 이 tuning parameter를 노출하지 않는다 --
+    이 값은 이 테스트 파일에만 존재한다. 이 helper는 이 파일의 optional
+    CUDA exact-resume fixture 전용이라(항상 device="cuda"로만 호출됨)
+    production의 device 문자열 파싱을 그대로 재사용하지 않고 최소한의
+    동일 조건만 복제한다. Phase 4T에서 production 함수가
+    `_build_grad_scaler()`(단일 GradScaler 반환)에서
+    `_build_precision_execution()`(tuple 반환)으로 재설계됐으므로 이
+    helper도 같은 tuple 형태로 다시 작성했다. `GradScaler`에는 `device`
+    문자열이 아니라 항상 `"cuda"`(device type)만 전달한다 -- production
+    과 동일한 이유(GradScaler의 공식 contract는 device type만 받고,
+    scale tensor의 실제 ordinal 배치는 loss tensor의 device로 정해져
+    ordinal을 전달해도 기능적 이득이 없음). precision dispatch도
+    production과 동일하게 "fp16이 아니면 무조건 bf16"이라는 implicit
+    fallback을 쓰지 않고, fp32/fp16/bf16을 각각 명시적으로 분기한
+    뒤 그 외 값은 명확히 거부한다 -- 이 helper의 docstring이 주장하는
+    "production과 동일한 의미의 조건 분기"가 실제 코드와 정확히
+    일치하도록 한다."""
+    if config.precision == "fp32":
+        return None, None
+    if config.precision not in ("fp16", "bf16"):
+        raise ValueError(f"unsupported precision: {config.precision!r}")
+    if not (device == "cuda" or device.startswith("cuda:")):
+        raise ValueError(f"precision={config.precision!r} requires a CUDA device, but device={device!r}")
+    if config.precision == "fp16":
+        return torch.float16, torch.amp.GradScaler("cuda", growth_interval=2, init_scale=1024.0)
+    return torch.bfloat16, None  # config.precision == "bf16"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a local CUDA device")
@@ -2096,12 +2121,13 @@ def test_workflow_cuda_amp_fp16_same_device_exact_resume(
     + checkpoint_out)를 그대로 재사용해, precision="fp16" AMP +
     gradient_clip_norm이 함께 걸린 continuous CUDA 5 epoch와 split(3+2)
     CUDA resume이 same physical CUDA device 기준 bitwise exact함을
-    증명한다. `_build_grad_scaler()`를 growth_interval=2로 monkeypatch해
-    GradScaler state(scale/_growth_tracker)가 checkpoint 저장 전에 실제로
-    변하도록 강제한다(조사 라운드의 positive control과 동일한 근거 --
-    state가 우연히 초기값과 같아 차이가 드러나지 않는 상황을 피한다)."""
+    증명한다. `_build_precision_execution()`을 growth_interval=2로
+    monkeypatch해 GradScaler state(scale/_growth_tracker)가 checkpoint
+    저장 전에 실제로 변하도록 강제한다(조사 라운드의 positive control과
+    동일한 근거 -- state가 우연히 초기값과 같아 차이가 드러나지 않는
+    상황을 피한다)."""
     monkeypatch.setattr(
-        "image_ai_studio.training.loop._build_grad_scaler", _fast_growth_grad_scaler
+        "image_ai_studio.training.loop._build_precision_execution", _fast_growth_precision_execution
     )
 
     _make_standard_dataset(tmp_path, count_per_class=8)
@@ -2196,3 +2222,131 @@ def test_workflow_cuda_amp_fp16_same_device_exact_resume(
         "growth_interval": 2, "_growth_tracker": 0,
     }, "fixture must actually change scaler state before checkpointing"
     _assert_deep_equal(payload_a["scaler_state_dict"], payload_b["scaler_state_dict"])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a local CUDA device")
+def test_workflow_cuda_bf16_one_epoch_completes_with_clipping(tmp_path: Path) -> None:
+    """optional CUDA smoke test(Phase 4T) -- precision="bf16"+
+    gradient_clip_norm이 함께 걸린 production ImageFolder workflow가
+    한 epoch 정상 완료되는지 확인한다(GradScaler 없이 FP32와 동일한
+    순서로 backward->clip->step이 실행되는 실제 경로)."""
+    _make_standard_dataset(tmp_path, count_per_class=8)
+    spec = _conv_bn_dropout_spec()
+    model_json_path = _write_model_json(tmp_path, spec)
+
+    result = run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(
+                epochs=1, batch_size=4, learning_rate=1e-2, gradient_clip_norm=1.0, precision="bf16"
+            ),
+            output_dir=tmp_path / "out",
+            export_torchscript=False,
+            seed=SEED,
+            device="cuda",
+        )
+    )
+
+    assert len(result.history.train_losses) == 1
+    assert math.isfinite(result.history.train_losses[0])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a local CUDA device")
+def test_workflow_cuda_bf16_same_device_exact_resume(tmp_path: Path) -> None:
+    """Phase 4T 핵심 regression. Phase 4R/4S와 동일한 Conv2d+BatchNorm2d+
+    Dropout fixture와 production checkpoint 경로를 그대로 재사용해,
+    precision="bf16"(GradScaler 없음) + gradient_clip_norm이 함께 걸린
+    continuous CUDA 5 epoch와 split(3+2) CUDA resume이 same physical
+    CUDA device 기준 bitwise exact함을 증명한다. BF16은 GradScaler를
+    쓰지 않으므로 checkpoint의 scaler_state_dict는 항상 None이어야
+    하고(새 checkpoint state가 전혀 필요 없음), 그 상태로도 exact-resume
+    이 성립함을 조사 라운드 실측과 동일하게 production 경로에서
+    재확인한다."""
+    _make_standard_dataset(tmp_path, count_per_class=8)
+    spec = _conv_bn_dropout_spec()
+    model_json_path = _write_model_json(tmp_path, spec)
+    config_kwargs = dict(
+        batch_size=4, learning_rate=1e-2, optimizer="sgd", momentum=0.9,
+        lr_scheduler="plateau", lr_scheduler_factor=0.5, lr_scheduler_patience=1,
+        gradient_clip_norm=1.0, precision="bf16",
+    )
+
+    checkpoint_a = tmp_path / "a_checkpoint.pt"
+    result_a = run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=5, **config_kwargs),
+            output_dir=tmp_path / "a",
+            checkpoint_out=checkpoint_a,
+            export_torchscript=False,
+            seed=SEED,
+            device="cuda",
+        )
+    )
+
+    checkpoint_b = tmp_path / "b_checkpoint.pt"
+    run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=3, **config_kwargs),
+            output_dir=tmp_path / "b1",
+            checkpoint_out=checkpoint_b,
+            export_torchscript=False,
+            seed=SEED,
+            device="cuda",
+        )
+    )
+    result_b2 = run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=2, **config_kwargs),
+            output_dir=tmp_path / "b2",
+            resume_from=checkpoint_b,
+            checkpoint_out=checkpoint_b,
+            export_torchscript=False,
+            seed=SEED,
+            device="cuda",
+        )
+    )
+
+    assert len(result_b2.history.train_losses) == 5
+    assert result_b2.history.train_losses == result_a.history.train_losses
+    assert result_b2.history.val_losses == result_a.history.val_losses
+    assert result_b2.history.val_accuracies == result_a.history.val_accuracies
+    assert result_b2.history.best_epoch == result_a.history.best_epoch
+    assert result_b2.history.best_val_loss == result_a.history.best_val_loss
+    assert result_b2.history.stopped_early == result_a.history.stopped_early
+
+    payload_a = load_training_checkpoint(checkpoint_a)
+    payload_b = load_training_checkpoint(checkpoint_b)
+
+    for name, tensor in payload_a["model_state_dict"].items():
+        assert torch.equal(tensor, payload_b["model_state_dict"][name]), f"model param mismatch: {name}"
+
+    bn_buffer_keys = [
+        key for key in payload_a["model_state_dict"]
+        if "running_mean" in key or "running_var" in key or "num_batches_tracked" in key
+    ]
+    assert len(bn_buffer_keys) > 0, "fixture must actually contain BatchNorm buffers"
+    for key in bn_buffer_keys:
+        assert torch.equal(payload_a["model_state_dict"][key], payload_b["model_state_dict"][key])
+
+    for name, tensor in payload_a["best_state_dict"].items():
+        assert torch.equal(tensor, payload_b["best_state_dict"][name]), f"best_state_dict mismatch: {name}"
+
+    _assert_deep_equal(payload_a["optimizer_state_dict"], payload_b["optimizer_state_dict"])
+    _assert_deep_equal(payload_a["scheduler_state_dict"], payload_b["scheduler_state_dict"])
+
+    assert payload_a["cuda_rng_state"] is not None
+    assert payload_b["cuda_rng_state"] is not None
+    assert torch.equal(payload_a["cuda_rng_state"], payload_b["cuda_rng_state"])
+
+    # Phase 4T 핵심 계약: BF16은 GradScaler를 쓰지 않으므로 checkpoint의
+    # scaler_state_dict는 항상 None이다 -- 새 checkpoint execution-state가
+    # 전혀 필요 없다는 조사 라운드 결론을 production 경로에서 재확인한다.
+    assert payload_a["scaler_state_dict"] is None
+    assert payload_b["scaler_state_dict"] is None

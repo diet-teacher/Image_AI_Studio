@@ -526,12 +526,19 @@ def test_accepts_fp16_precision() -> None:
     assert config.precision == "fp16"
 
 
+def test_accepts_bf16_precision() -> None:
+    """Phase 4T부터 "bf16"도 허용된다(CUDA autocast만 쓰고 GradScaler는
+    쓰지 않음 -- loop.py의 _build_precision_execution() 참고)."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, precision="bf16")
+    assert config.precision == "bf16"
+
+
 def test_rejects_unknown_precision() -> None:
-    """BF16은 이번 Phase의 non-goal이라 choices에 아예 없다(docs/
-    phase4s_amp_mixed_precision_design.md 참고) -- device 조합과 무관하게
-    이 dataclass 레벨에서 항상 거부된다."""
+    """FP8 등은 non-goal이라 choices에 아예 없다(docs/
+    phase4t_cuda_bf16_mixed_precision_design.md 참고) -- device 조합과
+    무관하게 이 dataclass 레벨에서 항상 거부된다."""
     with pytest.raises(TrainingConfigError, match="precision"):
-        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, precision="bf16")
+        TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, precision="fp8")
 
 
 def test_rejects_uppercase_precision_variant() -> None:
@@ -543,11 +550,13 @@ def test_precision_not_in_resume_config_fields() -> None:
     """precision은 gradient_clip_norm/label_smoothing/class_weights와 같은
     범주(자유롭게 바뀔 수 있는 training semantics)다 -- optimizer/scheduler
     구조를 바꾸지 않으므로 RESUME_CONFIG_FIELDS에 포함되지 않는다(현재
-    지원 optimizer와 이번 Phase에서 실제로 검증한 FP32↔FP16 AMP resume
+    지원 optimizer와 실제로 검증한 FP32/FP16/BF16 전 조합 resume
     경로에서는 momentum buffer 등 관련 optimizer state가 precision과
     무관하게 float32로 유지되어 optimizer.load_state_dict()가 깨지지
     않음을 확인했다 -- PyTorch 전체에 대한 일반적 불변식으로 확대하지
-    않는다)."""
+    않는다). RESUME_CONFIG_FIELDS 자체가 precision을 아예 비교 대상으로
+    삼지 않으므로, precision 값이 몇 개든(fp32/fp16/bf16) 이 계약은
+    동일하게 적용된다(개별 값마다 별도 회귀 테스트가 필요하지 않음)."""
     assert "precision" not in RESUME_CONFIG_FIELDS
 
 

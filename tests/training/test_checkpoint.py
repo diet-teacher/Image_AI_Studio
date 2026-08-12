@@ -380,7 +380,8 @@ def test_checkpoint_distinguishes_current_model_from_best_model(
     call_count = {"value": 0}
 
     def fake_train_one_epoch(
-        model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None, scaler=None
+        model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None,
+        autocast_dtype=None, scaler=None,
     ):
         call_count["value"] += 1
         epoch_value = float(call_count["value"])

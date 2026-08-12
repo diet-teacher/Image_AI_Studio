@@ -1586,8 +1586,9 @@ def test_cli_keyboard_interrupt_after_workflow_return_during_result_output_retur
 # -- Phase 4S: --precision --------------------------------------------------------
 
 
+@pytest.mark.parametrize("precision", ["fp16", "bf16"])
 def test_precision_forwards_exact_value_to_workflow_request(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    precision: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _make_standard_dataset(tmp_path)
     model_json_path = _write_model_json(tmp_path, "cli_precision_forward_model")
@@ -1623,13 +1624,13 @@ def test_precision_forwards_exact_value_to_workflow_request(
             "--output-dir", str(tmp_path / "out"),
             "--epochs", "1",
             "--batch-size", "4",
-            "--precision", "fp16",
+            "--precision", precision,
             "--no-export-torchscript",
         ]
     )
 
     assert exit_code == 0
-    assert captured["request"].training_config.precision == "fp16"
+    assert captured["request"].training_config.precision == precision
 
 
 def test_precision_defaults_to_fp32_when_flag_omitted(
@@ -1678,8 +1679,10 @@ def test_precision_defaults_to_fp32_when_flag_omitted(
 
 
 def test_precision_invalid_choice_fails_cleanly(tmp_path: Path, capsys) -> None:
-    """argparse choices=["fp32","fp16"]가 그 외 값(예: "bf16")을 명확히
-    거부해야 한다(BF16은 이번 Phase의 non-goal)."""
+    """argparse choices=["fp32","fp16","bf16"]가 그 외 값(예: "fp8")을
+    명확히 거부해야 한다(FP8은 non-goal, Phase 4T에서 "bf16"이 이 예시
+    값으로는 더 이상 쓰일 수 없다 -- Phase 4T부터 유효한 choice이기
+    때문)."""
     _make_standard_dataset(tmp_path)
     model_json_path = _write_model_json(tmp_path, "cli_precision_invalid_model")
 
@@ -1691,7 +1694,7 @@ def test_precision_invalid_choice_fails_cleanly(tmp_path: Path, capsys) -> None:
                 "--output-dir", str(tmp_path / "out"),
                 "--epochs", "1",
                 "--batch-size", "4",
-                "--precision", "bf16",
+                "--precision", "fp8",
                 "--no-export-torchscript",
             ]
         )

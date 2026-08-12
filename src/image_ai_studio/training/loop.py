@@ -3,19 +3,21 @@ Phase 4N부터, class별 명시적 weight는 Phase 4P부터 TrainingConfig로 �
 가능). optimizer(Adam/SGD)와 LR scheduler(없음/ReduceLROnPlateau)는
 Phase 4E부터 TrainingConfig로 선택 가능 -- 선택지가 2개/1개뿐이라 registry
 없이 이 모듈의 private helper(_build_optimizer/_build_scheduler/
-_build_criterion)로 충분하다. Phase 4S부터 config.precision="fp16"+CUDA
-device일 때만 `_build_grad_scaler()`가 `torch.amp.GradScaler`를 만들고,
-`train_one_epoch()`이 `torch.amp.autocast`+GradScaler 경로로 분기한다 --
-precision="fp32"(기본값)에서는 scaler가 항상 `None`이므로 AMP API를
-전혀 호출하지 않고, `train_one_epoch()`의 `else` branch가 Phase 4A~4R의
-기존 FP32 forward/backward/[clip]/optimizer.step 계산 semantics를 그대로
-실행한다(numerical anchor 무변경 -- 코드 자체에는 새 분기가 추가됐지만
-그 분기를 타지 않는 한 실행 경로/계산 결과는 동일하다).
-`config.precision="fp16"`인데 `device`가 CUDA가 아니면(`"cpu"`뿐 아니라
-`"mps"`/`"xpu"` 등 이 프로젝트가 다루지 않는 다른 backend 포함)
-`_build_grad_scaler()`가 `None`을 반환하지 않고 `ValueError`를 낸다 --
-silent FP32 fallback(또는 잘못된 backend용 scaler 생성) 없이 명확히
-거부한다."""
+_build_criterion)로 충분하다. Phase 4S/4T부터 `_build_precision_execution()`
+이 config.precision("fp32"|"fp16"|"bf16")+device로부터 `autocast_dtype`
+(forward+loss를 감쌀 dtype, fp32면 None)과 `scaler`(scaled backward용
+`torch.amp.GradScaler`, fp16만 사용하고 fp32/bf16은 None)라는 독립된
+두 값을 계산하고, `train_one_epoch()`이 이 둘을 각자 다른 축으로
+받아 분기한다 -- precision="fp32"(기본값)에서는 둘 다 항상 `None`이므로
+AMP API를 전혀 호출하지 않고, `train_one_epoch()`의 두 `else` branch가
+Phase 4A~4S의 기존 FP32 forward/backward/[clip]/optimizer.step 계산
+semantics를 그대로 실행한다(numerical anchor 무변경 -- 코드 자체에는
+새 분기가 추가됐지만 그 분기를 타지 않는 한 실행 경로/계산 결과는
+동일하다). `config.precision`이 `"fp16"`/`"bf16"`인데 `device`가
+CUDA가 아니면(`"cpu"`뿐 아니라 `"mps"`/`"xpu"` 등 이 프로젝트가 다루지
+않는 다른 backend 포함) `_build_precision_execution()`이 `ValueError`를
+낸다 -- silent FP32 fallback(또는 잘못된 backend용 scaler 생성) 없이
+명확히 거부한다."""
 from __future__ import annotations
 
 import copy
@@ -87,56 +89,115 @@ def _build_criterion(config: TrainingConfig, device: str = "cpu") -> nn.Module:
     return nn.CrossEntropyLoss(weight=weight, label_smoothing=config.label_smoothing)
 
 
-def _build_grad_scaler(config: TrainingConfig, device: str) -> torch.amp.GradScaler | None:
-    """config.precision/device에 따라 CUDA FP16 AMP용 `torch.amp.GradScaler`를
-    만든다(Phase 4S). `config.precision != "fp16"`이면 `None`을 반환한다
-    -- 이 경우 `train_one_epoch()`이 AMP API를 전혀 호출하지 않는 기존
-    (Phase 4A~4R) FP32 경로를 그대로 실행한다(scaler가 None인지만으로
-    분기).
+def _build_precision_execution(
+    config: TrainingConfig, device: str
+) -> tuple[torch.dtype | None, torch.amp.GradScaler | None]:
+    """config.precision/device로부터 `train_one_epoch()`이 실제로 필요로
+    하는 두 개의 독립적인 저수준 실행 정보를 계산한다(Phase 4T가
+    `_build_grad_scaler()`를 대체): `autocast_dtype`(forward+loss를
+    감쌀 dtype, `None`이면 autocast 자체를 쓰지 않음)과 `scaler`
+    (`torch.amp.GradScaler`, `None`이면 scaled backward를 쓰지 않음).
 
-    `config.precision == "fp16"`인데 `device`가 CUDA가 아니면(`"cpu"`
-    뿐 아니라 이 프로젝트가 인식하지 않는 다른 backend 문자열, 예:
-    `"mps"`/`"xpu"` 포함) **`None`을 반환하지 않고 `ValueError`를 낸다.**
-    Phase 4S의 공식 계약은 "fp16은 CUDA training에서만 지원"이지
-    "cpu만 금지"가 아니다 -- `device == "cpu"`만 검사하면 `"mps"`/`"xpu"`
-    같은 다른 non-CUDA backend가 조용히 `torch.amp.GradScaler("cuda")`
-    를 받아버리는 실측된 버그가 있었다(실제로는 CUDA가 전혀 아닌 device
-    에 CUDA용 scaler가 만들어짐). `ImageFolderWorkflowRequest`
-    (imagefolder_workflow.py의 `_validate_precision_device_compatibility()`)
-    를 거치지 않고 이 함수(또는 `run_training()`)를 직접 호출하는 generic
-    caller가 있을 수 있는데, 거기서도 "precision='fp16'을 요청했지만
-    실제로는 CUDA가 아니라 조용히 FP32로(또는 잘못된 backend용 scaler로)
-    대체됨"이라는 silent fallback이 일어나면 안 된다 -- 사용자가 명시한
-    실행 의도를 그대로 존중한다는 `_validate_device()`(Phase 4Q)의 기존
-    원칙과 동일하다. workflow 레벨의 조기 검증과 이 함수의 검증은 서로
-    다른 경계를 보호하는 defense-in-depth다(workflow: dataset/model
-    준비 전 user-facing fail-fast, 이 함수: workflow를 우회한 generic
-    `run_training()` 호출도 보호).
+    Phase 4S 최초 구현은 "scaler가 있는가"라는 단일 신호로 "AMP를
+    쓰는가"와 "AMP dtype이 무엇인가"를 동시에 판별했다 -- FP16만
+    지원할 때는 이 결합이 우연히 맞았지만("scaler 있음"="FP16 AMP
+    사용"), BF16은 autocast는 필요하면서 GradScaler는 필요 없는
+    조합이라(아래 GradScaler 불필요성 설명 참고) 이 결합을 그대로
+    유지하면 BF16이 `scaler is None` 때문에 FP32 branch로 조용히
+    빠지는 새로운 silent fallback을 만든다. 그래서 두 값을 독립된
+    tuple로 분리했다:
+
+    ```text
+    precision=fp32          -> (None, None)
+    precision=fp16 + CUDA   -> (torch.float16, GradScaler)
+    precision=bf16 + CUDA   -> (torch.bfloat16, None)
+    ```
+
+    `config.precision == "fp32"`이면 device가 무엇이든(CUDA 포함)
+    `(None, None)`을 반환한다 -- `train_one_epoch()`이 AMP API를 전혀
+    호출하지 않는 기존(Phase 4A~4S) FP32 경로를 그대로 실행한다.
+
+    `config.precision`이 `"fp16"`/`"bf16"`인데 `device`가 CUDA가
+    아니면(`"cpu"`뿐 아니라 이 프로젝트가 인식하지 않는 다른 backend
+    문자열, 예: `"mps"`/`"xpu"` 포함) **`ValueError`를 낸다.** Phase 4S
+    stabilization에서 `device == "cpu"`만 검사해 `"mps"`/`"xpu"`
+    같은 다른 non-CUDA backend가 조용히 CUDA용 scaler를 받아버리는
+    버그를 발견/수정한 적이 있다 -- Phase 4T도 같은 실수를 반복하지
+    않도록 fp16/bf16 둘 다 동일한 CUDA 판별을 거친다.
+    `ImageFolderWorkflowRequest`(imagefolder_workflow.py의
+    `_validate_precision_device_compatibility()`)를 거치지 않고 이
+    함수(또는 `run_training()`)를 직접 호출하는 generic caller가
+    있을 수 있는데, 거기서도 silent fallback이 일어나면 안 된다 --
+    사용자가 명시한 실행 의도를 그대로 존중한다는 `_validate_device()`
+    (Phase 4Q)의 기존 원칙과 동일하다. workflow 레벨의 조기 검증과 이
+    함수의 검증은 서로 다른 경계를 보호하는 defense-in-depth다
+    (workflow: dataset/model 준비 전 user-facing fail-fast, 이 함수:
+    workflow를 우회한 generic `run_training()` 호출도 보호).
 
     CUDA 판별은 이 프로젝트가 이미 다루는 `"cuda"`/`"cuda:N"` 형태만
     인식한다(`device == "cuda" or device.startswith("cuda:")`) --
     `imagefolder_workflow.py`의 `_DEVICE_PATTERN`(ordinal 범위까지 검증)
-    을 여기서 다시 구현하지 않는다. 이 함수는 "CUDA backend인가
-    아닌가"만 판별하면 충분하고, ordinal이 실제로 유효한지(예:
-    `torch.cuda.device_count()` 이내인지)는 이미 workflow의
-    `_validate_device()`가 더 이른 시점에 검증한 뒤이므로 여기서 다시
-    검증할 필요가 없다.
+    을 여기서 다시 구현하지 않는다. fp16/bf16 둘 다 이 판별 로직
+    하나를 공유하므로(각 precision마다 따로 구현하지 않음) 중복이
+    없다.
+
+    BF16은 GradScaler를 쓰지 않는다 -- FP32와 동일한 8-bit exponent
+    range를 가져(FP16의 5-bit보다 넓음) FP16에서 loss scaling이 특히
+    필요했던 좁은 dynamic range 문제를 크게 완화한다(BF16이 이론적으로
+    절대 underflow가 없다는 뜻은 아니다 -- exponent range 밖의 값은
+    BF16에도 여전히 존재한다). 이 프로젝트의 실제 BF16 학습 경로에서
+    GradScaler 없이 정상 학습(forward/backward/optimizer.step 정상
+    동작) 및 same-device continuous-vs-split+resume bitwise exact가
+    실측으로 확인됐으므로, **production contract로 BF16에는 GradScaler
+    를 사용하지 않는다** -- API 레벨에서는 BF16+GradScaler 조합도 에러
+    없이 동작하지만, 불필요한 checkpoint state/복잡도만 늘어나므로
+    채택하지 않는다(docs/phase4t_cuda_bf16_mixed_precision_design.md
+    참고).
 
     PyTorch 실측 확인: `torch.cuda.amp.GradScaler`는 FutureWarning으로
     deprecated이며 `torch.amp.GradScaler("cuda", ...)`가 권장 API다 -- 이
-    함수는 항상 후자를 쓴다. `device`를 그대로 전달하므로(`"cuda"`뿐
-    아니라 `"cuda:0"`/`"cuda:1"` 등도 실측으로 정상 생성 확인) `"cuda"`로
-    고정하지 않는다 -- ordinal별로 별도 scaler 설계를 추가할 필요 없이
-    기존 single CUDA device 설계를 그대로 유지한다. `init_scale`/
-    `growth_factor`/`backoff_factor`/`growth_interval` 등 tuning
-    parameter는 PyTorch 기본값을 그대로 쓴다 -- 이번 Phase는 이 값들을
-    config/CLI에 노출하지 않는다(non-goal, docs/
-    phase4s_amp_mixed_precision_design.md 참고)."""
-    if config.precision != "fp16":
-        return None
-    if device == "cuda" or device.startswith("cuda:"):
-        return torch.amp.GradScaler(device)
-    raise ValueError(f"precision={config.precision!r} requires a CUDA device, but device={device!r}")
+    함수는 항상 후자를 쓴다. `GradScaler`의 첫 인자는 **device type**
+    (`"cuda"` 또는 `"cpu"`)만 공식 contract다(설치된 PyTorch의
+    `GradScaler.__init__` docstring: "Possible values are: 'cuda' and
+    'cpu'. The type is the same as the `type` attribute of a
+    `torch.device`") -- ordinal이 붙은 `"cuda:0"`/`"cuda:1"` 등은
+    문서화된 값이 아니다. 실제로 `GradScaler.__init__` 소스를 확인한
+    결과 `self._device == "cuda"`라는 정확한 문자열 비교로 CUDA
+    availability 경고 분기를 타는데, `"cuda:0"`을 넘기면 이 비교가
+    항상 거짓이 되어 그 분기가 조용히 스킵되고, `update(new_scale=...)`
+    내부의 `new_scale.device.type != self._device` assertion도
+    `tensor.device.type`이 항상 ordinal 없는 `"cuda"`이므로
+    `"cuda:0"`과 비교하면 항상 어긋난다(이 프로젝트는 `update()`를
+    인자 없이만 호출하므로 이 경로를 실제로 타지는 않지만, `self._device`
+    가 device type만 담아야 한다는 내부 불변식을 보여준다). scale
+    tensor의 실제 device/ordinal 배치는 `scale()`이
+    `outputs.device`(즉 loss tensor가 이미 올라가 있는 실제 device)로
+    lazy 초기화하므로 `self._device`와 무관하다 -- 즉 `device`의
+    ordinal을 `GradScaler`에 전달해도 실질적인 기능 이득이 없다.
+    따라서 이 함수는 `GradScaler`에 **항상 `"cuda"`(device type)만
+    전달**하고, model/tensor의 실제 ordinal 배치는 기존과 동일하게
+    `model.to(device)`/`images.to(device)`가 전담한다 -- ordinal별
+    별도 scaler 설계를 추가할 필요가 없다는 결론은 유지되지만, 그
+    이유가 "ordinal을 그대로 전달해도 된다"가 아니라 "애초에 전달할
+    필요가 없다"로 정정됐다. `init_scale`/`growth_factor`/
+    `backoff_factor`/`growth_interval` 등 tuning parameter는 PyTorch
+    기본값을 그대로 쓴다 -- 이번 Phase도 이 값들을 config/CLI에
+    노출하지 않는다(non-goal)."""
+    if config.precision == "fp32":
+        return None, None
+    if config.precision not in ("fp16", "bf16"):
+        # TrainingConfig.PRECISION_CHOICES가 이미 "fp32"/"fp16"/"bf16" 외의
+        # 값을 거부하므로 정상 경로에서는 도달하지 않는다 -- 이 함수 자신이
+        # "fp32도 fp16도 아니면 무조건 bf16"처럼 implicit dispatch로 새
+        # precision을 조용히 잘못 처리하지 않도록 명시적 fail-fast로 막아
+        # 둔다(향후 PRECISION_CHOICES에 값이 추가되는데 이 함수 수정이
+        # 누락되는 경우를 대비).
+        raise ValueError(f"unsupported precision: {config.precision!r}")
+    if not (device == "cuda" or device.startswith("cuda:")):
+        raise ValueError(f"precision={config.precision!r} requires a CUDA device, but device={device!r}")
+    if config.precision == "fp16":
+        return torch.float16, torch.amp.GradScaler("cuda")
+    return torch.bfloat16, None  # config.precision == "bf16"
 
 
 def train_one_epoch(
@@ -146,6 +207,7 @@ def train_one_epoch(
     device: str = "cpu",
     gradient_clip_norm: float | None = None,
     criterion: nn.Module | None = None,
+    autocast_dtype: torch.dtype | None = None,
     scaler: torch.amp.GradScaler | None = None,
 ) -> float:
     """1 epoch 학습 (model.train() -> forward -> CrossEntropyLoss -> backward
@@ -157,20 +219,35 @@ def train_one_epoch(
     만든 criterion을 넘겨 label smoothing(Phase 4N)/class weight(Phase 4P)를
     적용한다.
 
-    scaler=None(기본값)이면 Phase 4S 이전과 완전히 동일한 FP32 경로가
-    그대로 실행된다 -- `torch.amp.autocast`/`GradScaler` API를 이 함수가
-    전혀 호출하지 않는다(기존 caller 전부 하위호환, CPU/CUDA FP32 회귀
-    없음). scaler가 주어지면(Phase 4S, CUDA FP16 AMP) 다음 순서로
-    실행한다: `torch.amp.autocast(device_type="cuda", dtype=torch.float16)`
-    안에서 forward+loss 계산 -> `scaler.scale(loss).backward()` ->
-    (gradient_clip_norm이 있으면) `scaler.unscale_(optimizer)` 후
-    `clip_grad_norm_` -> `scaler.step(optimizer)` -> `scaler.update()`.
-    `unscale_()`은 clipping이 있을 때만, 그리고 이 step에서 정확히 한 번만
-    호출한다 -- 실측 확인: `unscale_()`을 생략하면 grad norm이 현재
-    `scale`배(예: 1024배)로 부풀어 있어 clipping 임계값이 사실상
-    무의미해지고, 같은 step에서 두 번 호출하면 `RuntimeError`가 난다.
-    `autocast` context 안에는 forward+loss 계산만 두고 backward/clip/
-    step/update는 그 밖에서 호출한다(PyTorch 권장 사용법)."""
+    `autocast_dtype`/`scaler`는 서로 독립적인 두 축이다(Phase 4T,
+    `_build_precision_execution()` 참고) -- `autocast_dtype`은 forward+
+    loss를 `torch.amp.autocast`로 감쌀지/어떤 dtype으로 감쌀지를
+    결정하고, `scaler`는 scaled backward(`scaler.scale(loss).backward()`
+    -> `scaler.step()` -> `scaler.update()`)를 쓸지를 결정한다. **이
+    둘을 하나의 신호로 겸용하지 않는다** -- `scaler is None`은 더 이상
+    "AMP를 쓰지 않는다"는 뜻이 아니라 "scaled backward를 쓰지 않는다"는
+    뜻일 뿐이다(BF16은 `autocast_dtype=torch.bfloat16`이면서
+    `scaler=None`인 조합).
+
+    둘 다 기본값 `None`이면(Phase 4A~4S 이전과 동일) `torch.amp.autocast`
+    /`GradScaler` API를 이 함수가 전혀 호출하지 않는 기존 FP32 경로가
+    그대로 실행된다(기존 caller 전부 하위호환, CPU/CUDA FP32 회귀 없음).
+
+    `autocast_dtype`이 주어지면 그 dtype으로 `torch.amp.autocast(
+    device_type="cuda", dtype=autocast_dtype)` 안에서 forward+loss만
+    계산한다(backward/clip/step/update는 그 밖에서 호출 -- PyTorch
+    권장 사용법). 그 뒤 `scaler`가 주어지면(Phase 4S, CUDA FP16 AMP)
+    `scaler.scale(loss).backward()` -> (gradient_clip_norm이 있으면)
+    `scaler.unscale_(optimizer)` 후 `clip_grad_norm_` -> `scaler.step(
+    optimizer)` -> `scaler.update()` 순서로 실행한다. `unscale_()`은
+    clipping이 있을 때만, 그리고 이 step에서 정확히 한 번만 호출한다
+    -- 실측 확인: `unscale_()`을 생략하면 grad norm이 현재 `scale`배
+    (예: 1024배)로 부풀어 있어 clipping 임계값이 사실상 무의미해지고,
+    같은 step에서 두 번 호출하면 `RuntimeError`가 난다. `scaler`가
+    `None`이면(Phase 4T, CUDA BF16) autocast로 감싼 forward+loss
+    이후 `loss.backward()` -> (clipping 있으면) `clip_grad_norm_` ->
+    `optimizer.step()`을 그대로 쓴다 -- FP32 경로와 동일한 순서이며
+    scaled-backward 관련 API를 전혀 호출하지 않는다."""
     model.train()
     criterion = criterion if criterion is not None else nn.CrossEntropyLoss()
     total_loss = 0.0
@@ -181,10 +258,15 @@ def train_one_epoch(
         labels = labels.to(device)
 
         optimizer.zero_grad()
-        if scaler is not None:
-            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+        if autocast_dtype is not None:
+            with torch.amp.autocast(device_type="cuda", dtype=autocast_dtype):
                 outputs = model(images)
                 loss = criterion(outputs, labels)
+        else:
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+        if scaler is not None:
             scaler.scale(loss).backward()
             if gradient_clip_norm is not None:
                 scaler.unscale_(optimizer)
@@ -192,8 +274,6 @@ def train_one_epoch(
             scaler.step(optimizer)
             scaler.update()
         else:
-            outputs = model(images)
-            loss = criterion(outputs, labels)
             loss.backward()
             if gradient_clip_norm is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip_norm)
@@ -639,7 +719,7 @@ def run_training(
        않도록 deepcopy 후 로드 -- 그러지 않으면 이후 최적화 스텝이
        호출자가 들고 있는 resume_state/checkpoint payload의 텐서를 조용히
        변형시킬 수 있다). config.precision="fp16"+CUDA device면 같은
-       원칙으로 `_build_grad_scaler()`가 만든 GradScaler에도
+       원칙으로 `_build_precision_execution()`이 만든 GradScaler에도
        resume_state.scaler_state_dict가 있으면 로드한다(Phase 4S) --
        단 scheduler와 달리 존재/부재 불일치를 에러로 취급하지 않는다.
        `precision`은 RESUME_CONFIG_FIELDS가 아니라 자유롭게 바뀔 수 있는
@@ -749,12 +829,12 @@ def run_training(
     # 만 checkpoint에 저장됨) -- 그래서 optimizer/scheduler처럼 resume_state에서
     # 로드할 criterion state가 없다.
     criterion = _build_criterion(config, device=device)
-    # scaler는 optimizer/scheduler/criterion과 마찬가지로 epoch 루프 진입
-    # 전 config로 한 번만 생성한다(Phase 4S). scheduler와 달리 config
-    # 호환성이 엄격히 강제되지 않는다 -- precision은 RESUME_CONFIG_FIELDS가
-    # 아니므로(아래 resume 블록의 scaler 처리 참고) 여기서 만드는 scaler는
-    # "새 config가 요청한" precision을 그대로 따른다.
-    scaler = _build_grad_scaler(config, device)
+    # autocast_dtype/scaler는 optimizer/scheduler/criterion과 마찬가지로
+    # epoch 루프 진입 전 config로 한 번만 계산한다(Phase 4S/4T). scheduler와
+    # 달리 config 호환성이 엄격히 강제되지 않는다 -- precision은
+    # RESUME_CONFIG_FIELDS가 아니므로(아래 resume 블록의 scaler 처리 참고)
+    # 여기서 계산하는 값은 "새 config가 요청한" precision을 그대로 따른다.
+    autocast_dtype, scaler = _build_precision_execution(config, device)
 
     if resume_state is not None:
         optimizer.load_state_dict(copy.deepcopy(resume_state.optimizer_state_dict))
@@ -806,7 +886,7 @@ def run_training(
         train_loss = train_one_epoch(
             model, train_loader, optimizer, device=device,
             gradient_clip_norm=config.gradient_clip_norm, criterion=criterion,
-            scaler=scaler,
+            autocast_dtype=autocast_dtype, scaler=scaler,
         )
         history.train_losses.append(train_loss)
         val_loss, val_accuracy = evaluate(model, val_loader, device=device)

@@ -130,11 +130,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--precision",
-        choices=["fp32", "fp16"],
+        choices=["fp32", "fp16", "bf16"],
         default="fp32",
         help=(
-            "training precision -- 'fp32'(기본값) 또는 'fp16'(CUDA FP16 autocast+GradScaler, "
-            "Phase 4S). 'fp16'은 --device가 'cuda'/'cuda:N'일 때만 허용된다(CPU AMP 미지원). "
+            "training precision -- 'fp32'(기본값), 'fp16'(CUDA FP16 autocast+GradScaler, "
+            "Phase 4S), 또는 'bf16'(CUDA BF16 autocast, GradScaler 없음, Phase 4T). "
+            "'fp16'/'bf16' 모두 --device가 'cuda'/'cuda:N'일 때만 허용된다(CPU AMP 미지원). "
             "validation/test 평가와 TorchScript export는 이 값과 무관하게 항상 FP32로 수행된다"
         ),
     )

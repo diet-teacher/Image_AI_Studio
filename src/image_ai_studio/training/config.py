@@ -21,12 +21,20 @@ precision("fp32"|"fp16")을 선택할 수 있다 -- CUDA training에서만 의�
 이 프로젝트가 다루는 device 값 중 "cpu"만 해당)과, workflow를 우회한
 generic `run_training()` 호출(`"cpu"`뿐 아니라 이 프로젝트가 인식하지
 않는 다른 backend 문자열까지 포함) 양쪽 모두에서 거부된다 -- loop.py의
-`_build_grad_scaler()` 참고. optimizer/scheduler의
+`_build_precision_execution()` 참고. optimizer/scheduler의
 load_state_dict() 호환성에 영향을 주지 않음을 실측으로 확인했으므로
 (현재 지원 optimizer와 실측한 AMP 경로에서는 momentum buffer 등
 optimizer state가 precision과 무관하게 float32로 유지됨)
 gradient_clip_norm/label_smoothing/class_weights와 같은 이유로
-RESUME_CONFIG_FIELDS에 포함되지 않는다."""
+RESUME_CONFIG_FIELDS에 포함되지 않는다. Phase 4T부터 precision("bf16")
+도 선택할 수 있다 -- fp16과 달리 CUDA BF16 autocast만 쓰고
+`torch.amp.GradScaler`는 쓰지 않는다(BF16은 FP32와 같은 exponent-bit
+폭을 가져 FP16의 좁은 dynamic range 문제를 크게 완화하고, 이
+프로젝트의 실제 BF16 학습 경로에서 GradScaler 없이 정상 학습/
+exact-resume이 실측으로 확인됨 -- BF16에 이론적으로 절대 underflow가
+없다는 뜻은 아니다). device 조합 검증 정책은 fp16과 완전히
+동일하다(non-CUDA device는 workflow/generic run_training() 양쪽에서
+거부)."""
 from __future__ import annotations
 
 import math
@@ -34,9 +42,10 @@ from dataclasses import dataclass
 
 OPTIMIZER_CHOICES = ("adam", "sgd", "adamw")
 LR_SCHEDULER_CHOICES = ("plateau",)
-# Phase 4S: CUDA FP16 autocast + GradScaler만 지원(BF16/CPU AMP는 이번
-# Phase의 non-goal -- docs/phase4s_amp_mixed_precision_design.md 참고).
-PRECISION_CHOICES = ("fp32", "fp16")
+# Phase 4S: CUDA FP16 autocast + GradScaler 지원. Phase 4T: CUDA BF16
+# autocast(GradScaler 없음) 추가 -- CPU AMP는 여전히 non-goal(docs/
+# phase4t_cuda_bf16_mixed_precision_design.md 참고).
+PRECISION_CHOICES = ("fp32", "fp16", "bf16")
 
 # Phase 4F: resume 시 checkpoint와 반드시 일치해야 하는 필드.
 # optimizer.load_state_dict()/scheduler.load_state_dict()가 다른 종류의
@@ -193,7 +202,7 @@ class TrainingConfig:
 
     early_stopping_patience: int | None = None  # None => 비활성화 (현재 동작)
 
-    precision: str = "fp32"  # "fp32" | "fp16", CUDA에서만 "fp16" 허용 (Phase 4S)
+    precision: str = "fp32"  # "fp32" | "fp16" | "bf16", CUDA에서만 "fp16"/"bf16" 허용 (Phase 4S/4T)
 
     def __post_init__(self) -> None:
         _require_positive_int("epochs", self.epochs)

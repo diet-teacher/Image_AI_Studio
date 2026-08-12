@@ -1305,13 +1305,65 @@ PASS로 확인).
   하드웨어에 따라 달라질 수 있습니다 -- 특정 GPU에서의 speedup을
   보장하지 않습니다(Tensor Core가 없는 GPU에서는 이득이 작거나 없을 수
   있습니다).
-* BF16, CPU AMP, multi-GPU/distributed, gradient accumulation, GradScaler
+* CPU AMP, multi-GPU/distributed, gradient accumulation, GradScaler
   tuning parameter(`init_scale`/`growth_interval` 등) 노출, AMP
-  inference/export는 아직 미지원입니다.
+  inference/export는 이 Phase에서는 미지원입니다(CUDA BF16은 Phase 4T
+  에서 지원 -- 아래 "Phase 4T" 절 참고).
 
 설계 배경과 상세 계약(AMP API 조사, GradScaler lifecycle 실측,
 positive/negative control, gradient clipping 통합, exact-resume 계약)은
 `docs/phase4s_amp_mixed_precision_design.md`를 참고하세요.
+
+---
+
+## Phase 4T: CUDA BF16 Mixed Precision Training
+
+Phase 4S의 CUDA FP16 AMP에 이어 CUDA BF16 mixed precision을 지원합니다.
+BF16은 FP16과 달리 `torch.amp.GradScaler`를 쓰지 않습니다 -- BF16은
+FP32와 동일한 8-bit exponent range를 가져(FP16의 5-bit보다 넓음) FP16
+에서 loss scaling이 특히 필요했던 좁은 dynamic range 문제를 크게
+완화합니다. 이 프로젝트의 실제 BF16 학습 경로에서 GradScaler 없이도
+정상 학습과 same-device exact-resume이 성립함을 실측으로 확인했으며,
+그에 따라 **production contract로 BF16에는 GradScaler를 사용하지
+않습니다**(BF16에 이론적으로 절대 underflow가 없다는 뜻은 아닙니다).
+
+* `TrainingConfig.precision`에 `"bf16"`이 추가됐습니다(`"fp32"`(기본값)
+  | `"fp16"` | `"bf16"`) -- CLI `--precision {fp32,fp16,bf16}`으로도
+  선택 가능합니다. `RESUME_CONFIG_FIELDS`에는 여전히 포함되지 않습니다.
+* CUDA BF16 training은 `torch.amp.autocast(device_type="cuda",
+  dtype=torch.bfloat16)`로 forward+loss 계산만 감싸고, backward/
+  clipping/`optimizer.step()`은 GradScaler 없이 FP32와 동일한 순서
+  (`loss.backward()` → [clip] → `optimizer.step()`)를 그대로 씁니다.
+* `precision="fp16"`/`"bf16"` 둘 다 CUDA에서만 허용됩니다 -- `cpu`나
+  이 프로젝트가 인식하지 않는 다른 backend(`mps`/`xpu` 등)와 조합하면
+  silent fallback 없이 명확히 거부됩니다(workflow 레벨과, workflow를
+  거치지 않는 generic `run_training()` 호출 레벨 양쪽에서).
+* checkpoint의 `scaler_state_dict`는 BF16 checkpoint에서 항상 `None`
+  입니다 -- BF16이 GradScaler를 쓰지 않으므로 새 checkpoint 필드/
+  `CHECKPOINT_FORMAT_VERSION` 변경이 전혀 필요 없습니다(`checkpoint.py`
+  는 이번 Phase에서 무수정입니다).
+* same physical CUDA device / 같은 머신 / 같은 소프트웨어 환경 기준의
+  BF16 same-device exact-resume을 지원합니다 -- GradScaler state가
+  없는데도(즉 FP32와 동일한 state 집합만으로) continuous training과
+  split+resume training이 bitwise exact함을 production workflow
+  경로에서 직접 실측 확인했습니다.
+* Phase 4R의 scoped deterministic context를 FP16과 동일하게 그대로
+  재사용합니다 -- BF16 전용 별도 deterministic 설정은 추가하지
+  않았습니다.
+* **BF16 실행을 지원한다는 것이지 "더 빠르다"는 계약이 아닙니다.**
+  Tensor Core 기반 네이티브 BF16 하드웨어가 없는 GPU에서는
+  `torch.amp.autocast(dtype=torch.bfloat16)`가 emulation으로 동작할
+  수 있고, 이 경우 FP32 대비 속도 이득이 없거나 더 느릴 수 있습니다.
+  production code는 hardware capability를 강제로 검증하지 않습니다
+  (기능적으로 지원되면 하드웨어 세대와 무관하게 실행을 허용합니다).
+* validation/test 평가, TorchScript export, C++ parity는 이 값과
+  무관하게 항상 CPU+FP32로 수행됩니다(Phase 4Q/4R/4S와 동일한 정책).
+* CPU BF16, multi-GPU/distributed, gradient accumulation, AMP
+  inference/export, FP8은 아직 미지원입니다.
+
+설계 배경과 상세 계약(BF16 API/hardware 실측, GradScaler 불필요성 근거,
+exact-resume 실측, cross-precision resume matrix, compatibility matrix)
+은 `docs/phase4t_cuda_bf16_mixed_precision_design.md`를 참고하세요.
 
 ---
 
@@ -1390,6 +1442,12 @@ positive/negative control, gradient clipping 통합, exact-resume 계약)은
   항상 FP32 유지, checkpoint의 `scaler_state_dict`로 same-device AMP
   exact-resume 지원(scaler state가 있는 신규 checkpoint만 exact 보장,
   precision을 바꾼 resume은 portable-only) (Phase 4S)
+* `--precision bf16`으로 CUDA BF16 mixed precision training 선택 --
+  GradScaler를 쓰지 않고(`torch.amp.autocast(dtype=torch.bfloat16)`만),
+  `cpu`/기타 non-CUDA backend와 조합하면 fp16과 동일하게 명확히 거부,
+  checkpoint `scaler_state_dict`는 항상 `None`(새 checkpoint field
+  없음), same-device BF16 exact-resume 지원, hardware capability를
+  강제 검증하지 않음(기능 지원과 속도 보장은 별개) (Phase 4T)
 * TorchScript 배포, C++(LibTorch) CPU/CUDA 추론
 * Python/C++ parity 검증 (Phase 0~4E 배포 경로; Phase 4F는 export/parity
   코드를 변경하지 않았고, 기존 parity E2E를 재실행해 회귀 없음을 확인함
@@ -1439,9 +1497,10 @@ positive/negative control, gradient clipping 통합, exact-resume 계약)은
 * `SIGTERM`/`SIGHUP` graceful shutdown, batch 중간 cancellation, GUI stop
   button(Ctrl+C cooperative stop 자체는 Phase 4K에서 지원 -- 위 "Phase 4K"
   절 참고)
-* BF16/CPU AMP(CUDA FP16 AMP 자체는 Phase 4S에서 지원 -- 위 "Phase 4S"
-  절 참고), multi-GPU/distributed training, gradient accumulation,
-  GradScaler tuning parameter CLI/config 노출, AMP inference/export
+* CPU AMP(CUDA FP16/BF16 AMP 자체는 각각 Phase 4S/4T에서 지원 -- 위
+  "Phase 4S"/"Phase 4T" 절 참고), multi-GPU/distributed training,
+  gradient accumulation, GradScaler tuning parameter CLI/config 노출,
+  AMP inference/export, FP8
 * 일반 DAG(`GraphSpec`/`NodeSpec`/`EdgeSpec`), long skip connection,
   중첩 `BranchSpec`
 * Detection/Segmentation training

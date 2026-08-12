@@ -25,8 +25,8 @@ from image_ai_studio.training.loop import (
     TrainingResult,
     TrainingResumeState,
     _build_criterion,
-    _build_grad_scaler,
     _build_optimizer,
+    _build_precision_execution,
     _build_scheduler,
     evaluate,
     evaluate_classification_metrics,
@@ -574,7 +574,8 @@ def test_run_training_early_stopping_preserves_best_epoch_parameters(
     call_count = {"value": 0}
 
     def fake_train_one_epoch(
-        model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None, scaler=None
+        model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None,
+        autocast_dtype=None, scaler=None,
     ):
         call_count["value"] += 1
         epoch_value = float(call_count["value"])
@@ -1419,7 +1420,8 @@ def test_run_training_passes_build_criterion_result_to_train_one_epoch(monkeypat
     captured: dict = {}
 
     def fake_train_one_epoch(
-        model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None, scaler=None
+        model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None,
+        autocast_dtype=None, scaler=None,
     ):
         captured["criterion"] = criterion
         return 0.5
@@ -1697,7 +1699,8 @@ def test_run_training_passes_class_weights_criterion_to_train_one_epoch(monkeypa
     captured: dict = {}
 
     def fake_train_one_epoch(
-        model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None, scaler=None
+        model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None,
+        autocast_dtype=None, scaler=None,
     ):
         captured["criterion"] = criterion
         return 0.5
@@ -2045,7 +2048,8 @@ def test_run_training_checkpoint_hook_view_matches_epoch_state(monkeypatch: pyte
     call_count = {"value": 0}
 
     def fake_train_one_epoch(
-        model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None, scaler=None
+        model, loader, optimizer, device="cpu", gradient_clip_norm=None, criterion=None,
+        autocast_dtype=None, scaler=None,
     ):
         call_count["value"] += 1
         epoch_value = float(call_count["value"])
@@ -2865,57 +2869,79 @@ def test_run_training_user_stop_then_resume_matches_continuous_run_exactly() -> 
     _assert_deep_equal(result_a.scheduler_state_dict, result_b2.scheduler_state_dict)
 
 
-# -- Phase 4S: precision / GradScaler -------------------------------------------
+# -- Phase 4S/4T: precision / autocast_dtype / GradScaler -----------------------
 
 
-def test_build_grad_scaler_returns_none_for_fp32_precision() -> None:
+def test_build_precision_execution_returns_none_none_for_fp32_precision() -> None:
     """precision="fp32"(기본값)이면 device 문자열이 "cuda"여도 CUDA API를
-    전혀 건드리지 않고 None을 반환한다 -- config.precision 검사가 device
-    검사보다 먼저이므로 CUDA 하드웨어 없이도 이 분기만은 항상 안전하게
-    실행 가능하다."""
+    전혀 건드리지 않고 (None, None)을 반환한다 -- config.precision 검사가
+    device 검사보다 먼저이므로 CUDA 하드웨어 없이도 이 분기만은 항상
+    안전하게 실행 가능하다."""
     config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, precision="fp32")
-    assert _build_grad_scaler(config, "cpu") is None
-    assert _build_grad_scaler(config, "cuda") is None
+    assert _build_precision_execution(config, "cpu") == (None, None)
+    assert _build_precision_execution(config, "cuda") == (None, None)
 
 
-def test_build_grad_scaler_rejects_cpu_device_with_fp16() -> None:
-    """precision="fp16"인데 device="cpu"면 None을 반환해 조용히 FP32로
-    대체하지 않고 ValueError로 명확히 거부한다(CPU AMP는 이번 Phase
-    범위 밖) -- ImageFolderWorkflowRequest를 거치지 않고 이 함수(또는
+def test_build_precision_execution_rejects_unsupported_precision_value() -> None:
+    """`_build_precision_execution()`은 "fp32"/"fp16"/"bf16" 세 값을
+    명시적으로 분기하고, 그 외 값은 "fp32도 fp16도 아니면 bf16"처럼
+    implicit dispatch로 조용히 처리하지 않고 ValueError로 명확히
+    거부해야 한다 -- 향후 TrainingConfig.PRECISION_CHOICES에 새 값이
+    추가되는데 이 함수 수정이 누락되면, 새 precision이 엉뚱한 기존
+    분기로 조용히 처리되는 회귀를 방지하기 위한 fail-fast 계약이다.
+    TrainingConfig.__post_init__이 이미 정상 값만 허용하므로, 이 값은
+    검증을 우회해 인위적으로 만든다(production에서는 도달하지 않는
+    경로를 이 함수 자신의 invariant로 직접 고정)."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, precision="fp16")
+    config.precision = "fp8"  # TrainingConfig.__post_init__ 검증을 우회
+    with pytest.raises(ValueError, match="precision"):
+        _build_precision_execution(config, "cuda")
+
+
+@pytest.mark.parametrize("precision", ["fp16", "bf16"])
+def test_build_precision_execution_rejects_cpu_device(precision: str) -> None:
+    """precision="fp16"/"bf16"인데 device="cpu"면 조용히 FP32로 대체하지
+    않고 ValueError로 명확히 거부한다(CPU AMP는 이번 Phase 범위 밖) --
+    ImageFolderWorkflowRequest를 거치지 않고 이 함수(또는
     run_training())를 직접 호출하는 generic caller까지 이 규칙을
     강제하기 위한 lower-level invariant다. 이 분기는 실제
     torch.amp.GradScaler("cuda")를 생성하지 않으므로 CUDA 하드웨어 없이
     안전하다."""
-    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, precision="fp16")
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, precision=precision)
     with pytest.raises(ValueError, match="precision"):
-        _build_grad_scaler(config, "cpu")
+        _build_precision_execution(config, "cpu")
 
 
+@pytest.mark.parametrize("precision", ["fp16", "bf16"])
 @pytest.mark.parametrize("device", ["mps", "xpu"])
-def test_build_grad_scaler_rejects_non_cuda_backend_strings_with_fp16(device: str) -> None:
-    """precision="fp16"인데 device가 "cpu"가 아닌 다른 non-CUDA backend
-    문자열(예: "mps"/"xpu")이어도 ValueError로 명확히 거부해야 한다 --
-    최초 구현은 `device == "cpu"`만 검사해서, CUDA가 전혀 아닌 이런
-    backend 문자열이 조용히 torch.amp.GradScaler("cuda")를 받아버리는
-    버그가 있었다(실측으로 재현). 실제 MPS/XPU 하드웨어 없이도 이
-    문자열 비교만으로 안전하게 검증 가능하다."""
-    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, precision="fp16")
+def test_build_precision_execution_rejects_non_cuda_backend_strings(precision: str, device: str) -> None:
+    """precision="fp16"/"bf16"인데 device가 "cpu"가 아닌 다른 non-CUDA
+    backend 문자열(예: "mps"/"xpu")이어도 ValueError로 명확히 거부해야
+    한다 -- Phase 4S 최초 구현은 `device == "cpu"`만 검사해서, CUDA가
+    전혀 아닌 이런 backend 문자열이 조용히 torch.amp.GradScaler("cuda")
+    를 받아버리는 버그가 있었다(실측으로 재현). fp16/bf16 둘 다 이
+    함수 하나의 동일한 CUDA 판별을 거치므로 같은 실수가 bf16에서
+    반복되지 않는다. 실제 MPS/XPU 하드웨어 없이도 이 문자열 비교만으로
+    안전하게 검증 가능하다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, precision=precision)
     with pytest.raises(ValueError, match="precision"):
-        _build_grad_scaler(config, device)
+        _build_precision_execution(config, device)
 
 
-def test_run_training_rejects_non_cuda_backend_with_fp16_precision_without_workflow(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("precision", ["fp16", "bf16"])
+def test_run_training_rejects_non_cuda_backend_with_amp_precision_without_workflow(
+    precision: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """generic run_training() 회귀 계약(CPU 케이스의 일반화) --
-    device="mps"처럼 이 프로젝트가 인식하지 않는 non-CUDA backend
-    문자열로 TrainingConfig(precision="fp16")+run_training()을 직접
-    호출해도 silent fallback 없이 _build_grad_scaler() 단계에서
-    거부되어야 한다. train_one_epoch()가 호출되지 않음을 monkeypatch로
-    직접 증명해 실제 batch forward 전에 거부됨을 보장한다."""
+    """generic run_training() 회귀 계약(CPU 케이스의 일반화, fp16/bf16
+    공통) -- device="mps"처럼 이 프로젝트가 인식하지 않는 non-CUDA
+    backend 문자열로 TrainingConfig(precision=...)+run_training()을
+    직접 호출해도 silent fallback 없이 _build_precision_execution()
+    단계에서 거부되어야 한다. train_one_epoch()가 호출되지 않음을
+    monkeypatch로 직접 증명해 실제 batch forward 전에 거부됨을
+    보장한다."""
 
     def fail_if_called(*args, **kwargs):
-        raise AssertionError("train_one_epoch() must not be called when precision='fp16'+device='mps'")
+        raise AssertionError(f"train_one_epoch() must not be called when precision={precision!r}+device='mps'")
 
     monkeypatch.setattr("image_ai_studio.training.loop.train_one_epoch", fail_if_called)
 
@@ -2923,24 +2949,25 @@ def test_run_training_rejects_non_cuda_backend_with_fp16_precision_without_workf
     spec = _mlp_classifier_spec()
     model = build_model(spec)
     train_loader, val_loader = _make_loaders(spec, seed=0)
-    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2, precision="fp16")
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2, precision=precision)
 
     with pytest.raises(ValueError, match="precision"):
         run_training(model, train_loader, val_loader, config, device="mps")
 
 
-def test_run_training_rejects_cpu_device_with_fp16_precision_without_workflow(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("precision", ["fp16", "bf16"])
+def test_run_training_rejects_cpu_device_with_amp_precision_without_workflow(
+    precision: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """generic run_training() 회귀 계약 -- ImageFolderWorkflowRequest/
-    _validate_precision_device_compatibility()를 거치지 않고
-    TrainingConfig(precision="fp16")+device="cpu"로 run_training()을
-    직접 호출해도 silent FP32 fallback이 일어나면 안 된다. 실제 batch
-    forward(train_one_epoch)가 시작되기 전에 거부됨을 monkeypatch로
-    직접 증명한다."""
+    """generic run_training() 회귀 계약(fp16/bf16 공통) --
+    ImageFolderWorkflowRequest/_validate_precision_device_compatibility()
+    를 거치지 않고 TrainingConfig(precision=...)+device="cpu"로
+    run_training()을 직접 호출해도 silent FP32 fallback이 일어나면 안
+    된다. 실제 batch forward(train_one_epoch)가 시작되기 전에 거부됨을
+    monkeypatch로 직접 증명한다."""
 
     def fail_if_called(*args, **kwargs):
-        raise AssertionError("train_one_epoch() must not be called when precision='fp16'+device='cpu'")
+        raise AssertionError(f"train_one_epoch() must not be called when precision={precision!r}+device='cpu'")
 
     monkeypatch.setattr("image_ai_studio.training.loop.train_one_epoch", fail_if_called)
 
@@ -2948,7 +2975,7 @@ def test_run_training_rejects_cpu_device_with_fp16_precision_without_workflow(
     spec = _mlp_classifier_spec()
     model = build_model(spec)
     train_loader, val_loader = _make_loaders(spec, seed=0)
-    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2, precision="fp16")
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-2, precision=precision)
 
     with pytest.raises(ValueError, match="precision"):
         run_training(model, train_loader, val_loader, config, device="cpu")
@@ -3069,15 +3096,64 @@ def test_epoch_checkpoint_view_default_scaler_state_is_none() -> None:
     assert view.scaler_state_dict is None
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a local CUDA device")
-def test_build_grad_scaler_returns_gradscaler_for_cuda_fp16() -> None:
-    """optional CUDA smoke test -- precision="fp16"+device="cuda"/"cuda:0"
-    양쪽 모두 실제 torch.amp.GradScaler가 만들어짐을 확인한다(ordinal이
-    붙은 device 문자열도 그대로 받아들이는지 실측 확인 -- 별도
-    ordinal-specific scaler 설계는 없다)."""
+def test_build_precision_execution_passes_device_type_only_to_gradscaler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """precision="fp16"+ordinal이 붙은 training device("cuda:0"/"cuda:1"
+    등)를 받아도 `torch.amp.GradScaler`에는 공식 public API contract에
+    맞는 device type `"cuda"`만 전달돼야 한다(GradScaler.__init__
+    docstring: "Possible values are: 'cuda' and 'cpu'" -- ordinal이
+    붙은 문자열은 문서화된 값이 아니다). PyTorch private attribute
+    (`scaler._device`)에 의존하지 않고, `torch.amp.GradScaler` 생성자에
+    실제로 전달된 인자를 monkeypatch로 직접 가로채 검증한다 -- 이렇게
+    하면 실제 CUDA 하드웨어 없이도(fake GradScaler라 GPU를 전혀
+    건드리지 않음) 이 계약을 CPU-only로 안전하게 고정할 수 있다.
+    production code는 이 테스트를 위해 변경하지 않았다."""
+    captured: dict = {}
+
+    class _FakeGradScaler:
+        def __init__(self, device, *args, **kwargs):
+            captured["device"] = device
+
+    monkeypatch.setattr(torch.amp, "GradScaler", _FakeGradScaler)
+
     config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, precision="fp16")
-    assert isinstance(_build_grad_scaler(config, "cuda"), torch.amp.GradScaler)
-    assert isinstance(_build_grad_scaler(config, "cuda:0"), torch.amp.GradScaler)
+    for device in ("cuda", "cuda:0", "cuda:1"):
+        captured.clear()
+        autocast_dtype, scaler = _build_precision_execution(config, device)
+        assert autocast_dtype is torch.float16
+        assert isinstance(scaler, _FakeGradScaler)
+        assert captured["device"] == "cuda"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a local CUDA device")
+def test_build_precision_execution_returns_float16_and_gradscaler_for_cuda_fp16() -> None:
+    """optional CUDA smoke test -- precision="fp16"+device="cuda"/"cuda:0"
+    양쪽 모두 실제(fake가 아닌) `torch.amp.GradScaler` 인스턴스가
+    정상적으로 만들어짐을 실제 GPU에서 확인한다(ordinal이 붙은 device
+    문자열도 그대로 받아들이는지 실측 확인 -- 별도 ordinal-specific
+    scaler 설계는 없다). GradScaler에 어떤 device 인자가 실제로
+    전달되는지의 contract 자체는 CPU-only monkeypatch 테스트
+    (`test_build_precision_execution_passes_device_type_only_to_gradscaler`)
+    가 검증한다 -- 이 테스트는 그 결과로 실제 GradScaler가 정상
+    생성/동작하는지의 functional 확인만 담당한다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, precision="fp16")
+    for device in ("cuda", "cuda:0"):
+        autocast_dtype, scaler = _build_precision_execution(config, device)
+        assert autocast_dtype is torch.float16
+        assert isinstance(scaler, torch.amp.GradScaler)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a local CUDA device")
+def test_build_precision_execution_returns_bfloat16_and_no_scaler_for_cuda_bf16() -> None:
+    """optional CUDA smoke test(Phase 4T) -- precision="bf16"+device="cuda"
+    /"cuda:0"는 (torch.bfloat16, None)을 반환해야 한다 -- BF16은
+    GradScaler를 쓰지 않는다는 핵심 계약을 직접 고정한다."""
+    config = TrainingConfig(epochs=1, batch_size=8, learning_rate=1e-3, precision="bf16")
+    for device in ("cuda", "cuda:0"):
+        autocast_dtype, scaler = _build_precision_execution(config, device)
+        assert autocast_dtype is torch.bfloat16
+        assert scaler is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a local CUDA device")
