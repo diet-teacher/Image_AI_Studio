@@ -1515,6 +1515,44 @@ Phase 4A~4V에서 구현한 기능을 하나의 production pipeline으로 통합
 
 ---
 
+## Phase 5B: Application + Qt Worker Integration
+
+Phase 5A(architecture investigation)에서 결정한 대로, Phase 4
+training workflow를 PySide6 application에서 안전하게 실행할 수 있는
+application/controller + Qt worker 계층을 추가했습니다. **실제 GUI
+화면(Training Page/MainWindow)은 아직 없습니다** -- 그건 Phase 5C입니다.
+
+* `src/image_ai_studio/application/training_controller.py` --
+  PySide6를 전혀 모르는 framework-agnostic 계층. `TrainingController`
+  가 `idle`/`running`/`stopping`/`finished`/`failed` state와 single
+  active run, cooperative stop(`threading.Event`)을 관리하고,
+  backend(기본값 `run_imagefolder_training_workflow`)를 주입 가능하게
+  감쌉니다. `build_training_request()`는 UI 입력값을
+  `ImageFolderWorkflowRequest`로 조립만 할 뿐 검증은 하지 않습니다
+  (검증은 여전히 `TrainingConfig`/workflow 자신의 책임).
+* `src/image_ai_studio/gui/qt_training_worker.py` -- `QtTrainingWorker`
+  (`QObject`)가 `QThread`에서 실제 학습 전체(model 생성부터 완료까지)를
+  실행하고, `progress`/`finished`/`failed` Qt signal로 결과를
+  전달합니다. `QThread.terminate()`나 강제 kill은 쓰지 않습니다 --
+  Phase 4의 기존 epoch 경계 cooperative stop 그대로입니다.
+* PySide6 + `QThread` + CUDA 조합을 실제 로컬 GPU로 검증했습니다 --
+  model 생성/`.to("cuda")`/forward·backward가 worker thread 안에서
+  정상 동작하고 크래시/hang 없이 종료됩니다.
+* **중요 발견**: `Signal`을 QObject가 아닌 평범한 함수/lambda에
+  connect하면 GUI thread로 자동 queue되지 않고 emit이 일어난 worker
+  thread에서 직접 실행됩니다(empirical 확인). Phase 5C는 반드시 실제
+  QObject 메서드에 connect하거나 `QueuedConnection`을 명시해야
+  합니다.
+* training core(`src/image_ai_studio/training/*.py`)는 이번 Phase에서
+  전혀 수정하지 않았습니다 -- 기존 public API만으로 충분했습니다.
+
+설계 배경과 상세 계약(state model, single-active-run contract,
+signal thread-affinity 경고, Phase 5C handoff contract)은
+`docs/phase5b_application_qt_worker_integration_design.md`를
+참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
@@ -1831,7 +1869,8 @@ PyTorch는 의도적으로 `requirements.txt`에 **포함되어 있지 않습니
 python -m pip install -r requirements.txt
 ```
 
-현재 `requirements.txt`:
+현재 `requirements.txt`(Phase 5B부터 PySide6/GUI 관련 패키지 포함 --
+PyTorch와 달리 GPU 환경에 따라 빌드가 달라지지 않으므로 여기 포함됩니다):
 
 ```text
 filelock==3.32.0
@@ -1842,6 +1881,10 @@ mpmath==1.3.0
 networkx==3.6.1
 numpy==2.4.6
 packaging==26.0
+PySide6==6.11.1
+PySide6_Addons==6.11.1
+PySide6_Essentials==6.11.1
+shiboken6==6.11.1
 sympy==1.14.0
 typing_extensions==4.16.0
 ```
