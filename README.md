@@ -1560,8 +1560,7 @@ Phase 5B의 `TrainingController`/`QtTrainingWorker` 위에 실제 사용
 실행하면 Model JSON/Dataset root/Output directory를 선택하고, Basic/
 Advanced `TrainingConfig` 옵션과 device/precision을 설정하고, 학습을
 시작·관찰·cooperative stop하고, 결과(완료/조기종료/사용자중단)와
-artifact 경로를 확인할 수 있습니다. **Phase 5는 아직 완료되지
-않았습니다** -- 다음 Phase 5D가 최종 통합 검증/졸업을 담당합니다.
+artifact 경로를 확인할 수 있습니다.
 
 * `src/image_ai_studio/gui/training_page.py` -- `TrainingPage`
   (`QWidget`)가 이 Phase의 핵심입니다. widget 값의 snapshot에서 Phase
@@ -1601,6 +1600,83 @@ artifact 경로를 확인할 수 있습니다. **Phase 5는 아직 완료되지
 설계 배경과 상세 계약(field 매핑, QThread lifecycle, close 처리,
 테스트 구성, QThread lifecycle stabilization 내역)은
 `docs/phase5c_training_gui_design.md`를 참고하세요.
+
+---
+
+## Phase 5D: Final Integration Validation & Graduation — **PHASE 5 COMPLETE**
+
+Phase 5A(조사)→5B(application/Qt worker)→5C(Training GUI) 위에서
+새 기능을 추가하지 않고, 실제 사용자 관점에서 하나의 완성된 학습
+애플리케이션으로 정상 동작하는지 최종 통합 검증했습니다. **Phase 5는
+이 라운드로 종료됩니다** -- 이후 신규 기능은 별도 Phase에서 다룹니다.
+
+**GUI 실행 방법**:
+
+```bash
+python scripts/run_gui.py
+```
+
+**GUI에서 가능한 것**: Model JSON/Dataset root/Output directory 선택,
+Basic(epochs/batch size/learning rate/optimizer/device/precision) +
+Advanced(momentum/weight decay/gradient clip/label smoothing/class
+weights/LR scheduler/early stopping/checkpoint/pin memory/non
+blocking/TorchScript export/seed) 설정, CPU/CUDA(`cuda`/`cuda:N`)
+device 선택, fp32/fp16/bf16 precision 선택, resume checkpoint 선택
+(optional), 학습 시작·진행률 관찰·cooperative stop, 완료/조기종료/
+사용자중단 결과와 실패 메시지·artifact 경로 확인, 완료 후 같은 창에서
+새 학습 반복 시작, 학습 중 창 닫기 시 확인 후 안전한 지연 종료.
+
+**이번 라운드에서 확인한 것**(전부 실제 코드/실제 실행 기준):
+
+* 실제 `python scripts/run_gui.py` 실행과 실제 `TrainingPage.
+  _start_button`에 대한 실제 mouse click(`QTest.mouseClick`)으로 GUI
+  전체 흐름(Model/Dataset/Output 지정 → Basic/Advanced 설정 → Start →
+  Running 중 모든 configuration control과 Browse/Clear 버튼 6개 비활성
+  → 완료 → 재활성)을 end-to-end로 확인 -- traceback/Qt warning 없음.
+* 실제 tiny ImageFolder + 실제 `ModelSpec`으로 CPU 학습을 실제 GUI
+  경로(`TrainingPage`→`TrainingController`→`QtTrainingWorker`→
+  `run_imagefolder_training_workflow()`)로 완주, test loss/accuracy
+  표시와 best model/training history/class mapping/test result
+  artifact 생성을 확인.
+* resume checkpoint를 만든 뒤 **새 `TrainingPage`**에서 `resume_from`
+  필드로 이어받아 추가 epoch를 실행 -- `global_epoch`은 누적(2)되고
+  progress bar는 여전히 `run_epoch`/`total_run_epochs`(1/1)만 쓰는
+  계약을 실측으로 재확인.
+* 이 머신의 실제 GPU(`torch.cuda.is_available() == True`, 1 device)로
+  `device="cuda"` 선택 → 실제 QThread → 실제 워커 → 실제 학습
+  완료까지 GUI thread를 막지 않고 정상 동작, progress handler가
+  main thread에서 실행됨을 재확인.
+* 실제(fake가 아닌) CPU backend로 cooperative stop
+  (Start → Stop → "Stopping after current epoch..." → 실제 학습
+  중단 → "Training stopped by user")과, 실제 backend가 활성 상태일 때
+  `MainWindow.close()`(확인 다이얼로그 → 지연 close → 학습 종료 후
+  실제 종료)를 각각 재확인.
+* repeated-run/QThread cleanup stabilization regression
+  (`test_repeated_run_thread_lifecycle_stress`, `test_main_window.py`)
+  을 반복 실행해 native abort 재발이 없음을 재확인.
+* 전체 `pytest -q` 764/764 PASS를 여러 차례 반복 실행, native abort
+  0회.
+
+**이번 라운드에서 발견했지만 수정하지 않은 것**: Start 클릭 직후
+worker thread가 아직 `TrainingController.begin_run()`을 호출하기 전
+(실측 1ms 미만의 창)에 곧바로 Stop을 호출하면 `request_stop()`이
+조용히 no-op되는 race를 실측으로 확인했습니다. 이 창은 사람이 마우스로
+두 버튼을 연달아 클릭하는 데 걸리는 시간(통상 100ms 이상)보다 훨씬
+짧아 현재 일반적인 GUI 마우스 조작으로 재현될 가능성은 매우 낮다고
+판단합니다. 올바른 수정(`begin_run()`을 GUI thread로 옮기는 것)은
+`QtTrainingWorker`의 기존 공개 계약을 바꾸는 architecture 변경이라
+이번 verification-first 라운드의 범위 밖으로 판단해 코드는 건드리지
+않고 `docs/phase5_final_integration.md`의 known limitations에
+기록만 했습니다.
+
+**non-goals(Phase 5 전체, 계속 유효)**: 그래프/차트, 실험 이력 DB,
+multi-run, inference GUI, packaging/installer, custom theme/style,
+새 optimizer/scheduler/dataset/model layer, training core나
+`TrainingController`/`QtTrainingWorker` architecture 변경.
+
+Phase 5 전체 architecture, runtime flow, QThread ownership/deleteLater
+계약, 최종 test coverage, known limitations, graduation 판정 근거는
+`docs/phase5_final_integration.md`를 참고하세요.
 
 ---
 
