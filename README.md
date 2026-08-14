@@ -1553,6 +1553,57 @@ signal thread-affinity 경고, Phase 5C handoff contract)은
 
 ---
 
+## Phase 5C: Training GUI
+
+Phase 5B의 `TrainingController`/`QtTrainingWorker` 위에 실제 사용
+가능한 Training 화면을 올렸습니다. `python scripts/run_gui.py`로
+실행하면 Model JSON/Dataset root/Output directory를 선택하고, Basic/
+Advanced `TrainingConfig` 옵션과 device/precision을 설정하고, 학습을
+시작·관찰·cooperative stop하고, 결과(완료/조기종료/사용자중단)와
+artifact 경로를 확인할 수 있습니다. **Phase 5는 아직 완료되지
+않았습니다** -- 다음 Phase 5D가 최종 통합 검증/졸업을 담당합니다.
+
+* `src/image_ai_studio/gui/training_page.py` -- `TrainingPage`
+  (`QWidget`)가 이 Phase의 핵심입니다. widget 값의 snapshot에서 Phase
+  5B의 `build_training_request()`를 그대로 호출해 request를 조립하고
+  (semantic validation은 여전히 `TrainingConfig`의 책임), `Start`를
+  누를 때마다 새 `QThread`+`QtTrainingWorker`를 만들어 실행합니다
+  (같은 `TrainingController`는 재사용) -- 여러 번 연속 학습을
+  지원합니다.
+* `src/image_ai_studio/gui/main_window.py` -- `MainWindow`
+  (`QMainWindow`)는 `TrainingPage` 하나만 담는 얇은 창입니다. 학습
+  도중 창을 닫으려 하면 확인 다이얼로그를 띄우고, 동의하면
+  cooperative stop을 요청한 뒤 학습이 안전하게 끝난 뒤에만 실제로
+  닫습니다(`QThread.terminate()`나 GUI thread를 막는 blocking wait는
+  쓰지 않습니다).
+* progress bar는 **`run_epoch`/`total_run_epochs`**를 씁니다(`
+  global_epoch`을 분모/분자로 쓰면 resume 이후 잘못된 비율이 나오는
+  버그가 있었음 -- Phase 4V/5B에서 이미 고친 계약을 여기서도 지킵니다).
+* 결과 화면은 `result.stop_reason`을 그대로 읽어 상태 문구로
+  매핑합니다(`history.stopped_early`/`stopped_by_user`를 재계산하지
+  않음, single source of truth).
+* Phase 5B의 signal thread-affinity 경고를 그대로 지켜 `worker.
+  progress`/`finished`/`failed`를 전부 `TrainingPage`의 실제 QObject
+  bound method에 connect했습니다(plain 함수/lambda 사용 없음).
+* `scripts/run_gui.py`는 얇은 launcher입니다(`QApplication`+
+  `MainWindow`+`show()`+`app.exec()`) -- import 자체로는 어떤 side
+  effect도 없습니다.
+* `src/image_ai_studio/training/*.py`, `TrainingController`/
+  `QtTrainingWorker` 아키텍처는 이번 Phase에서 전혀 수정하지
+  않았습니다.
+* stabilization 라운드에서 드물게 재현되던 native abort(`Fatal
+  Python error: Aborted`)의 원인을 `worker.deleteLater()`가
+  `thread.finished`(worker thread의 event loop가 이미 멈춘 뒤)에
+  연결돼 있던 것으로 좁혀 Qt canonical `moveToThread` 패턴(worker
+  자신의 `finished`/`failed`에 연결)으로 고쳤습니다 -- 반복 실행
+  regression test로 고정.
+
+설계 배경과 상세 계약(field 매핑, QThread lifecycle, close 처리,
+테스트 구성, QThread lifecycle stabilization 내역)은
+`docs/phase5c_training_gui_design.md`를 참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
