@@ -236,8 +236,47 @@ def save_class_mapping(classes: list[str], class_to_idx: dict[str, int], path: s
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def _require_valid_class_mapping(data: object, path: Path) -> None:
+    """`load_class_mapping()`의 최소 구조 검증(Phase 6A가 발견한 gap을
+    Phase 6B에서 메운다 -- inference가 이 함수를 재사용하게 되므로,
+    손상되거나 수동 작성된 class_mapping.json이 inference 내부 어딘가
+    에서 불명확한 KeyError/TypeError를 내는 대신 여기서 명확한
+    ValueError로 즉시 거부되게 한다). `save_class_mapping()`이 실제로
+    저장하는 정상 파일(`classes`가 비어있지 않은 문자열 list, 이름이
+    전부 유일함, `class_to_idx`가 `classes`의 순서와 정확히 일치)은
+    언제나 이 검증을 통과하므로 기존 training/E2E behavior는 전혀
+    바뀌지 않는다.
+
+    class name uniqueness(Phase 6B 마무리 라운드)도 여기서 검증한다 --
+    inference가 `{class_name: probability}` 형태의 dict를 만들 때
+    (`inference/single_image_inference.py`) 중복된 class name이 있으면
+    앞선 확률이 조용히 덮어써져 결과 의미가 깨진다. `class_to_idx`가
+    없는 mapping은 기존 검증(아래)이 이 중복을 걸러내지 못했으므로,
+    `class_to_idx` 유무와 무관하게 항상 확인한다."""
+    if not isinstance(data, dict) or "classes" not in data:
+        raise ValueError(f"{path}: class mapping JSON must be an object with a 'classes' key")
+    classes = data["classes"]
+    if not isinstance(classes, list) or len(classes) == 0:
+        raise ValueError(f"{path}: 'classes' must be a non-empty list, got {classes!r}")
+    if not all(isinstance(name, str) for name in classes):
+        raise ValueError(f"{path}: every element of 'classes' must be a string, got {classes!r}")
+    if len(set(classes)) != len(classes):
+        raise ValueError(f"{path}: 'classes' must contain unique class names, got {classes!r}")
+    class_to_idx = data.get("class_to_idx")
+    if class_to_idx is not None:
+        expected = {name: index for index, name in enumerate(classes)}
+        if not isinstance(class_to_idx, dict) or class_to_idx != expected:
+            raise ValueError(
+                f"{path}: 'class_to_idx' does not match 'classes' order -- "
+                f"expected {expected}, got {class_to_idx!r}"
+            )
+
+
 def load_class_mapping(path: str | Path) -> dict[str, object]:
     """save_class_mapping()으로 저장한 JSON을 읽어
-    `{"classes": [...], "class_to_idx": {...}}` 형태로 반환."""
+    `{"classes": [...], "class_to_idx": {...}}` 형태로 반환한다.
+    최소 구조 검증은 `_require_valid_class_mapping()` 참고."""
     path = Path(path)
-    return json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(path.read_text(encoding="utf-8"))
+    _require_valid_class_mapping(data, path)
+    return data

@@ -209,6 +209,19 @@ def test_save_and_load_class_mapping_round_trip(tmp_path: Path) -> None:
     assert loaded["class_to_idx"] == splits.class_to_idx
 
 
+def test_load_class_mapping_rejects_duplicate_class_names_without_class_to_idx(tmp_path: Path) -> None:
+    """Phase 6B 마무리 라운드: `class_to_idx`가 없는 mapping은 기존
+    검증(순서 일치 확인)이 아예 실행되지 않아 중복 class name을 걸러낼
+    수 없었던 gap을 고정한다. inference가 `{class_name: probability}`
+    dict를 만들 때 중복 이름이 있으면 앞선 확률이 조용히 덮어써지므로,
+    artifact load 경계(`load_class_mapping()`)에서 이를 거부해야 한다."""
+    mapping_path = tmp_path / "classes.json"
+    mapping_path.write_text('{"classes": ["cat", "cat"]}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unique"):
+        load_class_mapping(mapping_path)
+
+
 # -- 10. 네트워크 접근 없음 ----------------------------------------------------
 #
 # 위 테스트는 전부 tmp_path에 직접 만든 PNG 픽스처만 사용하고
