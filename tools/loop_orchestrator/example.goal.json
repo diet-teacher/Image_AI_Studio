@@ -1,0 +1,8 @@
+{
+  "template": true,
+  "checkpoint_id": "phase6c-cp1",
+  "objective": "Replace with the first approved Phase 6C checkpoint objective",
+  "acceptance_criteria": [],
+  "allowed_files": ["src/image_ai_studio/phase6c/**"],
+  "required_tests": []
+}

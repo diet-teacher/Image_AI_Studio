@@ -1,0 +1,16 @@
+{
+  "soft_stop_percent": 75,
+  "hard_stop_percent": 80,
+  "budget_validity_hours": 24,
+  "max_checkpoints": 1,
+  "max_rework_rounds": 2,
+  "same_failure_limit": 3,
+  "process_timeout_seconds": 1800,
+  "test_timeout_seconds": 300,
+  "claude_max_budget_usd": 5.0,
+  "claude_executable": "claude",
+  "codex_executable": "codex",
+  "allowed_tests": [
+    {"name": "orchestrator", "argv": ["python", "-m", "unittest", "discover", "-s", "tests/tools", "-v"]}
+  ]
+}

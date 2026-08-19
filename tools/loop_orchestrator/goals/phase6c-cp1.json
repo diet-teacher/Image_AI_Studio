@@ -1,0 +1,22 @@
+{
+  "checkpoint_id": "phase6c-cp1-inference-page-request-form",
+  "objective": "Implement the smallest Phase 6C vertical slice: an InferencePage containing the required input controls and deterministic widget-to-InferenceRequest mapping, without starting inference or integrating MainWindow.",
+  "acceptance_criteria": [
+    "src/image_ai_studio/gui/inference_page.py defines an InferencePage QWidget that can be constructed with an optional injected InferenceController without creating a QThread, QtInferenceWorker, or starting inference.",
+    "The page exposes controls for training output directory, model JSON, input image, device, and precision, plus a Run Inference button and an initial Idle status display.",
+    "Building a request derives state_dict_path as <training_output_dir>/best_model_state_dict.pt and class_mapping_path as <training_output_dir>/class_mapping.json.",
+    "The request is created through the existing build_inference_request public API and preserves the selected model JSON path, image path, device, and precision.",
+    "No Phase 6B inference core, controller, or worker public interface is changed.",
+    "Tests verify initial widget state, fixed artifact path derivation, and widget-to-request mapping using qtbot and a fake or injected controller; no real model inference is performed.",
+    "Automated visual or screenshot verification is not part of this checkpoint; widget properties, labels, enabled state, and request values are the substitute verification."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/gui/inference_page.py",
+    "tests/gui/test_inference_page.py"
+  ],
+  "required_tests": [
+    "phase6c_cp1_inference_page"
+  ],
+  "claude_prompt": "Implement only Phase 6C checkpoint 1. Add src/image_ai_studio/gui/inference_page.py and tests/gui/test_inference_page.py. Follow TrainingPage's direct QWidget composition and _build_request pattern, but do not copy training-only lifecycle or introduce a generic ViewModel/base page abstraction. The page must provide training output directory, model JSON, image, device, and precision inputs. Derive best_model_state_dict.pt and class_mapping.json from the selected training output directory and create requests only through image_ai_studio.application.inference_controller.build_inference_request. Support optional InferenceController injection for later lifecycle work and tests. Do not create or start QThread/QtInferenceWorker, run inference, modify MainWindow, implement result lifecycle, add image preview, or alter Phase 6B public APIs. Add focused qtbot tests for initial state, artifact path derivation, and exact widget-to-request mapping. Visual screenshot testing is unavailable, so verify visible labels, control state, and mapped request values programmatically.",
+  "estimated_scope": "Small: one new GUI module and one focused GUI test module, approximately 150-250 lines combined."
+}

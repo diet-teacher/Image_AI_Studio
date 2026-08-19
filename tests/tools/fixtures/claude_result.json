@@ -1,0 +1,8 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "session_id": "11111111-2222-4333-8444-555555555555",
+  "total_cost_usd": 0.042,
+  "num_turns": 3,
+  "result": "{\"status\":\"DONE\",\"base_commit\":\"abc123\",\"changed_files\":[\"change.txt\"],\"tests_run\":[\"claimed-only\"],\"known_risks\":[],\"summary\":\"done\"}"
+}
