@@ -1,9 +1,14 @@
-"""Phase 6C CP1: InferencePage widget wiring tests. Uses a fake backend
+"""Phase 6C CP1/CP2: InferencePage widget wiring tests. Uses a fake backend
 injected into InferenceController to avoid real model/image loading.
-Verifies initial state, fixed artifact path derivation, and exact
-widget-to-InferenceRequest mapping."""
+CP1 verifies initial state, fixed artifact path derivation, and exact
+widget-to-InferenceRequest mapping. CP2 (below) verifies the async
+Run Inference lifecycle -- Running/Finished/Failed status, control
+disable/enable, overlap prevention, off-GUI-thread backend execution,
+worker/thread reference cleanup, and rerun -- using fake backends plus
+threading.Event synchronization (same approach as test_training_page.py)."""
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -11,6 +16,7 @@ from PySide6.QtWidgets import QFormLayout
 
 from image_ai_studio.application.inference_controller import InferenceController
 from image_ai_studio.gui.inference_page import InferencePage
+from image_ai_studio.inference.single_image_inference import InferenceResult
 
 pytestmark = pytest.mark.phase6c_cp1_inference_page
 
@@ -252,3 +258,284 @@ def test_full_request_mapping(tmp_path, qtbot) -> None:
     assert request.class_mapping_path == output_dir / "class_mapping.json"
     assert request.device == "cpu"
     assert request.precision == "fp32"
+
+
+# ===============================================================================
+# Phase 6C CP2: async Run Inference lifecycle (QThread + QtInferenceWorker)
+# ===============================================================================
+
+
+def _fake_inference_result() -> InferenceResult:
+    return InferenceResult(
+        predicted_index=0,
+        predicted_class="cat",
+        confidence=0.9,
+        probabilities={"cat": 0.9, "dog": 0.1},
+        inference_duration_seconds=0.01,
+    )
+
+
+def _fill_minimum_valid_fields(page: InferencePage, tmp_path: Path) -> None:
+    page._training_output_dir_edit.setText(str(tmp_path))
+    page._model_json_edit.setText(str(tmp_path / "model.json"))
+    page._image_path_edit.setText(str(tmp_path / "image.png"))
+
+
+def _start_and_wait(page: InferencePage, qtbot, timeout: int = 5000) -> None:
+    """`page._on_run_clicked()`을 호출한 뒤 lifecycle cleanup
+    (`_on_thread_finished`, controls 재활성화 + 참조 정리)까지 끝날
+    때까지 polling한다 -- `qtbot.waitSignal()`은 쓰지 않는다
+    (test_training_page.py의 `_start_and_wait()`와 동일한 이유: fake
+    backend가 즉시 반환하면 signal을 놓칠 수 있고, `_run_button`
+    재활성화 시점과 signal fire 시점이 반드시 같지 않다)."""
+    page._on_run_clicked()
+    qtbot.waitUntil(lambda: page._run_button.isEnabled(), timeout=timeout)
+
+
+# -- construction stays side-effect free even with lifecycle attributes ---------
+
+
+def test_construction_still_side_effect_free_with_cp2_attributes(qtbot) -> None:
+    page = _make_page(qtbot)
+    assert page._thread is None
+    assert page._worker is None
+
+
+# -- Running lifecycle ------------------------------------------------------------
+
+
+@pytest.mark.phase6c_cp2_inference_page_lifecycle
+def test_run_disables_controls_and_shows_running(tmp_path, qtbot) -> None:
+    backend_started = threading.Event()
+    let_backend_finish = threading.Event()
+
+    def blocking_backend(request):
+        backend_started.set()
+        assert let_backend_finish.wait(timeout=5)
+        return _fake_inference_result()
+
+    controller = InferenceController(backend=blocking_backend)
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    page._on_run_clicked()
+    assert backend_started.wait(timeout=5)
+
+    assert page._status_label.text() == "Running"
+    assert page._run_button.isEnabled() is False
+    assert page._training_output_dir_edit.isEnabled() is False
+    assert page._model_json_edit.isEnabled() is False
+    assert page._image_path_edit.isEnabled() is False
+    assert page._device_combo.isEnabled() is False
+    assert page._precision_combo.isEnabled() is False
+
+    let_backend_finish.set()
+    qtbot.waitUntil(lambda: page._run_button.isEnabled(), timeout=5000)
+    assert page._run_button.isEnabled() is True
+
+
+@pytest.mark.phase6c_cp2_inference_page_lifecycle
+def test_backend_runs_off_gui_thread(tmp_path, qtbot) -> None:
+    main_thread_id = threading.get_ident()
+    observed = {}
+
+    def recording_backend(request):
+        observed["thread_id"] = threading.get_ident()
+        return _fake_inference_result()
+
+    controller = InferenceController(backend=recording_backend)
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+
+    assert observed["thread_id"] != main_thread_id
+
+
+class _ThreadRecordingInferencePage(InferencePage):
+    """`_on_finished`이 실제로 실행되는 thread를 기록하는 테스트 전용
+    subclass -- monkeypatch로 method를 사후에 갈아끼우면 connect() 시점
+    slot 해석에 영향을 줘 검증하려는 thread-affinity 결과 자체가
+    바뀔 수 있다(test_training_page.py의 `_ThreadRecordingTrainingPage`
+    와 동일한 이유로 진짜 subclass를 쓴다)."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.observed_finished_thread_ids: list[int] = []
+        super().__init__(*args, **kwargs)
+
+    def _on_finished(self, result) -> None:
+        self.observed_finished_thread_ids.append(threading.get_ident())
+        super()._on_finished(result)
+
+
+@pytest.mark.phase6c_cp2_inference_page_lifecycle
+def test_finished_handler_runs_on_main_qt_thread_not_worker_thread(tmp_path, qtbot) -> None:
+    main_thread_id = threading.get_ident()
+
+    def recording_backend(request):
+        assert threading.get_ident() != main_thread_id  # backend 자신은 worker thread에서 돈다
+        return _fake_inference_result()
+
+    controller = InferenceController(backend=recording_backend)
+    page = _ThreadRecordingInferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+
+    assert page.observed_finished_thread_ids == [main_thread_id]
+
+
+# -- success / failure terminal states --------------------------------------------
+
+
+@pytest.mark.phase6c_cp2_inference_page_lifecycle
+def test_successful_run_shows_finished_and_restores_controls(tmp_path, qtbot) -> None:
+    controller = InferenceController(backend=lambda request: _fake_inference_result())
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+
+    assert page._status_label.text() == "Finished"
+    assert controller.state == "finished"
+    assert page._run_button.isEnabled() is True
+    assert page._model_json_edit.isEnabled() is True
+    assert page._device_combo.isEnabled() is True
+
+
+@pytest.mark.phase6c_cp2_inference_page_lifecycle
+def test_failed_run_shows_concise_error_and_restores_controls(tmp_path, qtbot) -> None:
+    def failing_backend(request):
+        raise ValueError("bad model")
+
+    controller = InferenceController(backend=failing_backend)
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+
+    assert page._status_label.text() == "Failed: ValueError: bad model"
+    assert "Traceback" not in page._status_label.text()  # concise, not the full traceback
+    assert controller.state == "failed"
+    assert page._run_button.isEnabled() is True
+    assert page._model_json_edit.isEnabled() is True
+
+
+# -- overlap prevention -------------------------------------------------------------
+
+
+@pytest.mark.phase6c_cp2_inference_page_lifecycle
+def test_overlap_prevented_while_running(tmp_path, qtbot) -> None:
+    """`_on_run_clicked()`을 활성 run 중에 직접 다시 호출해도(버튼이
+    비활성화돼 있어 UI로는 불가능한 상황을 흉내 냄) backend가 두 번
+    실행되면 안 된다."""
+    backend_started = threading.Event()
+    let_backend_finish = threading.Event()
+    call_count = {"n": 0}
+
+    def blocking_backend(request):
+        call_count["n"] += 1
+        backend_started.set()
+        assert let_backend_finish.wait(timeout=5)
+        return _fake_inference_result()
+
+    controller = InferenceController(backend=blocking_backend)
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    page._on_run_clicked()
+    assert backend_started.wait(timeout=5)
+
+    page._on_run_clicked()
+    page._on_run_clicked()
+
+    let_backend_finish.set()
+    qtbot.waitUntil(lambda: page._run_button.isEnabled(), timeout=5000)
+
+    assert call_count["n"] == 1
+    assert page._status_label.text() == "Finished"
+
+
+# -- worker/thread reference cleanup -----------------------------------------------
+
+
+@pytest.mark.phase6c_cp2_inference_page_lifecycle
+def test_worker_and_thread_references_cleared_after_success(tmp_path, qtbot) -> None:
+    controller = InferenceController(backend=lambda request: _fake_inference_result())
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    page._on_run_clicked()
+    assert page._thread is not None
+    assert page._worker is not None
+
+    qtbot.waitUntil(lambda: page._thread is None, timeout=5000)
+    assert page._worker is None
+
+
+@pytest.mark.phase6c_cp2_inference_page_lifecycle
+def test_worker_and_thread_references_cleared_after_failure(tmp_path, qtbot) -> None:
+    def failing_backend(request):
+        raise RuntimeError("boom")
+
+    controller = InferenceController(backend=failing_backend)
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    page._on_run_clicked()
+    assert page._thread is not None
+    assert page._worker is not None
+
+    qtbot.waitUntil(lambda: page._thread is None, timeout=5000)
+    assert page._worker is None
+
+
+# -- rerun after cleanup -------------------------------------------------------------
+
+
+@pytest.mark.phase6c_cp2_inference_page_lifecycle
+def test_repeated_successful_runs_on_same_page(tmp_path, qtbot) -> None:
+    controller = InferenceController(backend=lambda request: _fake_inference_result())
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    for _ in range(3):
+        _start_and_wait(page, qtbot)
+        assert page._status_label.text() == "Finished"
+        assert page._run_button.isEnabled() is True
+        assert page._thread is None
+        assert page._worker is None
+
+
+@pytest.mark.phase6c_cp2_inference_page_lifecycle
+def test_run_succeeds_after_a_previous_failed_run(tmp_path, qtbot) -> None:
+    """§lifecycle: `InferenceController.begin_run()`은 `failed` 상태
+    에서도 새 run을 허용한다(별도 reset 없음) -- 그 계약이 GUI
+    lifecycle을 통해서도 실제로 성립하는지 확인한다."""
+    calls = {"n": 0}
+
+    def flaky_backend(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("first run fails")
+        return _fake_inference_result()
+
+    controller = InferenceController(backend=flaky_backend)
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+    assert page._status_label.text().startswith("Failed")
+
+    _start_and_wait(page, qtbot)
+    assert page._status_label.text() == "Finished"

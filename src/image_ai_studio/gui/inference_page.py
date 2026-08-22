@@ -1,10 +1,17 @@
-"""Phase 6C CP1: InferencePage form -- widget layout and InferenceRequest
-building only. No QThread, no QtInferenceWorker, no inference execution."""
+"""Phase 6C CP2: InferencePage async lifecycle. Extends CP1's request-building
+form with the actual Run Inference execution -- a QThread + QtInferenceWorker
+pair wired around the injected InferenceController, following the same
+canonical lifecycle as TrainingPage/QtTrainingWorker (Phase 5C):
+started->run, finished/failed->page slots + thread.quit + worker.deleteLater,
+thread.finished->thread.deleteLater + reference cleanup. No MainWindow
+integration and no inference-result rendering here -- only lifecycle state
+(Running/Finished/Failed) and control enablement."""
 from __future__ import annotations
 
 from pathlib import Path
 
 import torch
+from PySide6.QtCore import QThread
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -19,7 +26,8 @@ from PySide6.QtWidgets import (
 )
 
 from image_ai_studio.application.inference_controller import InferenceController, build_inference_request
-from image_ai_studio.inference.single_image_inference import InferenceRequest
+from image_ai_studio.gui.qt_inference_worker import QtInferenceWorker
+from image_ai_studio.inference.single_image_inference import InferenceRequest, InferenceResult
 from image_ai_studio.training.config import PRECISION_CHOICES
 
 
@@ -34,7 +42,9 @@ def _detect_device_choices() -> list[str]:
 
 class InferencePage(QWidget):
     """Single-image inference form. Accepts optional InferenceController
-    injection for later lifecycle work and tests; CP1 only builds requests."""
+    injection for tests. Run Inference builds the request (CP1), then runs
+    it asynchronously via QThread + QtInferenceWorker (CP2) -- construction
+    itself creates no thread/worker and starts no inference."""
 
     def __init__(
         self,
@@ -44,6 +54,8 @@ class InferencePage(QWidget):
     ) -> None:
         super().__init__(parent)
         self._controller = controller if controller is not None else InferenceController()
+        self._thread: QThread | None = None
+        self._worker: QtInferenceWorker | None = None
         self._build_ui()
 
     # -- public request builder (used by tests and future Run handler) ---------
@@ -77,27 +89,27 @@ class InferencePage(QWidget):
         self._inputs_form = form
 
         self._training_output_dir_edit = QLineEdit()
-        browse_output = QPushButton("Browse...")
-        browse_output.clicked.connect(self._browse_training_output_dir)
+        self._browse_output_button = QPushButton("Browse...")
+        self._browse_output_button.clicked.connect(self._browse_training_output_dir)
         output_row = QHBoxLayout()
         output_row.addWidget(self._training_output_dir_edit)
-        output_row.addWidget(browse_output)
+        output_row.addWidget(self._browse_output_button)
         form.addRow("Training Output Dir:", output_row)
 
         self._model_json_edit = QLineEdit()
-        browse_model = QPushButton("Browse...")
-        browse_model.clicked.connect(self._browse_model_json)
+        self._browse_model_button = QPushButton("Browse...")
+        self._browse_model_button.clicked.connect(self._browse_model_json)
         model_row = QHBoxLayout()
         model_row.addWidget(self._model_json_edit)
-        model_row.addWidget(browse_model)
+        model_row.addWidget(self._browse_model_button)
         form.addRow("Model JSON:", model_row)
 
         self._image_path_edit = QLineEdit()
-        browse_image = QPushButton("Browse...")
-        browse_image.clicked.connect(self._browse_image)
+        self._browse_image_button = QPushButton("Browse...")
+        self._browse_image_button.clicked.connect(self._browse_image)
         image_row = QHBoxLayout()
         image_row.addWidget(self._image_path_edit)
-        image_row.addWidget(browse_image)
+        image_row.addWidget(self._browse_image_button)
         form.addRow("Input Image:", image_row)
 
         self._device_combo = QComboBox()
@@ -146,10 +158,69 @@ class InferencePage(QWidget):
             self._image_path_edit.setText(path)
 
     def _on_run_clicked(self) -> None:
-        # CP1: validates request construction only; inference execution deferred to CP2+
+        if self._worker is not None or self._thread is not None:
+            # A run is already active -- overlap prevention even if this
+            # handler is invoked directly while a previous run has not
+            # finished cleaning up yet.
+            return
+
         try:
-            self._build_request()
-        except Exception as exc:
+            request = self._build_request()
+        except Exception as exc:  # noqa: BLE001 -- request 조립 실패는 controller를 건드리지 않는다
             self._status_label.setText(f"Failed: {exc}")
             return
-        self._status_label.setText("Ready")
+
+        self._thread = QThread(self)
+        self._worker = QtInferenceWorker(self._controller, request)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        # signal을 QObject bound method(self의 메서드)에 connect한다 --
+        # plain 함수/lambda에 connect하면 GUI thread가 아니라 emit이
+        # 일어난 worker thread에서 직접 실행된다(QtInferenceWorker
+        # docstring/Phase 5B empirical 확인 참고).
+        self._worker.finished.connect(self._on_finished)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.failed.connect(self._thread.quit)
+        # worker.deleteLater()는 worker 자신의 finished/failed에
+        # connect한다(thread.finished에 connect하면 worker thread의
+        # event loop가 이미 멈춘 뒤라 안전하지 않다 -- QtInferenceWorker
+        # docstring의 deleteLater ordering 계약 참고).
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._worker.failed.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.finished.connect(self._on_thread_finished)
+
+        self._set_controls_enabled(False)
+        self._status_label.setText("Running")
+        self._thread.start()
+
+    # -- worker signal handlers -------------------------------------------------
+
+    def _on_finished(self, result: InferenceResult) -> None:
+        self._status_label.setText("Finished")
+
+    def _on_failed(self, message: str) -> None:
+        first_line = message.splitlines()[0] if message else "Unknown error"
+        self._status_label.setText(f"Failed: {first_line}")
+
+    def _on_thread_finished(self) -> None:
+        self._thread = None
+        self._worker = None
+        self._set_controls_enabled(True)
+
+    # -- helpers -----------------------------------------------------------------
+
+    def _set_controls_enabled(self, enabled: bool) -> None:
+        for widget in (
+            self._training_output_dir_edit,
+            self._browse_output_button,
+            self._model_json_edit,
+            self._browse_model_button,
+            self._image_path_edit,
+            self._browse_image_button,
+            self._device_combo,
+            self._precision_combo,
+            self._run_button,
+        ):
+            widget.setEnabled(enabled)
