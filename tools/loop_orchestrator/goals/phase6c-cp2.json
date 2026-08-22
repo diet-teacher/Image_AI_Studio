@@ -1,0 +1,25 @@
+{
+  "checkpoint_id": "phase6c-cp2-inference-page-async-lifecycle",
+  "objective": "Connect the existing InferencePage Run action to the existing InferenceController and QtInferenceWorker on a QThread, implementing only the asynchronous running, success, failure, cleanup, and rerun lifecycle without MainWindow integration or inference-result rendering.",
+  "acceptance_criteria": [
+    "Constructing InferencePage remains side-effect free: no QThread or QtInferenceWorker is created and no inference starts until Run Inference is activated.",
+    "Run Inference builds the request through the existing _build_request mapping and executes it through the injected InferenceController using QtInferenceWorker on a QThread, with the backend observed off the GUI thread in tests.",
+    "While a run is active, the status reports Running and the Run button plus every request input control are disabled so overlapping runs cannot start.",
+    "A successful worker signal produces a Finished terminal status, and a failed worker signal produces a Failed terminal status with concise propagated error information.",
+    "Both success and failure quit the thread, schedule worker deletion from the worker terminal signal, schedule thread deletion after thread completion, clear the page's strong worker/thread references after completion, and restore the controls only when cleanup permits a new run.",
+    "After either a successful or failed run has fully cleaned up, the same page and controller can start another run.",
+    "The existing Phase 6B inference core, InferenceController, and QtInferenceWorker public interfaces remain unchanged.",
+    "Focused qtbot tests use injected fake backends and synchronization primitives; they verify lifecycle state, GUI-thread-safe terminal handling, overlap prevention, cleanup, and rerun behavior without executing real model, CUDA, or image inference.",
+    "No MainWindow integration, inference-result or image rendering, preview, cancellation, generic ViewModel/base-page abstraction, or CP3 functionality is added.",
+    "Automated screenshot verification is not part of this checkpoint; deterministic widget text/enabled-state assertions, thread-affinity observations, signal outcomes, and lifecycle-reference cleanup are the substitute verification."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/gui/inference_page.py",
+    "tests/gui/test_inference_page.py"
+  ],
+  "required_tests": [
+    "phase6c_cp2_inference_page_lifecycle"
+  ],
+  "claude_prompt": "Implement only Phase 6C checkpoint 2 in the two allowed files. Extend the existing InferencePage so its Run Inference action first uses the unchanged _build_request mapping, then creates a QThread and image_ai_studio.gui.qt_inference_worker.QtInferenceWorker for the injected InferenceController. Preserve construction-time side-effect freedom: initialize lifecycle references to None if needed, but do not create a thread or worker or start inference until Run is activated. Follow the repository's canonical lifecycle exactly: move the worker to the thread; connect thread.started to worker.run; connect worker.finished and worker.failed to real QObject-bound InferencePage methods; connect both terminal signals to thread.quit and the worker's own deleteLater; connect thread.finished to thread.deleteLater and to page cleanup that clears strong references. Keep terminal result/error state long enough to show Finished or a concise Failed message, and restore the Run button and all request inputs only when lifecycle cleanup permits a safe rerun. Prevent overlap even if the click handler is invoked directly while active. Add focused qtbot tests to tests/gui/test_inference_page.py using injected fake InferenceController backends plus synchronization primitives. Verify no construction-time execution, backend execution off the GUI thread, Running status and disabled controls, success and failure outcomes, overlap prevention, eventual thread/worker reference clearing, and a subsequent run after cleanup. Reuse the existing controller and worker public APIs without modifying them. Do not modify MainWindow; do not render predictions, probabilities, images, or previews; do not add cancellation, CP3 behavior, generic ViewModel/base-page abstractions, actual model/CUDA/image inference, shell commands, or changes outside the allowed files. Automated visual verification is unavailable, so use deterministic widget state, signal, thread-affinity, and cleanup assertions instead.",
+  "estimated_scope": "Small-to-medium: modify one existing GUI page and its focused test module, approximately 180-300 changed lines combined."
+}
