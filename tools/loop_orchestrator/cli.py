@@ -37,14 +37,16 @@ def doctor() -> int:
     config = load_config()
     def probe(argv):
         try:
-            p = subprocess.run(argv, text=True, capture_output=True, shell=False, timeout=10, check=False)
+            p = subprocess.run(argv, text=True, encoding="utf-8", errors="replace", capture_output=True,
+                               shell=False, timeout=10, check=False)
             return {"ok": p.returncode == 0, "exit_code": p.returncode,
-                    "output": (p.stdout or p.stderr).strip()[-2000:]}
+                    "output": p.stdout.strip()[-2000:], "stdout_tail": p.stdout[-2000:],
+                    "stderr_tail": p.stderr[-2000:]}
         except (OSError, subprocess.TimeoutExpired) as exc:
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     git_ok = (ROOT / ".git").exists()
     git_status = probe(["git", "status", "--porcelain=v1", "--untracked-files=all"]) if git_ok else {"ok": False, "error": "not a Git repository"}
-    dirty = bool(git_status.get("output", "").strip())
+    dirty = bool(git_status.get("stdout_tail", "").strip())
     python_ok = sys.version_info >= (3, 10)
     claude = str(config.get("claude_executable", "claude")); codex = str(config.get("codex_executable", "codex"))
     checks = {"claude_version": probe([claude, "--version"]), "codex_version": probe([codex, "--version"]),

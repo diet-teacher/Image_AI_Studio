@@ -7,8 +7,20 @@ from pathlib import Path
 from typing import Sequence
 
 
+OUTPUT_TAIL_LIMIT = 4000
+
+
 class ProcessFailure(RuntimeError):
-    pass
+    def __init__(self, message: str, *, return_code: int | None = None,
+                 stdout_tail: str = "", stderr_tail: str = ""):
+        super().__init__(message)
+        self.return_code = return_code
+        self.stdout_tail = stdout_tail[-OUTPUT_TAIL_LIMIT:]
+        self.stderr_tail = stderr_tail[-OUTPUT_TAIL_LIMIT:]
+
+    def diagnostics(self) -> dict:
+        return {"return_code": self.return_code, "stdout_tail": self.stdout_tail,
+                "stderr_tail": self.stderr_tail}
 
 
 @dataclass
@@ -23,8 +35,8 @@ def run_json_process(argv: Sequence[str], cwd: Path, timeout: int, *, json_lines
     """Run a fixed adapter-built argv; never interprets model-produced commands."""
     process = None
     try:
-        process = subprocess.Popen(list(argv), cwd=cwd, text=True, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, shell=False)
+        process = subprocess.Popen(list(argv), cwd=cwd, text=True, encoding="utf-8", errors="replace",
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         if process is not None:
@@ -37,7 +49,11 @@ def run_json_process(argv: Sequence[str], cwd: Path, timeout: int, *, json_lines
     except OSError as exc:
         raise ProcessFailure(f"PROCESS_START_FAILED: {exc}") from exc
     if process.returncode != 0:
-        raise ProcessFailure(f"NONZERO_EXIT {process.returncode}: {stderr[-1000:]}")
+        stdout_tail = stdout[-OUTPUT_TAIL_LIMIT:]
+        stderr_tail = stderr[-OUTPUT_TAIL_LIMIT:]
+        raise ProcessFailure(
+            f"NONZERO_EXIT {process.returncode}: stdout_tail={stdout_tail!r}; stderr_tail={stderr_tail!r}",
+            return_code=process.returncode, stdout_tail=stdout_tail, stderr_tail=stderr_tail)
     try:
         if json_lines:
             events = [json.loads(line) for line in stdout.splitlines() if line.strip()]

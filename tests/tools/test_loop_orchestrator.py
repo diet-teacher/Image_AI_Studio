@@ -11,8 +11,7 @@ from tools.loop_orchestrator.adapters import ClaudeCLIAdapter
 from tools.loop_orchestrator.budget import BudgetManager
 from tools.loop_orchestrator.engine import LoopEngine
 from tools.loop_orchestrator.models import ClaudeInvocation, MakerResult, PlannerResult, State, VerifierResult
-from tools.loop_orchestrator.process import ProcessResult
-from tools.loop_orchestrator.process import run_json_process
+from tools.loop_orchestrator.process import OUTPUT_TAIL_LIMIT, ProcessFailure, ProcessResult, run_json_process
 
 
 def command(argv, cwd): return subprocess.run(argv, cwd=cwd, text=True, capture_output=True, shell=False, check=True)
@@ -136,6 +135,18 @@ class LoopTests(unittest.TestCase):
             cli.main(["run", "--goal", str(Path(__file__).parents[2]/"tools"/"loop_orchestrator"/"example.goal.json"), "--max-checkpoints", "0", "--dry-run"])
         self.assertEqual(2, raised.exception.code)
 
+    def test_maker_process_failure_is_saved_and_handed_off(self):
+        class FailingMaker:
+            def run(self, prompt, session_id=None):
+                raise ProcessFailure("NONZERO_EXIT 1", return_code=1,
+                                     stdout_tail='{\"error\":\"bad\"}', stderr_tail="diagnostic")
+        state = self.engine(FailingMaker(), FakeCodex([])).run(self.goal, execute=True)
+        self.assertEqual(State.FAILED, state.state)
+        details = json.loads((self.root/".loop"/"handoff.json").read_text(encoding="utf-8"))["details"]
+        self.assertEqual(1, details["maker_error"]["return_code"])
+        self.assertIn("error", details["maker_error"]["stdout_tail"])
+        self.assertEqual("diagnostic", details["maker_error"]["stderr_tail"])
+
 
 class AdapterTests(unittest.TestCase):
     def fixture(self):
@@ -165,6 +176,46 @@ class AdapterTests(unittest.TestCase):
         def fake(argv, root, timeout): captured["argv"] = argv; return self.fixture()
         with patch.object(adapters, "run_json_process", side_effect=fake): ClaudeCLIAdapter(Path.cwd(), 10, 1).run("fix", "actual-session")
         self.assertEqual("actual-session", captured["argv"][captured["argv"].index("--resume")+1])
+
+    def run_failure(self, script):
+        with self.assertRaises(ProcessFailure) as raised:
+            run_json_process([sys.executable, "-c", script], Path.cwd(), 10)
+        return raised.exception
+
+    def test_nonzero_exit_preserves_stdout_when_stderr_empty(self):
+        failure = self.run_failure("import sys; print('{\"error\": \"failed\"}'); sys.exit(1)")
+        self.assertEqual(1, failure.return_code)
+        self.assertIn('"error": "failed"', failure.stdout_tail)
+        self.assertEqual("", failure.stderr_tail)
+
+    def test_nonzero_exit_preserves_stderr(self):
+        failure = self.run_failure("import sys; print('bad stderr', file=sys.stderr); sys.exit(1)")
+        self.assertEqual("", failure.stdout_tail)
+        self.assertIn("bad stderr", failure.stderr_tail)
+
+    def test_nonzero_exit_preserves_both_bounded_tails(self):
+        script = "import sys; print('x' * 5000); print('y' * 5000, file=sys.stderr); sys.exit(1)"
+        failure = self.run_failure(script)
+        self.assertEqual(OUTPUT_TAIL_LIMIT, len(failure.stdout_tail))
+        self.assertEqual(OUTPUT_TAIL_LIMIT, len(failure.stderr_tail))
+        self.assertTrue(failure.stdout_tail.endswith("x" * (OUTPUT_TAIL_LIMIT - 1) + "\n"))
+        self.assertTrue(failure.stderr_tail.endswith("y" * (OUTPUT_TAIL_LIMIT - 1) + "\n"))
+
+    def test_invalid_utf8_is_replaced_without_decode_failure(self):
+        failure = self.run_failure("import os; os.write(1, b'bad\\xffbytes'); raise SystemExit(1)")
+        self.assertIn("bad\ufffdbytes", failure.stdout_tail)
+
+    def test_popen_keeps_shell_false_and_utf8_and_interrupt_cleanup(self):
+        process = unittest.mock.MagicMock()
+        process.communicate.side_effect = [KeyboardInterrupt(), ("", "")]
+        with patch("tools.loop_orchestrator.process.subprocess.Popen", return_value=process) as popen:
+            with self.assertRaises(KeyboardInterrupt):
+                run_json_process(["fixed", "argv"], Path.cwd(), 10)
+        kwargs = popen.call_args.kwargs
+        self.assertFalse(kwargs["shell"])
+        self.assertEqual("utf-8", kwargs["encoding"])
+        self.assertEqual("replace", kwargs["errors"])
+        process.kill.assert_called_once_with()
 
 
 class BudgetAndDoctorTests(unittest.TestCase):
@@ -197,5 +248,24 @@ class BudgetAndDoctorTests(unittest.TestCase):
         with patch.object(cli.subprocess, "run", side_effect=fake), redirect_stdout(output): code = cli.doctor()
         self.assertEqual(1, code); self.assertIn("PermissionError", output.getvalue())
 
+    def doctor_with_git_output(self, stdout, stderr):
+        def fake(argv, **kwargs):
+            if argv[:2] == ["git", "status"]:
+                return subprocess.CompletedProcess(argv, 0, stdout, stderr)
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+        output = io.StringIO()
+        with patch.object(cli.subprocess, "run", side_effect=fake), redirect_stdout(output):
+            code = cli.doctor()
+        return code, json.loads(output.getvalue())
 
+    def test_doctor_stderr_warning_does_not_mark_clean_worktree_dirty(self):
+        code, report = self.doctor_with_git_output("", "warning: inaccessible ignore file")
+        self.assertEqual(0, code)
+        self.assertFalse(report["worktree_dirty"])
+        self.assertIn("inaccessible", report["worktree_status"]["stderr_tail"])
+
+    def test_doctor_git_stdout_marks_worktree_dirty(self):
+        code, report = self.doctor_with_git_output(" M tracked.py\n", "warning")
+        self.assertEqual(0, code)
+        self.assertTrue(report["worktree_dirty"])
 if __name__ == "__main__": unittest.main()

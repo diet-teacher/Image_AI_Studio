@@ -7,6 +7,7 @@ from pathlib import Path
 from .budget import BudgetManager
 from .goal import GoalError, path_allowed, validate_executable_goal, validate_goal
 from .models import State, RunState, VerifierResult
+from .process import ProcessFailure
 from .prompts import MAKER, PLANNER, VERIFIER
 from .repository import base_commit, changed_files, file_snapshot, git, worktree_snapshot
 
@@ -67,6 +68,13 @@ class LoopEngine:
                 try: invocation = self.maker.run(MAKER.format(goal=json.dumps(goal), checkpoint=goal["checkpoint_id"], rework=rework_text), session_id)
                 except KeyboardInterrupt:
                     state.move(State.BLOCKED, "INTERRUPTED"); self._save(state, "maker"); return state
+                except ProcessFailure as exc:
+                    details = exc.diagnostics()
+                    state.recent_result = {"maker_error": details}
+                    state.move(State.FAILED, f"MAKER_ERROR: {exc}")
+                    self._save(state, "maker", state.recent_result)
+                    self._write_handoff(state, state.stop_reason, state.recent_result)
+                    return state
                 except Exception as exc:
                     state.move(State.FAILED, f"MAKER_ERROR: {exc}"); self._save(state, "maker"); return state
                 maker, session_id = invocation.result, invocation.session_id
