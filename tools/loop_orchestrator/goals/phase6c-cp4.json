@@ -1,0 +1,32 @@
+{
+  "checkpoint_id": "phase6c-cp4-main-window-integration-close-coordination",
+  "objective": "Integrate the completed InferencePage into MainWindow as a second tab and add centralized, non-blocking close coordination for active training and inference while preserving the established CP1-CP3 request, lifecycle, and result-presentation behavior.",
+  "acceptance_criteria": [
+    "MainWindow uses a QTabWidget and adds the existing TrainingPage and InferencePage exactly once, with stable references to both pages.",
+    "Existing MainWindow training-tab behavior and the completed CP1-CP3 inference request mapping, asynchronous lifecycle, result presentation, overlap prevention, and rerun behavior remain intact.",
+    "InferencePage exposes only the minimal read-only activity state and non-blocking close-coordination interface needed by MainWindow, following the existing TrainingPage close contract where practical.",
+    "InferencePage construction remains idle, and its activity state remains true throughout worker and thread cleanup rather than becoming idle merely when a terminal worker signal is received.",
+    "Closing MainWindow while training and inference are both idle is accepted immediately with the existing user-visible behavior.",
+    "Closing during active inference defers window destruction until the existing asynchronous worker and QThread cleanup completes, without introducing inference cancellation.",
+    "No GUI-thread-blocking wait(), busy loop, processEvents polling loop, QThread.terminate(), or other forced termination is used for close coordination.",
+    "A confirmed close request while work is active establishes one pending-close operation, requests the existing cooperative training stop when needed, and allows active inference to finish naturally.",
+    "Repeated close requests while shutdown is pending do not create duplicate confirmation dialogs, signal connections, cleanup requests, or close retries.",
+    "After every active page has completed cleanup, MainWindow retries close exactly once regardless of whether training or inference finishes first.",
+    "Both successful and failed inference lifecycles can complete cleanup and allow a pending close to finish normally.",
+    "MainWindow and InferencePage thread, worker, page, and pending-close references remain consistent after cleanup and after the deferred close completes.",
+    "The existing Phase 6B inference core, InferenceController, QtInferenceWorker, and training public interfaces are not changed.",
+    "No cancellation or stop API for inference, MainWindow launcher change, image preview or result-image rendering, actual model/CUDA/image inference, deployment work, or CP5 functionality is included.",
+    "Focused qtbot tests use fake controllers or workers to verify one-time tab integration, idle close, deferred active-inference close, duplicate-close suppression, both completion orders where applicable, success and failure cleanup, and stable references without real inference."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/gui/inference_page.py",
+    "src/image_ai_studio/gui/main_window.py",
+    "tests/gui/test_inference_page.py",
+    "tests/gui/test_main_window.py"
+  ],
+  "required_tests": [
+    "phase6c_cp4_main_window_integration"
+  ],
+  "claude_prompt": "Implement only Phase 6C checkpoint 4 in the four allowed files: src/image_ai_studio/gui/inference_page.py, src/image_ai_studio/gui/main_window.py, tests/gui/test_inference_page.py, and tests/gui/test_main_window.py. Integrate the completed InferencePage into MainWindow's QTabWidget exactly once alongside the existing TrainingPage and retain stable references to both pages. Reuse the repository's existing TrainingPage close-request pattern and Qt signal-driven cleanup patterns with the smallest practical changes. Add only a minimal read-only activity query and safe non-blocking close-coordination interface to InferencePage if needed. Centralize MainWindow pending-close handling so an idle close is immediate, a confirmed close during active work is deferred, existing training cooperative stop is requested when applicable, active inference is allowed to finish naturally, and close is retried exactly once only after all page cleanup is complete. Prevent repeated close requests from producing duplicate dialogs, signal connections, cleanup actions, or close retries. Do not use wait(), busy loops, processEvents polling, QThread.terminate(), forced worker termination, or any GUI-thread-blocking mechanism. Preserve the CP1 request mapping, CP2 QThread/QtInferenceWorker lifecycle and cleanup ordering, CP3 deterministic result presentation, overlap prevention, control restoration, and rerun behavior. Add focused qtbot tests using fake controllers or workers for tab integration, idle close, active-inference deferred close, duplicate-close suppression, success and failure completion, relevant completion ordering, and reference consistency. Do not run actual model, CUDA, or image inference. Do not modify files outside the four allowed files, change any Phase 6B controller/worker or training public API, add inference cancellation, preview or result-image rendering, launcher changes, deployment work, CP5 features, or unrelated abstractions.",
+  "estimated_scope": "Medium: two existing GUI modules and two focused GUI test modules, approximately 200-350 changed lines combined."
+}
