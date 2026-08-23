@@ -1,19 +1,21 @@
-"""Phase 6C CP3: InferencePage result presentation. Extends CP1's
-request-building form and CP2's async Run Inference lifecycle -- a QThread +
-QtInferenceWorker pair wired around the injected InferenceController,
-following the same canonical lifecycle as TrainingPage/QtTrainingWorker
-(Phase 5C): started->run, finished/failed->page slots + thread.quit +
-worker.deleteLater, thread.finished->thread.deleteLater + reference cleanup
--- with a result area that presents the existing InferenceResult fields
-(predicted class, confidence, class probabilities, inference duration)
-after a successful run, without recalculating any prediction values. No
-MainWindow integration."""
+"""Phase 6C CP3/CP4: InferencePage result presentation + MainWindow close
+coordination. Extends CP1's request-building form and CP2's async Run
+Inference lifecycle -- a QThread + QtInferenceWorker pair wired around the
+injected InferenceController, following the same canonical lifecycle as
+TrainingPage/QtTrainingWorker (Phase 5C): started->run, finished/failed->page
+slots + thread.quit + worker.deleteLater, thread.finished->thread.deleteLater
++ reference cleanup -- with a result area that presents the existing
+InferenceResult fields (predicted class, confidence, class probabilities,
+inference duration) after a successful run, without recalculating any
+prediction values. CP4 adds `is_inference_active()`/`request_close()` so
+MainWindow can defer window close until an active run finishes naturally
+(no cancellation API)."""
 from __future__ import annotations
 
 from pathlib import Path
 
 import torch
-from PySide6.QtCore import QThread
+from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -66,7 +68,16 @@ class InferencePage(QWidget):
     """Single-image inference form. Accepts optional InferenceController
     injection for tests. Run Inference builds the request (CP1), then runs
     it asynchronously via QThread + QtInferenceWorker (CP2) -- construction
-    itself creates no thread/worker and starts no inference."""
+    itself creates no thread/worker and starts no inference.
+
+    CP4: exposes the minimal read-only activity query and close-coordination
+    interface MainWindow needs, following TrainingPage's `close_requested`
+    contract where practical. Unlike TrainingPage there is no cooperative
+    stop API for inference -- `request_close()` never cancels an active run,
+    it only defers the `close_requested` emission until the run finishes
+    naturally and worker/thread cleanup (`_on_thread_finished`) has run."""
+
+    close_requested = Signal()
 
     def __init__(
         self,
@@ -78,7 +89,26 @@ class InferencePage(QWidget):
         self._controller = controller if controller is not None else InferenceController()
         self._thread: QThread | None = None
         self._worker: QtInferenceWorker | None = None
+        self._close_pending = False
         self._build_ui()
+
+    # -- public: MainWindow.closeEvent()가 사용 ---------------------------------
+
+    def is_inference_active(self) -> bool:
+        """`_thread`는 worker/thread cleanup(`_on_thread_finished`)이 끝날
+        때까지 `None`이 아니다 -- `finished`/`failed` 같은 terminal worker
+        signal을 받은 시점이 아니라 cleanup이 실제로 끝난 시점에만
+        idle이 된다."""
+        return self._thread is not None
+
+    def request_close(self) -> None:
+        """Inference 중이 아니면 즉시 `close_requested`를 emit한다.
+        Inference 중이면 취소하지 않고 자연스럽게 끝나기를 기다렸다가
+        `_on_thread_finished()`에서 cleanup이 끝난 뒤에만 emit한다."""
+        if not self.is_inference_active():
+            self.close_requested.emit()
+            return
+        self._close_pending = True
 
     # -- public request builder (used by tests and future Run handler) ---------
 
@@ -260,6 +290,9 @@ class InferencePage(QWidget):
         self._thread = None
         self._worker = None
         self._set_controls_enabled(True)
+        if self._close_pending:
+            self._close_pending = False
+            self.close_requested.emit()
 
     # -- helpers -----------------------------------------------------------------
 

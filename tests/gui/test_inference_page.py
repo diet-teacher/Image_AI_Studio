@@ -746,6 +746,157 @@ def test_new_run_clears_previous_error_presentation(tmp_path, qtbot) -> None:
     assert page._predicted_class_value_label.text() == "cat"
 
 
+@pytest.mark.phase6c_cp4_main_window_integration
+def test_is_inference_active_false_at_construction(qtbot) -> None:
+    page = _make_page(qtbot)
+    assert page.is_inference_active() is False
+
+
+@pytest.mark.phase6c_cp4_main_window_integration
+def test_is_inference_active_true_while_running(tmp_path, qtbot) -> None:
+    backend_started = threading.Event()
+    let_backend_finish = threading.Event()
+
+    def blocking_backend(request):
+        backend_started.set()
+        assert let_backend_finish.wait(timeout=5)
+        return _fake_inference_result()
+
+    controller = InferenceController(backend=blocking_backend)
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    page._on_run_clicked()
+    assert backend_started.wait(timeout=5)
+    assert page.is_inference_active() is True
+
+    let_backend_finish.set()
+    qtbot.waitUntil(lambda: page.is_inference_active() is False, timeout=5000)
+
+
+@pytest.mark.phase6c_cp4_main_window_integration
+def test_is_inference_active_stays_true_through_cleanup_not_just_terminal_signal(tmp_path, qtbot) -> None:
+    """Terminal worker signal(`finished`)이 도착한 시점에는 아직
+    thread/worker cleanup(`_on_thread_finished`)이 끝나지 않았을 수
+    있다 -- `is_inference_active()`는 그 순간에도 여전히 `True`여야
+    한다."""
+    observed_active_during_finished = {}
+
+    class _RecordingPage(InferencePage):
+        def _on_finished(self, result) -> None:
+            observed_active_during_finished["value"] = self.is_inference_active()
+            super()._on_finished(result)
+
+    controller = InferenceController(backend=lambda request: _fake_inference_result())
+    page = _RecordingPage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+
+    assert observed_active_during_finished["value"] is True
+    assert page.is_inference_active() is False
+
+
+@pytest.mark.phase6c_cp4_main_window_integration
+def test_request_close_emits_immediately_when_idle(qtbot) -> None:
+    page = _make_page(qtbot)
+    received = []
+    page.close_requested.connect(lambda: received.append(True))
+
+    page.request_close()
+
+    assert received == [True]
+
+
+@pytest.mark.phase6c_cp4_main_window_integration
+def test_request_close_defers_until_active_run_completes(tmp_path, qtbot) -> None:
+    backend_started = threading.Event()
+    let_backend_finish = threading.Event()
+
+    def blocking_backend(request):
+        backend_started.set()
+        assert let_backend_finish.wait(timeout=5)
+        return _fake_inference_result()
+
+    controller = InferenceController(backend=blocking_backend)
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    received = []
+    page.close_requested.connect(lambda: received.append(True))
+
+    page._on_run_clicked()
+    assert backend_started.wait(timeout=5)
+
+    page.request_close()
+    assert received == []  # not yet -- inference must finish naturally, no cancellation
+
+    let_backend_finish.set()
+    qtbot.waitUntil(lambda: received == [True], timeout=5000)
+    assert page._thread is None
+    assert page._worker is None
+
+
+@pytest.mark.phase6c_cp4_main_window_integration
+def test_request_close_completes_after_failed_run(tmp_path, qtbot) -> None:
+    backend_started = threading.Event()
+    let_backend_finish = threading.Event()
+
+    def failing_blocking_backend(request):
+        backend_started.set()
+        assert let_backend_finish.wait(timeout=5)
+        raise ValueError("boom")
+
+    controller = InferenceController(backend=failing_blocking_backend)
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    received = []
+    page.close_requested.connect(lambda: received.append(True))
+
+    page._on_run_clicked()
+    assert backend_started.wait(timeout=5)
+    page.request_close()
+
+    let_backend_finish.set()
+    qtbot.waitUntil(lambda: received == [True], timeout=5000)
+    assert page._thread is None
+    assert page._worker is None
+
+
+@pytest.mark.phase6c_cp4_main_window_integration
+def test_repeated_request_close_does_not_duplicate_emission(tmp_path, qtbot) -> None:
+    backend_started = threading.Event()
+    let_backend_finish = threading.Event()
+
+    def blocking_backend(request):
+        backend_started.set()
+        assert let_backend_finish.wait(timeout=5)
+        return _fake_inference_result()
+
+    controller = InferenceController(backend=blocking_backend)
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    received = []
+    page.close_requested.connect(lambda: received.append(True))
+
+    page._on_run_clicked()
+    assert backend_started.wait(timeout=5)
+
+    page.request_close()
+    page.request_close()
+    page.request_close()
+
+    let_backend_finish.set()
+    qtbot.waitUntil(lambda: received == [True], timeout=5000)
+
+
 @pytest.mark.phase6c_cp3_inference_results
 def test_successful_run_removes_previous_error_and_shows_only_new_result(tmp_path, qtbot) -> None:
     calls = {"n": 0}
