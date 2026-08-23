@@ -12,6 +12,11 @@ VERIFIER_SCHEMA = {"type":"object","required":["verdict","findings","failed_chec
 PLANNER_SCHEMA = {"type":"object","required":["checkpoint_id","objective","acceptance_criteria","allowed_files","required_tests","claude_prompt","estimated_scope"],"properties":{k:{} for k in ["checkpoint_id","objective","acceptance_criteria","allowed_files","required_tests","claude_prompt","estimated_scope"]}}
 
 
+def codex_exec_prefix(executable: str, root: Path) -> list[str]:
+    """Production Codex global options shared by execution and free preflight help."""
+    return [executable, "--ask-for-approval", "never", "--sandbox", "read-only", "--cd", str(root), "exec"]
+
+
 class ClaudeCLIAdapter:
     def __init__(self, root: Path, timeout: int, max_budget_usd: float):
         self.root, self.timeout, self.max_budget_usd = root, timeout, max_budget_usd
@@ -36,8 +41,8 @@ class CodexCLIAdapter:
         self.root, self.timeout, self.schema_dir, self.executable = root, timeout, schema_dir, executable
 
     def _run(self, prompt: str, schema_name: str) -> dict:
-        argv = [self.executable, "--ask-for-approval", "never", "--sandbox", "read-only", "--cd", str(self.root),
-                "exec", prompt, "--json", "--ephemeral", "--output-schema", str(self.schema_dir / schema_name)]
+        argv = [*codex_exec_prefix(self.executable, self.root), prompt, "--json", "--ephemeral",
+                "--output-schema", str(self.schema_dir / schema_name)]
         return run_json_process(argv, self.root, self.timeout, json_lines=True).payload
 
     def verify(self, prompt: str) -> VerifierResult:

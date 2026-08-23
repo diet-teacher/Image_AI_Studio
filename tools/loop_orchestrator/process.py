@@ -8,19 +8,46 @@ from typing import Sequence
 
 
 OUTPUT_TAIL_LIMIT = 4000
+TIMEOUT = "TIMEOUT"
+PROCESS_START_FAILED = "PROCESS_START_FAILED"
+NONZERO_EXIT = "NONZERO_EXIT"
+JSON_PARSE_FAILED = "JSON_PARSE_FAILED"
 
 
 class ProcessFailure(RuntimeError):
-    def __init__(self, message: str, *, return_code: int | None = None,
+    def __init__(self, kind: str, message: str, *, return_code: int | None = None,
                  stdout_tail: str = "", stderr_tail: str = ""):
         super().__init__(message)
+        self.kind = kind
         self.return_code = return_code
         self.stdout_tail = stdout_tail[-OUTPUT_TAIL_LIMIT:]
         self.stderr_tail = stderr_tail[-OUTPUT_TAIL_LIMIT:]
 
     def diagnostics(self) -> dict:
-        return {"return_code": self.return_code, "stdout_tail": self.stdout_tail,
+        return {"kind": self.kind, "return_code": self.return_code, "stdout_tail": self.stdout_tail,
                 "stderr_tail": self.stderr_tail}
+
+
+def _tail(value: str | bytes | None) -> str:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    return (value or "")[-OUTPUT_TAIL_LIMIT:]
+
+
+def probe_process(argv: Sequence[str], cwd: Path, timeout: int) -> dict:
+    """Probe a fixed, non-model argv and return bounded structured diagnostics."""
+    try:
+        done = subprocess.run(list(argv), cwd=cwd, text=True, encoding="utf-8", errors="replace",
+                              capture_output=True, shell=False, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        return {"ok": False, "kind": TIMEOUT, "return_code": None,
+                "stdout_tail": _tail(exc.stdout), "stderr_tail": _tail(exc.stderr)}
+    except OSError as exc:
+        return {"ok": False, "kind": PROCESS_START_FAILED, "return_code": None,
+                "stdout_tail": "", "stderr_tail": _tail(str(exc))}
+    kind = None if done.returncode == 0 else NONZERO_EXIT
+    return {"ok": done.returncode == 0, "kind": kind, "return_code": done.returncode,
+            "stdout_tail": _tail(done.stdout), "stderr_tail": _tail(done.stderr)}
 
 
 @dataclass
@@ -41,17 +68,19 @@ def run_json_process(argv: Sequence[str], cwd: Path, timeout: int, *, json_lines
     except subprocess.TimeoutExpired as exc:
         if process is not None:
             process.kill(); process.communicate()
-        raise ProcessFailure(f"TIMEOUT after {timeout}s") from exc
+        raise ProcessFailure(TIMEOUT, f"TIMEOUT after {timeout}s",
+                             stdout_tail=_tail(exc.stdout), stderr_tail=_tail(exc.stderr)) from exc
     except KeyboardInterrupt:
         if process is not None:
             process.kill(); process.communicate()
         raise
     except OSError as exc:
-        raise ProcessFailure(f"PROCESS_START_FAILED: {exc}") from exc
+        raise ProcessFailure(PROCESS_START_FAILED, f"PROCESS_START_FAILED: {exc}",
+                             stderr_tail=str(exc)) from exc
     if process.returncode != 0:
         stdout_tail = stdout[-OUTPUT_TAIL_LIMIT:]
         stderr_tail = stderr[-OUTPUT_TAIL_LIMIT:]
-        raise ProcessFailure(
+        raise ProcessFailure(NONZERO_EXIT,
             f"NONZERO_EXIT {process.returncode}: stdout_tail={stdout_tail!r}; stderr_tail={stderr_tail!r}",
             return_code=process.returncode, stdout_tail=stdout_tail, stderr_tail=stderr_tail)
     try:
@@ -79,6 +108,7 @@ def run_json_process(argv: Sequence[str], cwd: Path, timeout: int, *, json_lines
         if not isinstance(payload, dict):
             raise ValueError("result is not an object")
     except (json.JSONDecodeError, ValueError) as exc:
-        raise ProcessFailure(f"JSON_PARSE_FAILED: {exc}") from exc
+        raise ProcessFailure(JSON_PARSE_FAILED, f"JSON_PARSE_FAILED: {exc}",
+                             stdout_tail=stdout, stderr_tail=stderr) from exc
     metadata = {} if json_lines else envelope
     return ProcessResult(payload, stdout, stderr, metadata)

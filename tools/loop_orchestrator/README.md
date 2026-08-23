@@ -21,6 +21,8 @@ python -m tools.loop_orchestrator run --goal .loop/phase6c-checkpoint-1.json --m
 
 Do not add unrestricted permission flags. The generated runtime state and per-run records live in ignored `.loop/`.
 
+Execute mode also performs a fail-closed, non-model preflight before the maker: configured Claude `--version`, Codex `--version`, and Codex's production global approval/read-only/root prefix followed by `exec --help`. Start failure, timeout, or nonzero exit blocks the run and preserves bounded diagnostics in state, the run directory, and handoff. Dry-run skips this probe and continues to invoke no external model or paid API.
+
 ## Integration choice
 
 Claude Code exposes non-interactive `-p`, JSON Schema output, UUID session/resume, and `--max-budget-usd`. Session ID, cost, and turn count are read exclusively from the CLI's top-level result envelope. Bash is explicitly denied; Claude receives only Read/Edit/Write/Glob/Grep tools, while required tests run through fixed orchestrator argv. Codex CLI exposes `codex exec --json`, `--output-schema`, `--ephemeral`, and `--sandbox read-only`; it is used for verifier and planner, so no SDK dependency is installed. The verifier prompt contains only goal, base commit, changed files, actual diff, required-test results, and verification artifacts—not the maker's success narrative.
@@ -28,6 +30,10 @@ Claude Code exposes non-interactive `-p`, JSON Schema output, UUID session/resum
 `goal` is a validated JSON object. Absolute paths, traversal, and ambiguous paths are rejected, and any changed file outside `allowed_files` blocks the run. `required_tests` must all resolve to configured allowlist entries regardless of Claude's claimed `tests_run`. After PASS, the validated planner result is saved as `.loop/next-goal.json`. `max_checkpoints` controls accepted checkpoint chaining; `max_rework_rounds` independently controls FAIL corrections within one checkpoint.
 
 Every required test must report PASS before a verifier PASS can be accepted. A test FAIL overrides a verifier PASS and enters normal rework; exhaustion ends in FAILED. TIMEOUT and START_FAILED are infrastructure blocks. Test status and stdout/stderr tails are retained in state and handoff records. Planner `claude_prompt` is preserved in `next-goal.json` and included in the next maker prompt. `--max-checkpoints` must be at least one.
+
+Each required-test attempt keeps its literal allowlist argv and receives a unique, retained `.loop/test-temp/<run-id>/<attempt>-<test>/` directory through `TEMP`, `TMP`, and `TMPDIR`, plus UTF-8 Python environment overrides. Its symbolic name, status, exit code, bounded output tails, argv, and temp path are saved in a `tests` run record before verifier budget checking or invocation.
+
+Process failures carry a stable `kind`: `TIMEOUT`, `PROCESS_START_FAILED`, `NONZERO_EXIT`, or `JSON_PARSE_FAILED`. Start failures and timeouts from maker, verifier, or planner are infrastructure blocks with handoff; ordinary nonzero and JSON parse failures retain FAILED semantics.
 
 The CLI JSON token/cost events may be retained in role logs by a future event-normalization extension, but per-call usage is not treated as subscription-period utilization. Codex App Server rate-limit auto-query is not enabled in this initial implementation; manual period percentages remain authoritative.
 

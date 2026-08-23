@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import sys
 from pathlib import Path
 
 from .adapters import ClaudeCLIAdapter, CodexCLIAdapter
 from .budget import BudgetManager
 from .engine import LoopEngine
+from .process import probe_process
 
 
 ROOT = Path.cwd()
@@ -36,14 +36,12 @@ def init() -> int:
 def doctor() -> int:
     config = load_config()
     def probe(argv):
-        try:
-            p = subprocess.run(argv, text=True, encoding="utf-8", errors="replace", capture_output=True,
-                               shell=False, timeout=10, check=False)
-            return {"ok": p.returncode == 0, "exit_code": p.returncode,
-                    "output": p.stdout.strip()[-2000:], "stdout_tail": p.stdout[-2000:],
-                    "stderr_tail": p.stderr[-2000:]}
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        result = probe_process(argv, ROOT, 10)
+        result["exit_code"] = result["return_code"]
+        result["output"] = result["stdout_tail"].strip()[-2000:]
+        result["stdout_tail"] = result["stdout_tail"][-2000:]
+        result["stderr_tail"] = result["stderr_tail"][-2000:]
+        return result
     git_ok = (ROOT / ".git").exists()
     git_status = probe(["git", "status", "--porcelain=v1", "--untracked-files=all"]) if git_ok else {"ok": False, "error": "not a Git repository"}
     dirty = bool(git_status.get("stdout_tail", "").strip())
