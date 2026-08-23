@@ -15,6 +15,7 @@ from tools.loop_orchestrator.process import (
     JSON_PARSE_FAILED, NONZERO_EXIT, OUTPUT_TAIL_LIMIT, PROCESS_START_FAILED, TIMEOUT,
     ProcessFailure, ProcessResult, probe_process, run_json_process,
 )
+from tools.loop_orchestrator.repository import git as repository_git
 
 
 def command(argv, cwd): return subprocess.run(argv, cwd=cwd, text=True, capture_output=True, shell=False, check=True)
@@ -428,6 +429,17 @@ class AdapterTests(unittest.TestCase):
         kwargs = run.call_args.kwargs
         self.assertFalse(kwargs["shell"]); self.assertEqual(7, kwargs["timeout"])
         self.assertEqual("utf-8", kwargs["encoding"]); self.assertEqual("replace", kwargs["errors"])
+
+
+class RepositoryTests(unittest.TestCase):
+    def test_git_uses_platform_independent_utf8_decoding(self):
+        done = subprocess.CompletedProcess(["git"], 0, "diff – text", "")
+        with patch("tools.loop_orchestrator.repository.subprocess.run", return_value=done) as run:
+            self.assertEqual("diff – text", repository_git(Path.cwd(), "diff"))
+        kwargs = run.call_args.kwargs
+        self.assertEqual("utf-8", kwargs["encoding"])
+        self.assertEqual("replace", kwargs["errors"])
+        self.assertFalse(kwargs["shell"])
 
 
 class BudgetAndDoctorTests(unittest.TestCase):

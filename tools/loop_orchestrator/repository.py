@@ -7,7 +7,16 @@ from pathlib import Path
 
 
 def git(root: Path, *args: str) -> str:
-    result = subprocess.run(["git", *args], cwd=root, text=True, capture_output=True, shell=False, check=False)
+    result = subprocess.run(
+        ["git", *args],
+        cwd=root,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        shell=False,
+        check=False,
+    )
     if result.returncode:
         raise RuntimeError(result.stderr.strip())
     return result.stdout
