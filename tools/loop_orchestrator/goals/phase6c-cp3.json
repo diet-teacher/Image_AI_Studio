@@ -1,0 +1,31 @@
+{
+  "checkpoint_id": "phase6c-cp3-inference-result-presentation",
+  "objective": "Extend the existing InferencePage with deterministic presentation of the existing InferenceResult fields after successful asynchronous inference, while preserving the CP1 request mapping and CP2 lifecycle and without integrating MainWindow.",
+  "acceptance_criteria": [
+    "InferencePage contains a clear result area that presents predicted class, confidence, class probabilities, and inference duration.",
+    "The initial result area shows empty values or placeholders that cannot be mistaken for an actual inference result.",
+    "The _on_finished handler presents only the existing InferenceResult instance it receives and does not recalculate prediction values.",
+    "The predicted_class value is displayed exactly.",
+    "Confidence is displayed using a consistent fixed format that is locked by focused tests.",
+    "Probabilities are displayed in a deterministic order and format independent of dictionary insertion order, such as sorting by class name.",
+    "inference_duration_seconds is converted to milliseconds and displayed using a consistent format locked by focused tests.",
+    "Starting a new run clears any previous successful result and previous error presentation before showing Running state.",
+    "A failed run clears any previous successful result so stale prediction data is not left visible while preserving a concise Failed error status.",
+    "A successful run removes any previous error presentation and displays only the new successful result.",
+    "The existing CP2 QThread and QtInferenceWorker lifecycle, signal ordering, overlap prevention, request-control disable and restore behavior, cleanup, and rerun behavior remain unchanged.",
+    "The existing Phase 6B inference core, InferenceController, and QtInferenceWorker public interfaces remain unchanged.",
+    "No MainWindow or tab integration, close coordination, image preview or rendering, cancellation, actual model/CUDA/image inference, generic ViewModel/base-page abstraction, launcher change, or CP4 functionality is included.",
+    "Focused qtbot tests use injected fake backends to verify initial, success, failure, stale-result clearing, and rerun presentation behavior without executing real inference.",
+    "Automated screenshot verification is not required; deterministic widget text and lifecycle state assertions provide programmatic verification."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/gui/inference_page.py",
+    "tests/gui/test_inference_page.py"
+  ],
+  "required_tests": [
+    "phase6c_cp3_inference_results"
+  ],
+  "template": false,
+  "claude_prompt": "Implement only Phase 6C checkpoint 3 in the two allowed files: src/image_ai_studio/gui/inference_page.py and tests/gui/test_inference_page.py. Add a minimal, clear result area to the existing InferencePage and present the existing InferenceResult fields directly after successful asynchronous inference: predicted_class exactly, confidence in a fixed tested format, probabilities in a deterministic tested order and format such as sorting by class name, and inference_duration_seconds converted to milliseconds in a fixed tested format. Do not recalculate prediction values or introduce a new application/core abstraction. Show empty values or unmistakable placeholders initially. Clear stale successful results and prior error presentation before each new run; on failure clear any prior successful result while keeping the existing concise error status; on success remove prior error presentation and show only the new result. Preserve the CP1 _build_request/build_inference_request mapping and do not change the CP2 QThread/QtInferenceWorker connection or cleanup ordering, overlap prevention, control disable/restore, or rerun lifecycle. Add focused qtbot tests with injected fake backends covering initial state, deterministic success formatting, failure clearing, stale-result clearing at new-run start, and rerun behavior. Use fake backends only and never execute actual model, CUDA, or image inference. Do not modify MainWindow or any other file, and do not add tab integration, close coordination, preview or image rendering, cancellation, CP4 behavior, launcher changes, generic ViewModel/base-page abstractions, or Phase 6B public API changes.",
+  "estimated_scope": "Small: one existing GUI module and one focused GUI test module, approximately 100-200 changed lines combined."
+}
