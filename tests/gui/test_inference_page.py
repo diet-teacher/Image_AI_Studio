@@ -539,3 +539,239 @@ def test_run_succeeds_after_a_previous_failed_run(tmp_path, qtbot) -> None:
 
     _start_and_wait(page, qtbot)
     assert page._status_label.text() == "Finished"
+
+
+# ===============================================================================
+# Phase 6C CP3: deterministic inference result presentation
+# ===============================================================================
+
+
+@pytest.mark.phase6c_cp3_inference_results
+def test_result_area_shows_placeholders_initially(qtbot) -> None:
+    page = _make_page(qtbot)
+    assert page._predicted_class_value_label.text() == "--"
+    assert page._confidence_value_label.text() == "--"
+    assert page._probabilities_value_label.text() == "--"
+    assert page._duration_value_label.text() == "--"
+
+
+@pytest.mark.phase6c_cp3_inference_results
+def test_successful_run_displays_predicted_class_exactly(tmp_path, qtbot) -> None:
+    result = InferenceResult(
+        predicted_index=2,
+        predicted_class="golden_retriever",
+        confidence=0.5,
+        probabilities={"golden_retriever": 0.5, "poodle": 0.5},
+        inference_duration_seconds=0.1,
+    )
+    controller = InferenceController(backend=lambda request: result)
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+
+    assert page._predicted_class_value_label.text() == "golden_retriever"
+
+
+@pytest.mark.phase6c_cp3_inference_results
+def test_successful_run_displays_confidence_in_fixed_format(tmp_path, qtbot) -> None:
+    result = InferenceResult(
+        predicted_index=0,
+        predicted_class="cat",
+        confidence=0.8734,
+        probabilities={"cat": 0.8734, "dog": 0.1266},
+        inference_duration_seconds=0.1,
+    )
+    controller = InferenceController(backend=lambda request: result)
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+
+    assert page._confidence_value_label.text() == "87.34%"
+
+
+@pytest.mark.phase6c_cp3_inference_results
+def test_successful_run_displays_probabilities_sorted_by_class_name(tmp_path, qtbot) -> None:
+    # Insertion order is deliberately not alphabetical -- display must sort.
+    result = InferenceResult(
+        predicted_index=1,
+        predicted_class="zebra",
+        confidence=0.6,
+        probabilities={"zebra": 0.6, "aardvark": 0.25, "mongoose": 0.15},
+        inference_duration_seconds=0.1,
+    )
+    controller = InferenceController(backend=lambda request: result)
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+
+    assert page._probabilities_value_label.text() == (
+        "aardvark: 25.00%\nmongoose: 15.00%\nzebra: 60.00%"
+    )
+
+
+@pytest.mark.phase6c_cp3_inference_results
+def test_successful_run_displays_duration_converted_to_milliseconds(tmp_path, qtbot) -> None:
+    result = InferenceResult(
+        predicted_index=0,
+        predicted_class="cat",
+        confidence=0.9,
+        probabilities={"cat": 0.9, "dog": 0.1},
+        inference_duration_seconds=0.12345,
+    )
+    controller = InferenceController(backend=lambda request: result)
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+
+    assert page._duration_value_label.text() == "123.45 ms"
+
+
+@pytest.mark.phase6c_cp3_inference_results
+def test_on_finished_presents_result_without_recalculation(qtbot) -> None:
+    """`_on_finished` must present the InferenceResult instance it receives
+    verbatim -- calling it directly (bypassing the worker/backend entirely)
+    must still produce the exact same displayed values."""
+    page = _make_page(qtbot)
+    result = InferenceResult(
+        predicted_index=0,
+        predicted_class="direct_call",
+        confidence=0.3333,
+        probabilities={"b": 0.6667, "a": 0.3333},
+        inference_duration_seconds=0.05,
+    )
+
+    page._on_finished(result)
+
+    assert page._predicted_class_value_label.text() == "direct_call"
+    assert page._confidence_value_label.text() == "33.33%"
+    assert page._probabilities_value_label.text() == "a: 33.33%\nb: 66.67%"
+    assert page._duration_value_label.text() == "50.00 ms"
+
+
+@pytest.mark.phase6c_cp3_inference_results
+def test_failed_run_clears_previous_successful_result(tmp_path, qtbot) -> None:
+    calls = {"n": 0}
+
+    def flaky_backend(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _fake_inference_result()
+        raise ValueError("second run fails")
+
+    controller = InferenceController(backend=flaky_backend)
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+    assert page._predicted_class_value_label.text() == "cat"
+
+    _start_and_wait(page, qtbot)
+
+    assert page._status_label.text() == "Failed: ValueError: second run fails"
+    assert page._predicted_class_value_label.text() == "--"
+    assert page._confidence_value_label.text() == "--"
+    assert page._probabilities_value_label.text() == "--"
+    assert page._duration_value_label.text() == "--"
+
+
+@pytest.mark.phase6c_cp3_inference_results
+def test_new_run_clears_stale_result_before_showing_running(tmp_path, qtbot) -> None:
+    backend_started = threading.Event()
+    let_backend_finish = threading.Event()
+
+    def blocking_backend(request):
+        backend_started.set()
+        assert let_backend_finish.wait(timeout=5)
+        return _fake_inference_result()
+
+    controller = InferenceController(backend=blocking_backend)
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    page._on_run_clicked()
+    assert backend_started.wait(timeout=5)
+    let_backend_finish.set()
+    qtbot.waitUntil(lambda: page._run_button.isEnabled(), timeout=5000)
+    assert page._predicted_class_value_label.text() == "cat"
+
+    # Second run: result area must already be cleared by the time Running
+    # is shown, before the (blocking) backend has produced a new result.
+    backend_started.clear()
+    let_backend_finish.clear()
+    page._on_run_clicked()
+    assert backend_started.wait(timeout=5)
+
+    assert page._status_label.text() == "Running"
+    assert page._predicted_class_value_label.text() == "--"
+    assert page._confidence_value_label.text() == "--"
+    assert page._probabilities_value_label.text() == "--"
+    assert page._duration_value_label.text() == "--"
+
+    let_backend_finish.set()
+    qtbot.waitUntil(lambda: page._run_button.isEnabled(), timeout=5000)
+
+
+@pytest.mark.phase6c_cp3_inference_results
+def test_new_run_clears_previous_error_presentation(tmp_path, qtbot) -> None:
+    calls = {"n": 0}
+
+    def flaky_backend(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("first run fails")
+        return _fake_inference_result()
+
+    controller = InferenceController(backend=flaky_backend)
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+    assert page._status_label.text().startswith("Failed")
+
+    _start_and_wait(page, qtbot)
+
+    assert page._status_label.text() == "Finished"
+    assert "Failed" not in page._status_label.text()
+    assert page._predicted_class_value_label.text() == "cat"
+
+
+@pytest.mark.phase6c_cp3_inference_results
+def test_successful_run_removes_previous_error_and_shows_only_new_result(tmp_path, qtbot) -> None:
+    calls = {"n": 0}
+
+    def flaky_backend(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("boom")
+        return InferenceResult(
+            predicted_index=0,
+            predicted_class="second_run_class",
+            confidence=0.42,
+            probabilities={"second_run_class": 0.42, "other": 0.58},
+            inference_duration_seconds=0.2,
+        )
+
+    controller = InferenceController(backend=flaky_backend)
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+    assert page._status_label.text().startswith("Failed")
+
+    _start_and_wait(page, qtbot)
+
+    assert page._status_label.text() == "Finished"
+    assert page._predicted_class_value_label.text() == "second_run_class"
+    assert page._confidence_value_label.text() == "42.00%"

@@ -1,11 +1,13 @@
-"""Phase 6C CP2: InferencePage async lifecycle. Extends CP1's request-building
-form with the actual Run Inference execution -- a QThread + QtInferenceWorker
-pair wired around the injected InferenceController, following the same
-canonical lifecycle as TrainingPage/QtTrainingWorker (Phase 5C):
-started->run, finished/failed->page slots + thread.quit + worker.deleteLater,
-thread.finished->thread.deleteLater + reference cleanup. No MainWindow
-integration and no inference-result rendering here -- only lifecycle state
-(Running/Finished/Failed) and control enablement."""
+"""Phase 6C CP3: InferencePage result presentation. Extends CP1's
+request-building form and CP2's async Run Inference lifecycle -- a QThread +
+QtInferenceWorker pair wired around the injected InferenceController,
+following the same canonical lifecycle as TrainingPage/QtTrainingWorker
+(Phase 5C): started->run, finished/failed->page slots + thread.quit +
+worker.deleteLater, thread.finished->thread.deleteLater + reference cleanup
+-- with a result area that presents the existing InferenceResult fields
+(predicted class, confidence, class probabilities, inference duration)
+after a successful run, without recalculating any prediction values. No
+MainWindow integration."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -38,6 +40,26 @@ def _detect_device_choices() -> list[str]:
         for index in range(torch.cuda.device_count()):
             choices.append(f"cuda:{index}")
     return choices
+
+
+_RESULT_PLACEHOLDER = "--"
+
+
+def _format_confidence(confidence: float) -> str:
+    return f"{confidence:.2%}"
+
+
+def _format_duration_ms(inference_duration_seconds: float) -> str:
+    return f"{inference_duration_seconds * 1000:.2f} ms"
+
+
+def _format_probabilities(probabilities: dict[str, float]) -> str:
+    """Class probabilities sorted by class name (not dict insertion order) so
+    the displayed order is deterministic regardless of upstream ordering."""
+    if not probabilities:
+        return _RESULT_PLACEHOLDER
+    lines = [f"{class_name}: {value:.2%}" for class_name, value in sorted(probabilities.items())]
+    return "\n".join(lines)
 
 
 class InferencePage(QWidget):
@@ -81,6 +103,7 @@ class InferencePage(QWidget):
         layout.addWidget(self._build_inputs_group())
         layout.addLayout(self._build_actions_row())
         layout.addWidget(self._build_status_label())
+        layout.addWidget(self._build_result_group())
         layout.addStretch(1)
 
     def _build_inputs_group(self) -> QGroupBox:
@@ -135,6 +158,25 @@ class InferencePage(QWidget):
     def _build_status_label(self) -> QLabel:
         self._status_label = QLabel("Idle")
         return self._status_label
+
+    def _build_result_group(self) -> QGroupBox:
+        group = QGroupBox("Inference Result")
+        form = QFormLayout(group)
+        self._results_form = form
+
+        self._predicted_class_value_label = QLabel(_RESULT_PLACEHOLDER)
+        form.addRow("Predicted Class:", self._predicted_class_value_label)
+
+        self._confidence_value_label = QLabel(_RESULT_PLACEHOLDER)
+        form.addRow("Confidence:", self._confidence_value_label)
+
+        self._probabilities_value_label = QLabel(_RESULT_PLACEHOLDER)
+        form.addRow("Probabilities:", self._probabilities_value_label)
+
+        self._duration_value_label = QLabel(_RESULT_PLACEHOLDER)
+        form.addRow("Duration:", self._duration_value_label)
+
+        return group
 
     # -- slots -----------------------------------------------------------------
 
@@ -191,6 +233,7 @@ class InferencePage(QWidget):
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.finished.connect(self._on_thread_finished)
 
+        self._clear_result_display()
         self._set_controls_enabled(False)
         self._status_label.setText("Running")
         self._thread.start()
@@ -198,9 +241,18 @@ class InferencePage(QWidget):
     # -- worker signal handlers -------------------------------------------------
 
     def _on_finished(self, result: InferenceResult) -> None:
+        # 존재하는 InferenceResult 필드만 그대로 표시한다 -- 여기서
+        # prediction 값을 재계산하지 않는다.
+        self._predicted_class_value_label.setText(result.predicted_class)
+        self._confidence_value_label.setText(_format_confidence(result.confidence))
+        self._probabilities_value_label.setText(_format_probabilities(result.probabilities))
+        self._duration_value_label.setText(_format_duration_ms(result.inference_duration_seconds))
         self._status_label.setText("Finished")
 
     def _on_failed(self, message: str) -> None:
+        # 이전 성공 결과가 남아 있으면 stale prediction으로 보일 수
+        # 있으므로 실패 시에도 결과 영역을 초기화한다.
+        self._clear_result_display()
         first_line = message.splitlines()[0] if message else "Unknown error"
         self._status_label.setText(f"Failed: {first_line}")
 
@@ -210,6 +262,12 @@ class InferencePage(QWidget):
         self._set_controls_enabled(True)
 
     # -- helpers -----------------------------------------------------------------
+
+    def _clear_result_display(self) -> None:
+        self._predicted_class_value_label.setText(_RESULT_PLACEHOLDER)
+        self._confidence_value_label.setText(_RESULT_PLACEHOLDER)
+        self._probabilities_value_label.setText(_RESULT_PLACEHOLDER)
+        self._duration_value_label.setText(_RESULT_PLACEHOLDER)
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         for widget in (
