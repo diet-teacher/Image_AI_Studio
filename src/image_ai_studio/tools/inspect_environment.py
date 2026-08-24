@@ -8,6 +8,8 @@ guess.
 from __future__ import annotations
 
 import json
+import locale
+import os
 import platform
 import shutil
 import subprocess
@@ -15,13 +17,21 @@ import sys
 from pathlib import Path
 
 
+def _decode_output(data: bytes | None) -> str:
+    if not data:
+        return ""
+    encoding = "mbcs" if sys.platform == "win32" else locale.getpreferredencoding(False)
+    return data.decode(encoding, errors="replace")
+
+
 def _run(cmd: list[str]) -> str | None:
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        text = (out.stdout or out.stderr).strip()
-        return text if text else None
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+        out = subprocess.run(cmd, capture_output=True, timeout=15, shell=False)
+    except (OSError, subprocess.TimeoutExpired):
         return None
+
+    text = (_decode_output(out.stdout) or _decode_output(out.stderr)).strip()
+    return text if text else None
 
 
 def _first_line(text: str | None) -> str | None:
@@ -34,7 +44,7 @@ def inspect_environment() -> dict:
     info: dict = {}
 
     info["os"] = platform.platform()
-    info["os_system"] = platform.system()
+    info["os_system"] = platform.uname().system
     info["os_release"] = platform.release()
     info["architecture"] = platform.machine()
 
@@ -81,7 +91,7 @@ def inspect_environment() -> dict:
     info["cmake_version"] = _first_line(_run(["cmake", "--version"]))
     info["git_version"] = _first_line(_run(["git", "--version"]))
 
-    if platform.system() == "Windows":
+    if sys.platform == "win32" or os.name == "nt":
         info["compiler"] = _first_line(_run(["cl"])) or "MSVC (cl.exe) not found on PATH"
         info["visual_studio_version"] = _run(
             ["powershell", "-Command", "(Get-CimInstance MSFT_VSInstance).Version"]

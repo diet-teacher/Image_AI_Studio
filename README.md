@@ -1680,6 +1680,34 @@ Phase 5 전체 architecture, runtime flow, QThread ownership/deleteLater
 
 ---
 
+## Phase 6A~6D: Inference GUI + Training/Inference 통합
+
+Phase 5의 Training GUI 위에 단일 이미지 추론(single-image inference)
+화면을 추가했습니다. `python scripts/run_gui.py`로 실행하면 이제
+**Training**/**Inference** 두 tab이 있는 하나의 창(`MainWindow`,
+`QTabWidget`)이 뜹니다.
+
+**Inference tab 사용법**: 완료된 학습의 Output directory(자동으로
+`best_model_state_dict.pt`/`class_mapping.json`을 고정 파일명으로 찾음)
++ 그 학습에 쓴 Model JSON(output_dir에 저장되지 않으므로 별도 지정) +
+Input Image 하나를 선택하고, Device(cpu/cuda/cuda:N)/Precision
+(fp32/fp16/bf16)을 고른 뒤 Run Inference를 누르면 QThread에서 비동기로
+실행되고, 완료되면 Predicted Class/Confidence/Class Probabilities/
+Duration을 표시합니다. **단일 이미지만 지원**하며(폴더/배치 추론,
+추론 취소, 이미지 미리보기는 미지원), 학습에서 방금 만든 모델을 같은
+세션에서 바로 이어서 추론할 수 있습니다.
+
+학습/추론이 진행 중인 상태에서 창을 닫으면 확인 다이얼로그가 뜨고,
+동의하면 학습에는 기존 cooperative stop을, 추론에는 취소 없이 자연
+종료 대기를 적용한 뒤 두 작업이 모두 끝나야 실제로 창이 닫힙니다
+(다이얼로그는 1회만 표시).
+
+Phase 6 전체 architecture, Training→Inference artifact 흐름, close
+coordination, 검증 범위(자동화/CUDA 조건부/수동 실행 구분)는
+`docs/phase6_final_integration.md`를 참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
