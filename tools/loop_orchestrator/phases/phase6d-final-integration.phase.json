@@ -1,0 +1,41 @@
+{
+  "phase_id": "phase6d-final-integration-graduation",
+  "objective": "Graduate Phase 6 by permanently validating the real Training-to-Inference GUI workflow and real-backend close coordination before documenting the verified single-image inference application.",
+  "checkpoints": [
+    {
+      "checkpoint_id": "phase6d-cp1-training-to-inference-real-cpu",
+      "goal": "tools/loop_orchestrator/goals/phase6d-cp1.json"
+    },
+    {
+      "checkpoint_id": "phase6d-cp2-real-backend-close-coordination",
+      "goal": "tools/loop_orchestrator/goals/phase6d-cp2.json"
+    },
+    {
+      "checkpoint_id": "phase6d-cp3-final-integration-graduation-docs",
+      "goal": "tools/loop_orchestrator/goals/phase6d-cp3.json"
+    }
+  ],
+  "allowed_files": [
+    "tests/gui/test_training_inference_integration.py",
+    "tests/gui/test_phase6d_close_integration.py",
+    "README.md",
+    "docs/phase6_final_integration.md"
+  ],
+  "allowed_tests": [
+    "phase6d_cp1_training_to_inference_real_cpu",
+    "phase6d_cp2_real_backend_close_coordination",
+    "phase6d_cp3_graduation_gate"
+  ],
+  "final_harness_profile": "full",
+  "max_checkpoints": 3,
+  "max_rework_rounds": 1,
+  "max_model_calls": 10,
+  "max_claude_cost_usd": 6.0,
+  "max_elapsed_seconds": 10800,
+  "completion_conditions": [
+    "The real CPU TrainingPage-to-InferencePage workflow passes using artifacts produced in the same MainWindow session.",
+    "Real-backend deferred close and simultaneous training/inference close coordination pass in both completion orders.",
+    "The Phase 6 graduation documentation accurately reflects the committed implementation and automated evidence.",
+    "The fixed full project harness passes without product, protected-file, HEAD, staged-index, or verifier mutation."
+  ]
+}

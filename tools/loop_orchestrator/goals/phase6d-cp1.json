@@ -1,0 +1,21 @@
+{
+  "checkpoint_id": "phase6d-cp1-training-to-inference-real-cpu",
+  "objective": "Add a permanent real-backend GUI integration test proving that a model trained through TrainingPage can be used immediately for inference through InferencePage in the same MainWindow session.",
+  "acceptance_criteria": [
+    "tests/gui/test_training_inference_integration.py creates a deterministic tiny two-class ImageFolder dataset and a minimal ModelSpec entirely under pytest's isolated temporary directory.",
+    "The test constructs MainWindow, drives its existing TrainingPage through the real default TrainingController, QtTrainingWorker, and run_imagefolder_training_workflow CPU path for one epoch, and waits for normal Qt cleanup without blocking the GUI thread.",
+    "The completed training run produces best_model_state_dict.pt and class_mapping.json in the selected output directory, and the test does not manufacture substitutes for those two artifacts.",
+    "Without constructing a second MainWindow, the test switches to the existing InferencePage, supplies the just-produced training output directory plus the same model JSON and a real dataset image, and runs the real default InferenceController, QtInferenceWorker, and run_single_image_inference CPU fp32 path.",
+    "The inference completes successfully, displays a predicted class contained in the generated class mapping, displays deterministic confidence/probability/duration fields according to the existing Phase 6C contract, and restores controls after thread and worker cleanup.",
+    "The test uses production backends rather than fake inference or fake training results; synchronization may use qtbot and bounded event polling but must not use wait(), busy loops, processEvents polling, QThread.terminate(), or forced worker termination.",
+    "No src/, scripts/, controller, worker, model, training, inference, or GUI production file is changed. If the real path exposes a product defect, report BLOCKED instead of weakening the test or modifying production code in this checkpoint."
+  ],
+  "allowed_files": [
+    "tests/gui/test_training_inference_integration.py"
+  ],
+  "required_tests": [
+    "phase6d_cp1_training_to_inference_real_cpu"
+  ],
+  "claude_prompt": "Implement only Phase 6D checkpoint 1 by adding tests/gui/test_training_inference_integration.py. This is a verification-first checkpoint: do not modify product code. Reuse the tiny real ImageFolder and minimal ModelSpec patterns in tests/gui/test_training_page_integration.py, but exercise both pages in one MainWindow. Run one real CPU training epoch through TrainingPage's normal asynchronous UI path, use the resulting best_model_state_dict.pt and class_mapping.json without replacing or editing them, then run real CPU fp32 inference through the existing InferencePage in the same window with a real input image. Assert meaningful user-visible results and eventual QThread/worker cleanup. Do not mock the production training or inference backend, do not duplicate core correctness tests, do not use sleeps as correctness synchronization, and do not add broad helpers or production abstractions. If existing production behavior cannot satisfy this contract, return BLOCKED with the observed gap rather than weakening assertions or changing files outside the allowed test module.",
+  "estimated_scope": "Small-to-medium verification slice: one new GUI integration test module, approximately 150-250 lines, with no product changes."
+}

@@ -1,0 +1,22 @@
+{
+  "checkpoint_id": "phase6d-cp3-final-integration-graduation-docs",
+  "objective": "Document the verified Phase 6 architecture, user workflow, integration evidence, limitations, and graduation contract without changing runtime behavior.",
+  "acceptance_criteria": [
+    "docs/phase6_final_integration.md is added as the authoritative Phase 6A-6D graduation document and accurately describes the inference architecture, Training-to-Inference artifact flow, QThread ownership, MainWindow close coordination, and verification-first Phase 6D scope.",
+    "The document distinguishes permanent automated tests from conditional CUDA coverage and manual launcher usage, and does not invent test counts, timings, GPU results, costs, or executions that are not represented by repository tests or the current Phase gate.",
+    "The document records the canonical user workflow: train or select an existing training output directory, select the matching model JSON and input image, choose device/precision, run inference, inspect deterministic result fields, and safely close during active work.",
+    "README.md is updated minimally so its GUI section reflects the Training and Inference tabs, current launch command, supported single-image inference behavior, artifact requirements, lifecycle behavior, and a link to docs/phase6_final_integration.md.",
+    "The graduation document explicitly lists Phase 6 non-goals and residual risks, including no inference cancellation, no batch/folder inference, no image preview/result image rendering, conditional CUDA execution, and the existing Windows process-descendant limitation where applicable.",
+    "The document uses PHASE 6 COMPLETE only as the graduation result conditioned on the committed Phase passing its fixed integration tests and final full project harness; it does not claim that documentation itself performed validation.",
+    "No Python source, test behavior, configuration, goal, or orchestrator code is changed in this checkpoint."
+  ],
+  "allowed_files": [
+    "README.md",
+    "docs/phase6_final_integration.md"
+  ],
+  "required_tests": [
+    "phase6d_cp3_graduation_gate"
+  ],
+  "claude_prompt": "Implement only Phase 6D checkpoint 3 in README.md and a new docs/phase6_final_integration.md. Read the existing Phase 6A architecture, Phase 6B implementation document, current Phase 6C production code/tests, and the two Phase 6D integration test modules. Produce a precise graduation document modeled structurally on docs/phase5_final_integration.md without copying obsolete Phase 5 claims. Update README minimally to describe the current two-tab Training+Inference application and link the new document. Do not fabricate exact test totals, timing, cost, GPU execution, launcher execution, or machine observations. Clearly separate automated portable coverage, CUDA-conditional tests, and manual launch instructions. Do not modify code, tests, config, goals, or unrelated historical documentation.",
+  "estimated_scope": "Documentation-only checkpoint: one new graduation document and a focused README update, approximately 250-450 lines combined."
+}

@@ -1,0 +1,21 @@
+{
+  "checkpoint_id": "phase6d-cp2-real-backend-close-coordination",
+  "objective": "Add deterministic real-backend integration coverage for closing MainWindow during inference alone and while training and inference are both active, including both completion orders.",
+  "acceptance_criteria": [
+    "tests/gui/test_phase6d_close_integration.py uses MainWindow with the existing TrainingPage and InferencePage and delegates to the real production training and inference backends after deterministic synchronization gates.",
+    "A close request during active real inference shows the confirmation dialog exactly once, does not cancel inference, keeps the window visible until inference finishes naturally, and closes only after QThread and worker cleanup.",
+    "When real training and real inference are both active, accepting close requests cooperative training stop while allowing inference to finish naturally; no forced termination, GUI-thread wait, busy loop, or processEvents polling is introduced.",
+    "Parameterized coverage proves both completion orders: training cleanup before inference cleanup and inference cleanup before training cleanup. In both orders the dialog is shown once, the first completion does not close the window, and the final completion causes exactly one successful close retry.",
+    "The test artifacts are a deterministic tiny ImageFolder dataset, minimal ModelSpec, genuine training artifacts, and a real input image under isolated pytest temporary storage; CUDA is not required for these close-ordering tests.",
+    "Existing Phase 6C fake-backend unit tests remain unchanged and continue to pass; this checkpoint adds the missing real-backend integration layer without duplicating their internal signal assertions.",
+    "No production file is changed. If the real backend reveals a product defect, report BLOCKED instead of weakening synchronization, replacing the production backend with a fake result, or broadening the allowed files."
+  ],
+  "allowed_files": [
+    "tests/gui/test_phase6d_close_integration.py"
+  ],
+  "required_tests": [
+    "phase6d_cp2_real_backend_close_coordination"
+  ],
+  "claude_prompt": "Implement only Phase 6D checkpoint 2 by adding tests/gui/test_phase6d_close_integration.py. Do not modify product code or the checkpoint-1 test. Build deterministic real-backend close scenarios around MainWindow. You may wrap the existing production run_imagefolder_training_workflow and run_single_image_inference entrypoints with threading.Event gates solely to control when each real backend begins or completes, but the wrappers must delegate to the real functions and must not return fabricated results. Verify inference-only deferred close and simultaneous training+inference close in both completion orders. Confirm exactly one QMessageBox prompt, no early window close after the first page finishes, cooperative training stop, natural inference completion, one final close, and eventual thread/worker cleanup. Use qtbot.waitUntil and bounded threading events; never use QThread.wait(), terminate(), time.sleep as a correctness condition, processEvents polling, or a GUI-thread busy loop. If production behavior fails, return BLOCKED rather than weakening the test or editing outside the allowed file.",
+  "estimated_scope": "Medium verification slice: one real-backend close integration test module, approximately 200-350 lines, with no product changes."
+}
