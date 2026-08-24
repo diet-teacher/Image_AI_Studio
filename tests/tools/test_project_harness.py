@@ -94,3 +94,20 @@ def test_require_clean_blocks_before_profile_processes(tmp_path: Path, monkeypat
     assert code == 2
     assert report["state"] == "BLOCKED"
     assert report["reason"] == "DIRTY_WORKTREE"
+
+
+def test_profile_elapsed_limit_is_applied_to_step_timeout(tmp_path: Path, monkeypatch) -> None:
+    root = _repository(tmp_path)
+    monkeypatch.setattr("tools.project_harness.runner.doctor", lambda value: {"healthy": True, "worktree_dirty": False})
+    monkeypatch.setattr(
+        "tools.project_harness.runner._git",
+        lambda *args: CommandResult("PASS", 0, 0.0, "abc123\n", ""),
+    )
+    observed = []
+    def fake_runner(argv, cwd, env, timeout):
+        observed.append(timeout)
+        return CommandResult("PASS", 0, 0.0, "", "")
+    code, report = execute_profile(root, PROFILES["syntax"], command_runner=fake_runner,
+                                   max_elapsed_seconds=2.0)
+    assert code == 0 and report["state"] == "PASSED"
+    assert len(observed) == 1 and 0 < observed[0] <= 2.0

@@ -1,0 +1,27 @@
+{
+  "phase_id": "example-phase",
+  "objective": "Demonstrate a bounded, pre-approved sequence of executable checkpoints.",
+  "checkpoints": [
+    {
+      "checkpoint_id": "replace-with-approved-checkpoint",
+      "goal": "tools/loop_orchestrator/goals/approved-checkpoint.json"
+    }
+  ],
+  "allowed_files": [
+    "src/example.py",
+    "tests/test_example.py"
+  ],
+  "allowed_tests": [
+    "approved_fixed_argv_test"
+  ],
+  "final_harness_profile": "full",
+  "max_checkpoints": 1,
+  "max_rework_rounds": 1,
+  "max_model_calls": 5,
+  "max_claude_cost_usd": 5.0,
+  "max_elapsed_seconds": 7200,
+  "completion_conditions": [
+    "Every checkpoint verifier returns PASS.",
+    "The fixed final project harness profile passes."
+  ]
+}

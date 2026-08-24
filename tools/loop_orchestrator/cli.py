@@ -6,9 +6,13 @@ import sys
 from pathlib import Path
 
 from .adapters import ClaudeCLIAdapter, CodexCLIAdapter
+from .adapters import codex_exec_prefix
 from .budget import BudgetManager
 from .engine import LoopEngine
+from .phase import PhaseManifestError, load_phase_manifest, resolve_phase_manifest_path
+from .phase_engine import PhaseEngine
 from .process import probe_process
+from tools.project_harness.profiles import PROFILES
 
 
 ROOT = Path.cwd()
@@ -69,10 +73,48 @@ def main(argv=None) -> int:
     sub.add_parser("doctor"); sub.add_parser("init"); sub.add_parser("status")
     run = sub.add_parser("run"); run.add_argument("--goal", required=True, type=Path); run.add_argument("--max-checkpoints", type=int, default=1)
     mode = run.add_mutually_exclusive_group(); mode.add_argument("--dry-run", action="store_true"); mode.add_argument("--execute", action="store_true")
+    phase = sub.add_parser("run-phase")
+    phase.add_argument("--manifest", required=True, type=Path)
+    phase_mode = phase.add_mutually_exclusive_group()
+    phase_mode.add_argument("--execute", action="store_true")
+    phase_mode.add_argument("--resume", action="store_true")
     args = parser.parse_args(argv)
     if args.command == "doctor": return doctor()
     if args.command == "init": return init()
     if args.command == "status": return status()
+    if args.command == "run-phase":
+        config = load_config()
+        try:
+            manifest_path = resolve_phase_manifest_path(args.manifest, ROOT)
+            manifest = load_phase_manifest(manifest_path, ROOT, config, set(PROFILES))
+        except PhaseManifestError as exc:
+            parser.error(str(exc))
+        if not args.execute and not args.resume:
+            state = PhaseEngine(ROOT, config, None, None, None).run(manifest)
+            print(json.dumps(state, indent=2))
+            return 0
+        budget = BudgetManager(RUNTIME / "budget.json", config["soft_stop_percent"],
+                               config["hard_stop_percent"], config["budget_validity_hours"])
+        maker = ClaudeCLIAdapter(ROOT, config["process_timeout_seconds"], config["claude_max_budget_usd"])
+        maker.executable = config.get("claude_executable", "claude")
+        codex = CodexCLIAdapter(ROOT, config["process_timeout_seconds"], PACKAGE / "schemas",
+                                config.get("codex_executable", "codex"))
+        def preflight():
+            timeout = min(int(config.get("process_timeout_seconds", 1800)), 10)
+            probes = [
+                ("claude", [str(config.get("claude_executable", "claude")), "--version"]),
+                ("codex", [str(config.get("codex_executable", "codex")), "--version"]),
+                ("codex_exec", [*codex_exec_prefix(str(config.get("codex_executable", "codex")), ROOT), "--help"]),
+            ]
+            for integration, probe_argv in probes:
+                result = probe_process(probe_argv, ROOT, timeout)
+                if not result["ok"]:
+                    return {"integration": integration, "argv": probe_argv, **result}
+            return None
+        state = PhaseEngine(ROOT, config, maker, codex, budget, preflight=preflight).run(
+            manifest, execute=True, resume=args.resume)
+        print(json.dumps(state, indent=2))
+        return 0 if state["state"] == "READY_TO_COMMIT" else 2
     if args.max_checkpoints < 1: parser.error("--max-checkpoints must be at least 1")
     if not args.goal.is_file(): parser.error(f"goal file not found: {args.goal}")
     try: goal = json.loads(args.goal.read_text(encoding="utf-8"))

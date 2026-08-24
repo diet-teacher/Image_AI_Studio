@@ -146,6 +146,7 @@ def execute_profile(
     *,
     require_clean: bool = False,
     command_runner: Callable[[Sequence[str], Path, dict[str, str], int], CommandResult] = run_command,
+    max_elapsed_seconds: float | None = None,
 ) -> tuple[int, dict]:
     health = doctor(root)
     if not health["healthy"]:
@@ -167,10 +168,12 @@ def execute_profile(
     _write_json(run_dir / "manifest.json", report)
 
     exit_code = 0
+    profile_started = time.monotonic()
     try:
         for index, step in enumerate(profile.steps, start=1):
             step_dir = run_dir / f"{index:03d}-{step.name}"
             step_dir.mkdir(parents=True, exist_ok=False)
+            timeout = step.timeout_seconds
             try:
                 env = _step_environment(step_dir)
             except OSError as exc:
@@ -180,14 +183,22 @@ def execute_profile(
                 )
             else:
                 argv = (sys.executable, *step.python_args)
-                result = command_runner(argv, root, env, step.timeout_seconds)
+                if max_elapsed_seconds is not None:
+                    remaining = max_elapsed_seconds - (time.monotonic() - profile_started)
+                    if remaining <= 0:
+                        result = CommandResult("TIMEOUT", None, 0.0, "", "", "profile elapsed-time limit reached")
+                    else:
+                        timeout = min(timeout, max(0.001, remaining))
+                        result = command_runner(argv, root, env, timeout)
+                else:
+                    result = command_runner(argv, root, env, timeout)
                 (step_dir / "stdout.log").write_text(result.stdout, encoding="utf-8")
                 (step_dir / "stderr.log").write_text(result.stderr, encoding="utf-8")
 
             step_record = {
                 "name": step.name,
                 "argv": [sys.executable, *step.python_args],
-                "timeout_seconds": step.timeout_seconds,
+                "timeout_seconds": timeout,
                 "artifact_dir": str(step_dir),
                 **result.summary(),
             }

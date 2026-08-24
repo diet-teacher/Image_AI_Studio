@@ -11,6 +11,7 @@ python -m tools.loop_orchestrator doctor
 python -m tools.loop_orchestrator init
 python -m tools.loop_orchestrator status
 python -m tools.loop_orchestrator run --goal tools/loop_orchestrator/example.goal.json --max-checkpoints 1 --dry-run
+python -m tools.loop_orchestrator run-phase --manifest path/to/approved.phase.json
 ```
 
 Before execution, edit `.loop/budget.json` and enter the current subscription-period usage percentages for both providers plus an `updated_at` timestamp. Unknown usage blocks paid calls. Existing dirty worktrees also block execution. `example.goal.json` is intentionally marked `"template": true`; copy it to a local goal file, remove that marker, replace the objective, and provide non-empty acceptance criteria and required tests. The template itself can never execute. Once the goal, allowlisted tests, permissions, and budgets have been reviewed, the explicit execution form is:
@@ -20,6 +21,24 @@ python -m tools.loop_orchestrator run --goal .loop/phase6c-checkpoint-1.json --m
 ```
 
 Do not add unrestricted permission flags. The generated runtime state and per-run records live in ignored `.loop/`.
+
+## Pre-approved Phase runs
+
+`run-phase` extends the same fail-closed engine to an ordered set of goals that has been reviewed in advance. Its default is a static dry-run: it validates the manifest, referenced executable goals, fixed test allowlists, repository-relative paths, and numeric limits without probing executables, running tests, or calling a model. Only `--execute` starts the approved sequence; only `--resume` may continue a durable blocked/failed Phase state. Neither form commits, publishes, or starts another Phase.
+
+A Phase manifest declares `phase_id`, `objective`, ordered `{checkpoint_id, goal}` entries, Phase-wide `allowed_files` and `allowed_tests`, one fixed `final_harness_profile`, positive limits for checkpoints, rework, model calls, reported Claude cost, and elapsed time, plus explicit completion conditions. Referenced goals must be non-template executable goals whose file/test scopes are subsets of the Phase. Goal paths are repository-relative, cannot traverse or resolve outside the repository, and cannot be symlinks. See `example.phase.json` for the data shape; it is illustrative and intentionally does not reference an executable checked-in goal.
+
+Phase execution takes and persists a content snapshot immediately before each checkpoint, before calling its maker. The snapshot records existence/type, SHA-256, symlink targets, and bounded before content used to reconstruct textual diffs. The active checkpoint record and its maker/test/verifier stage, session ID, rework context, attempts, and last observed snapshot are durably saved. Only bytes changed since the original checkpoint baseline form the verifier diff; prior checkpoint diffs therefore cannot leak into the next verifier prompt, while their approved working-tree changes remain present. A later checkpoint cannot touch an earlier checkpoint file unless that file is explicitly allowed by the later goal.
+
+Every maker, required-test, verifier, and final-harness boundary also fingerprints HEAD, the staged set, tracked/untracked repository files, and protected ignored local files (`.loop/config.json`, `.loop/budget.json`, `.claude/settings.local.json`, and `.vscode/settings.json`). Runtime artifacts below `.loop/runs`, `.loop/test-temp`, and `.harness` remain excluded. Maker mutations are diagnosed even when the maker returns BLOCKED, raises a process/general exception, or is interrupted; unsafe file, HEAD, staged, or protected-local mutations take precedence and block. Tests, verifier, and harness must leave the guarded worktree unchanged.
+
+Manual provider-period usage remains authoritative and must be fresh, timezone-aware, sourced, and below 70 percent for both providers. Before every model call the engine rechecks period budget, elapsed time, total calls, and the conservative Claude per-call cost ceiling. Codex cost is not estimated. Phase mode follows the manifest directly and does not call the planner, preventing generated goals from expanding the approved order or scope.
+
+After every verifier passes, and only then, the engine invokes the manifest's named profile from the existing deterministic `project_harness`. Its fixed Python argv arrays, `shell=False`, UTF-8 environment, retained isolated temporary directories, and bounded diagnostics remain authoritative. A passing profile yields `READY_TO_COMMIT`; ordinary failure yields `FAILED`; start failure or timeout yields `BLOCKED`.
+
+Resume is explicit and fail-closed. It requires a genuine Phase record, the same manifest digest and base commit, a complete active-checkpoint baseline/stage record, an unchanged last-observed snapshot, no staged/protected/external changes, fresh budgets, and remaining model/cost/time limits. An incomplete checkpoint is resumed against its original baseline, so pre-timeout maker edits remain in the verifier delta even when the resumed maker makes no edit. Missing baseline data blocks with `RESUME_INCOMPLETE_CHECKPOINT_STATE`; completed checkpoints are never replayed.
+
+The final harness is guarded with the same before/after snapshot. A PASS report cannot produce `READY_TO_COMMIT` if product files, HEAD, staged state, or protected local files changed. Harness startup/runtime exceptions, timeout-style infrastructure reports, and Ctrl+C become structured BLOCKED handoffs rather than escaping with a traceback.
 
 Execute mode also performs a fail-closed, non-model preflight before the maker: configured Claude `--version`, Codex `--version`, and Codex's production global approval/read-only/root prefix followed by `exec --help`. Start failure, timeout, or nonzero exit blocks the run and preserves bounded diagnostics in state, the run directory, and handoff. Dry-run skips this probe and continues to invoke no external model or paid API.
 

@@ -10,12 +10,16 @@ from tools.loop_orchestrator import adapters, cli
 from tools.loop_orchestrator.adapters import ClaudeCLIAdapter, CodexCLIAdapter, codex_exec_prefix
 from tools.loop_orchestrator.budget import BudgetManager
 from tools.loop_orchestrator.engine import LoopEngine
+from tools.loop_orchestrator.goal import GoalError
+from tools.loop_orchestrator.phase import PhaseManifestError, validate_phase_manifest
+from tools.loop_orchestrator.phase_engine import PhaseEngine
 from tools.loop_orchestrator.models import ClaudeInvocation, MakerResult, PlannerResult, State, VerifierResult
 from tools.loop_orchestrator.process import (
     JSON_PARSE_FAILED, NONZERO_EXIT, OUTPUT_TAIL_LIMIT, PROCESS_START_FAILED, TIMEOUT,
     ProcessFailure, ProcessResult, probe_process, run_json_process,
 )
 from tools.loop_orchestrator.repository import git as repository_git
+from tools.project_harness.profiles import PROFILES
 
 
 def command(argv, cwd): return subprocess.run(argv, cwd=cwd, text=True, capture_output=True, shell=False, check=True)
@@ -493,4 +497,453 @@ class BudgetAndDoctorTests(unittest.TestCase):
         code, report = self.doctor_with_git_output(" M tracked.py\n", "warning")
         self.assertEqual(0, code)
         self.assertTrue(report["worktree_dirty"])
+
+
+class PhaseEngineTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(); self.root = Path(self.temp.name)
+        command(["git", "init", "-q"], self.root)
+        command(["git", "config", "user.email", "test@example.invalid"], self.root)
+        command(["git", "config", "user.name", "Test"], self.root)
+        (self.root / ".gitignore").write_text(".loop/\n.harness/\n", encoding="utf-8")
+        (self.root / "cp1.txt").write_text("one-before\n", encoding="utf-8")
+        (self.root / "cp2.txt").write_text("two-before\n", encoding="utf-8")
+        (self.root / "goals").mkdir()
+        self.goals = [
+            {"checkpoint_id": "cp1", "objective": "first change", "acceptance_criteria": ["first works"],
+             "allowed_files": ["cp1.txt"], "required_tests": ["required"]},
+            {"checkpoint_id": "cp2", "objective": "second change", "acceptance_criteria": ["second works"],
+             "allowed_files": ["cp2.txt"], "required_tests": ["required"]},
+        ]
+        for goal in self.goals:
+            (self.root / "goals" / f"{goal['checkpoint_id']}.json").write_text(json.dumps(goal), encoding="utf-8")
+        command(["git", "add", "."], self.root); command(["git", "commit", "-qm", "base"], self.root)
+        (self.root / ".loop").mkdir()
+        self.config = {
+            "allowed_tests": [{"name": "required", "argv": [sys.executable, "-c", "print('pass')"]}],
+            "test_timeout_seconds": 5, "claude_max_budget_usd": 0.5,
+        }
+        self.raw_manifest = {
+            "phase_id": "phase", "objective": "complete two approved changes",
+            "checkpoints": [{"checkpoint_id": "cp1", "goal": "goals/cp1.json"},
+                            {"checkpoint_id": "cp2", "goal": "goals/cp2.json"}],
+            "allowed_files": ["cp1.txt", "cp2.txt"], "allowed_tests": ["required"],
+            "final_harness_profile": "orchestrator", "max_checkpoints": 2,
+            "max_rework_rounds": 1, "max_model_calls": 8,
+            "max_claude_cost_usd": 2.0, "max_elapsed_seconds": 60,
+            "completion_conditions": ["all verifier checks pass", "final harness passes"],
+        }
+
+    def tearDown(self): self.temp.cleanup()
+
+    def manifest(self, value=None):
+        return validate_phase_manifest(value or self.raw_manifest, self.root, self.config, set(PROFILES))
+
+    def budget(self):
+        now = datetime.now(timezone.utc).isoformat()
+        path = self.root / ".loop" / "budget.json"
+        if not path.exists():
+            path.write_text(json.dumps({
+                "claude": {"period_usage_percent": 10, "updated_at": now, "source": "manual"},
+                "codex": {"period_usage_percent": 10, "updated_at": now, "source": "manual"},
+            }), encoding="utf-8")
+        return BudgetManager(path)
+
+    @staticmethod
+    def harness(state="PASSED", code=0):
+        def run(root, profile, **kwargs):
+            return code, {"state": state, "profile": profile.name, "steps": [], "run_id": "harness",
+                          "max_elapsed_seconds": kwargs.get("max_elapsed_seconds")}
+        return run
+
+    class Maker:
+        def __init__(self, root, outside=False): self.root, self.calls, self.sessions, self.outside = root, 0, [], outside
+        def run(self, prompt, session_id=None):
+            self.calls += 1; self.sessions.append(session_id)
+            name = "outside.txt" if self.outside else ("cp1.txt" if '"checkpoint_id": "cp1"' in prompt else "cp2.txt")
+            (self.root / name).write_text(f"changed-{self.calls}\n", encoding="utf-8")
+            result = MakerResult("DONE", "base", [name], [], [], "done")
+            return ClaudeInvocation(result, f"session-{self.calls}", 0.1, 1)
+
+    class Codex:
+        def __init__(self, verdicts=None, mutate_root=None, failure_at=None):
+            self.verdicts = list(verdicts or ["PASS", "PASS"]); self.prompts = []
+            self.plans = 0; self.mutate_root = mutate_root; self.failure_at = failure_at
+        def verify(self, prompt):
+            self.prompts.append(prompt)
+            if self.failure_at == len(self.prompts): raise ProcessFailure(TIMEOUT, "timeout")
+            if self.mutate_root: (self.mutate_root / "verifier.txt").write_text("bad", encoding="utf-8")
+            verdict = self.verdicts.pop(0)
+            return VerifierResult(verdict, [] if verdict == "PASS" else ["fix"], [], [], None, [], "rework")
+        def plan(self, prompt): self.plans += 1; raise AssertionError("phase mode never calls planner")
+
+    def engine(self, maker=None, codex=None, **kwargs):
+        return PhaseEngine(self.root, self.config, maker or self.Maker(self.root), codex or self.Codex(),
+                           self.budget(), harness_runner=kwargs.pop("harness_runner", self.harness()), **kwargs)
+
+    def test_valid_manifest_and_dry_run_invoke_no_process(self):
+        manifest = self.manifest(); maker, codex = self.Maker(self.root), self.Codex()
+        state = self.engine(maker, codex).run(manifest)
+        self.assertEqual("DRY_RUN", state["state"]); self.assertFalse(state["processes_invoked"])
+        self.assertEqual(0, maker.calls); self.assertEqual([], codex.prompts)
+
+    def test_cli_run_phase_defaults_to_dry_run_without_adapters_or_probe(self):
+        config = dict(self.config)
+        config.update({"soft_stop_percent": 75, "hard_stop_percent": 80, "budget_validity_hours": 24,
+                       "process_timeout_seconds": 10})
+        (self.root / ".loop" / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        manifest_path = self.root / "phase.json"; manifest_path.write_text(json.dumps(self.raw_manifest), encoding="utf-8")
+        output = io.StringIO()
+        with patch.object(cli, "ROOT", self.root), patch.object(cli, "RUNTIME", self.root / ".loop"), \
+             patch.object(cli, "ClaudeCLIAdapter", side_effect=AssertionError("no maker")), \
+             patch.object(cli, "CodexCLIAdapter", side_effect=AssertionError("no codex")), \
+             patch.object(cli, "probe_process", side_effect=AssertionError("no probe")), redirect_stdout(output):
+            code = cli.main(["run-phase", "--manifest", manifest_path.name])
+        self.assertEqual(0, code); self.assertFalse(json.loads(output.getvalue())["processes_invoked"])
+
+    def test_invalid_manifest_json_and_schema(self):
+        path = self.root / "broken.json"; path.write_text("{", encoding="utf-8")
+        from tools.loop_orchestrator.phase import load_phase_manifest
+        with self.assertRaises(PhaseManifestError): load_phase_manifest(path, self.root, self.config, set(PROFILES))
+        invalid = dict(self.raw_manifest); invalid.pop("phase_id")
+        with self.assertRaises(PhaseManifestError): self.manifest(invalid)
+
+    def test_manifest_rejects_absolute_traversal_and_symlink_escape(self):
+        for bad in ("C:/outside.json", "../outside.json"):
+            value = dict(self.raw_manifest); value["checkpoints"] = [{"checkpoint_id": "cp1", "goal": bad}]
+            with self.assertRaises((PhaseManifestError, GoalError)): self.manifest(value)
+        original = Path.is_symlink
+        with patch.object(Path, "is_symlink", lambda path: path.name == "cp1.json" or original(path)):
+            value = dict(self.raw_manifest); value["checkpoints"] = [self.raw_manifest["checkpoints"][0]]
+            with self.assertRaises(PhaseManifestError): self.manifest(value)
+
+    def test_manifest_rejects_goal_id_template_placeholder_and_empty_contract(self):
+        mutations = []
+        mismatch = json.loads(json.dumps(self.raw_manifest)); mismatch["checkpoints"][0]["checkpoint_id"] = "wrong"; mutations.append(mismatch)
+        for index, update in enumerate(({"template": True}, {"objective": "Replace with objective"},
+                                        {"acceptance_criteria": []}, {"required_tests": []})):
+            goal = dict(self.goals[0]); goal.update(update)
+            path = self.root / "goals" / f"invalid-{index}.json"; path.write_text(json.dumps(goal), encoding="utf-8")
+            value = json.loads(json.dumps(self.raw_manifest)); value["checkpoints"][0]["goal"] = f"goals/invalid-{index}.json"
+            mutations.append(value)
+        for value in mutations:
+            with self.assertRaises(PhaseManifestError): self.manifest(value)
+
+    def test_manifest_rejects_duplicate_id_scope_test_and_limits(self):
+        cases = []
+        duplicate = dict(self.raw_manifest); duplicate["checkpoints"] = [self.raw_manifest["checkpoints"][0]] * 2; cases.append(duplicate)
+        scope = json.loads(json.dumps(self.raw_manifest)); scope["allowed_files"] = ["cp2.txt"]; cases.append(scope)
+        tests = dict(self.raw_manifest); tests["allowed_tests"] = ["missing"]; cases.append(tests)
+        for field in ("max_checkpoints", "max_rework_rounds", "max_model_calls", "max_claude_cost_usd", "max_elapsed_seconds"):
+            value = dict(self.raw_manifest); value[field] = 0; cases.append(value)
+        for value in cases:
+            with self.subTest(value=value):
+                with self.assertRaises(PhaseManifestError): self.manifest(value)
+
+    def test_manifest_rejects_malformed_shell_and_wildcard_allowlists(self):
+        original = self.config["allowed_tests"]
+        for entry in ({"name": "required", "argv": "python -m pytest"},
+                      {"name": "required", "argv": ["cmd.exe", "/c", "pytest"]},
+                      {"name": "required", "argv": ["python", "-m", "pytest", "tests/*"]}):
+            self.config["allowed_tests"] = [entry]
+            with self.assertRaises(PhaseManifestError): self.manifest()
+        self.config["allowed_tests"] = original
+
+    def test_two_checkpoints_pass_then_final_harness_ready(self):
+        maker, codex = self.Maker(self.root), self.Codex()
+        state = self.engine(maker, codex).run(self.manifest(), execute=True)
+        self.assertEqual("READY_TO_COMMIT", state["state"], state)
+        self.assertEqual(["cp1", "cp2"], state["completed_checkpoints"])
+        self.assertEqual(2, maker.calls); self.assertEqual(2, len(codex.prompts)); self.assertEqual(0, codex.plans)
+        self.assertEqual("changed-1\n", (self.root / "cp1.txt").read_text())
+        self.assertEqual("changed-2\n", (self.root / "cp2.txt").read_text())
+
+    def test_fail_rework_pass_then_next_checkpoint(self):
+        maker, codex = self.Maker(self.root), self.Codex(["FAIL", "PASS", "PASS"])
+        state = self.engine(maker, codex).run(self.manifest(), execute=True)
+        self.assertEqual("READY_TO_COMMIT", state["state"], state); self.assertEqual(3, maker.calls)
+        self.assertEqual([None, "session-1", None], maker.sessions)
+
+    def test_checkpoint_diff_isolated_and_cumulative_changes_remain(self):
+        codex = self.Codex(); state = self.engine(codex=codex).run(self.manifest(), execute=True)
+        self.assertEqual("READY_TO_COMMIT", state["state"], state)
+        self.assertIn("cp1.txt", codex.prompts[0]); self.assertNotIn("cp2.txt", codex.prompts[0])
+        self.assertIn("cp2.txt", codex.prompts[1]); self.assertNotIn("a/cp1.txt", codex.prompts[1])
+        self.assertTrue((self.root / "cp1.txt").read_text().startswith("changed"))
+        self.assertTrue((self.root / "cp2.txt").read_text().startswith("changed"))
+
+    def test_prior_checkpoint_file_cannot_be_modified_without_current_permission(self):
+        class BadMaker(self.Maker):
+            def run(inner, prompt, session_id=None):
+                result = super(BadMaker, inner).run(prompt, session_id)
+                if inner.calls == 2: (inner.root / "cp1.txt").write_text("tampered\n", encoding="utf-8")
+                return result
+        state = self.engine(maker=BadMaker(self.root)).run(self.manifest(), execute=True)
+        self.assertEqual("BLOCKED", state["state"]); self.assertEqual("MAKER_SAFETY_VIOLATION", state["stop_reason"])
+
+    def test_allowed_file_violation_and_verifier_mutation_block(self):
+        state = self.engine(maker=self.Maker(self.root, outside=True)).run(self.manifest(), execute=True)
+        self.assertEqual("MAKER_SAFETY_VIOLATION", state["stop_reason"])
+        (self.root / "outside.txt").unlink()
+        state = self.engine(codex=self.Codex(mutate_root=self.root)).run(self.manifest(), execute=True)
+        self.assertEqual("VERIFIER_SAFETY_VIOLATION", state["stop_reason"])
+
+    def test_model_cost_and_elapsed_limits_block_before_call(self):
+        value = dict(self.raw_manifest); value["max_model_calls"] = 1
+        maker, codex = self.Maker(self.root), self.Codex()
+        state = self.engine(maker, codex).run(self.manifest(value), execute=True)
+        self.assertEqual("MAX_MODEL_CALLS", state["stop_reason"]); self.assertEqual([], codex.prompts)
+        (self.root / "cp1.txt").write_text("one-before\n", encoding="utf-8")
+        value = dict(self.raw_manifest); value["max_claude_cost_usd"] = 0.1
+        maker = self.Maker(self.root); state = self.engine(maker=maker).run(self.manifest(value), execute=True)
+        self.assertEqual("MAX_CLAUDE_COST_USD", state["stop_reason"]); self.assertEqual(0, maker.calls)
+        ticks = iter([0, 100, 100, 100])
+        maker = self.Maker(self.root); value = dict(self.raw_manifest); value["max_elapsed_seconds"] = 10
+        state = self.engine(maker=maker, clock=lambda: next(ticks)).run(self.manifest(value), execute=True)
+        self.assertEqual("MAX_ELAPSED_SECONDS", state["stop_reason"]); self.assertEqual(0, maker.calls)
+
+    def test_harness_failure_and_infrastructure_mapping(self):
+        state = self.engine(harness_runner=self.harness("FAILED", 1)).run(self.manifest(), execute=True)
+        self.assertEqual("FAILED", state["state"], state); self.assertEqual("FINAL_HARNESS_FAILED", state["stop_reason"])
+        (self.root / "cp1.txt").write_text("one-before\n", encoding="utf-8")
+        (self.root / "cp2.txt").write_text("two-before\n", encoding="utf-8")
+        state = self.engine(harness_runner=self.harness("BLOCKED", 2)).run(self.manifest(), execute=True)
+        self.assertEqual("BLOCKED", state["state"]); self.assertEqual("FINAL_HARNESS_INFRASTRUCTURE_FAILURE", state["stop_reason"])
+
+    def test_timeout_creates_handoff_and_resume_continues_without_restarting_cp1(self):
+        maker, codex = self.Maker(self.root), self.Codex(failure_at=2)
+        state = self.engine(maker, codex).run(self.manifest(), execute=True)
+        self.assertEqual("BLOCKED", state["state"]); self.assertEqual(["cp1"], state["completed_checkpoints"])
+        self.assertTrue((self.root / ".loop" / "handoff.json").is_file())
+        self.assertTrue(any((self.root / ".loop" / "runs" / state["run_id"]).glob("*.json")))
+        resumed_maker, resumed_codex = self.Maker(self.root), self.Codex(["PASS"])
+        resumed = self.engine(resumed_maker, resumed_codex).run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("READY_TO_COMMIT", resumed["state"], resumed); self.assertEqual(1, resumed_maker.calls)
+        self.assertEqual(["cp1", "cp2"], resumed["completed_checkpoints"])
+
+    def test_resume_noop_maker_still_verifies_pre_timeout_delta(self):
+        stopped = self.engine(codex=self.Codex(failure_at=2)).run(self.manifest(), execute=True)
+        self.assertEqual("BLOCKED", stopped["state"])
+        class NoopMaker:
+            calls = 0
+            def run(inner, prompt, session_id=None):
+                inner.calls += 1
+                return ClaudeInvocation(MakerResult("DONE", "base", [], [], [], "no change"),
+                                        session_id or "resume-session", 0.1, 1)
+        maker, codex = NoopMaker(), self.Codex(["PASS"])
+        resumed = self.engine(maker, codex).run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("READY_TO_COMMIT", resumed["state"], resumed)
+        self.assertEqual(1, maker.calls)
+        self.assertIn("--- a/cp2.txt", codex.prompts[0])
+        self.assertIn("+changed-2", codex.prompts[0])
+
+    def test_resume_missing_active_baseline_fails_closed(self):
+        stopped = self.engine(codex=self.Codex(failure_at=2)).run(self.manifest(), execute=True)
+        state_path = self.root / ".loop" / "state.json"
+        wrapper = json.loads(state_path.read_text(encoding="utf-8"))
+        wrapper["state"]["active_checkpoint"].pop("baseline")
+        state_path.write_text(json.dumps(wrapper), encoding="utf-8")
+        maker = self.Maker(self.root)
+        resumed = self.engine(maker=maker).run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("RESUME_INCOMPLETE_CHECKPOINT_STATE", resumed["stop_reason"])
+        self.assertEqual(0, maker.calls); self.assertEqual(["cp1"], stopped["completed_checkpoints"])
+
+    def test_maker_blocked_after_edit_records_delta_and_cost(self):
+        class BlockedMaker(self.Maker):
+            def run(inner, prompt, session_id=None):
+                invocation = super().run(prompt, session_id)
+                return ClaudeInvocation(MakerResult("BLOCKED", "base", ["cp1.txt"], [], [], "blocked"),
+                                        invocation.session_id, 0.25, 2)
+        state = self.engine(maker=BlockedMaker(self.root)).run(self.manifest(), execute=True)
+        self.assertEqual("MAKER_BLOCKED", state["stop_reason"])
+        self.assertEqual(0.25, state["claude_cost_usd"])
+        self.assertEqual(["cp1.txt"], state["recent_result"]["checkpoint_changed_files"])
+
+    def test_maker_process_failure_after_edit_records_delta(self):
+        class FailureMaker:
+            def __init__(inner, root): inner.root = root
+            def run(inner, prompt, session_id=None):
+                (inner.root / "cp1.txt").write_text("partial failure\n", encoding="utf-8")
+                raise ProcessFailure(NONZERO_EXIT, "failed", return_code=1, stdout_tail="out", stderr_tail="err")
+        state = self.engine(maker=FailureMaker(self.root)).run(self.manifest(), execute=True)
+        self.assertEqual("FAILED", state["state"]); self.assertEqual("MAKER_ERROR: NONZERO_EXIT", state["stop_reason"])
+        self.assertEqual(["cp1.txt"], state["recent_result"]["checkpoint_changed_files"])
+        self.assertIn("before_sha256", state["recent_result"]["checkpoint_file_diagnostics"]["cp1.txt"])
+
+    def test_maker_general_exception_and_interrupt_after_edit_record_delta(self):
+        for exception in (RuntimeError("crash"), KeyboardInterrupt()):
+            with self.subTest(exception=type(exception).__name__):
+                class AbnormalMaker:
+                    def __init__(inner, root): inner.root = root
+                    def run(inner, prompt, session_id=None):
+                        (inner.root / "cp1.txt").write_text("partial abnormal exit\n", encoding="utf-8")
+                        raise exception
+                state = self.engine(maker=AbnormalMaker(self.root)).run(self.manifest(), execute=True)
+                expected = "INTERRUPTED" if isinstance(exception, KeyboardInterrupt) else "MAKER_ERROR"
+                self.assertEqual(expected, state["stop_reason"])
+                self.assertEqual(["cp1.txt"], state["recent_result"]["checkpoint_changed_files"])
+                (self.root / "cp1.txt").write_text("one-before\n", encoding="utf-8")
+
+    def test_maker_exception_with_outside_edit_prioritizes_safety_block(self):
+        class UnsafeMaker:
+            def __init__(inner, root): inner.root = root
+            def run(inner, prompt, session_id=None):
+                (inner.root / "outside.txt").write_text("unsafe\n", encoding="utf-8")
+                raise RuntimeError("maker crashed")
+        state = self.engine(maker=UnsafeMaker(self.root)).run(self.manifest(), execute=True)
+        self.assertEqual("BLOCKED", state["state"]); self.assertEqual("MAKER_SAFETY_VIOLATION", state["stop_reason"])
+        self.assertEqual(["outside.txt"], state["recent_result"]["guard"]["allowed_files_violations"])
+
+    def test_maker_staged_or_head_change_is_blocked(self):
+        class StagingMaker(self.Maker):
+            def run(inner, prompt, session_id=None):
+                result = super().run(prompt, session_id)
+                command(["git", "add", "cp1.txt"], inner.root)
+                return result
+        state = self.engine(maker=StagingMaker(self.root)).run(self.manifest(), execute=True)
+        self.assertEqual("MAKER_SAFETY_VIOLATION", state["stop_reason"])
+        self.assertTrue(state["recent_result"]["guard"]["staged_violation"])
+
+    def test_maker_head_change_is_blocked(self):
+        class CommittingMaker(self.Maker):
+            def run(inner, prompt, session_id=None):
+                result = super().run(prompt, session_id)
+                command(["git", "add", "cp1.txt"], inner.root)
+                command(["git", "commit", "-qm", "unsafe fixture commit"], inner.root)
+                return result
+        state = self.engine(maker=CommittingMaker(self.root)).run(self.manifest(), execute=True)
+        self.assertEqual("MAKER_SAFETY_VIOLATION", state["stop_reason"])
+        self.assertTrue(state["recent_result"]["guard"]["head_violation"])
+
+    def test_maker_protected_config_and_budget_changes_are_blocked(self):
+        class ProtectedMaker(self.Maker):
+            def run(inner, prompt, session_id=None):
+                result = super().run(prompt, session_id)
+                (inner.root / ".loop" / "config.json").write_text("{}", encoding="utf-8")
+                (inner.root / ".loop" / "budget.json").write_text("{}", encoding="utf-8")
+                (inner.root / ".claude").mkdir(exist_ok=True)
+                (inner.root / ".vscode").mkdir(exist_ok=True)
+                (inner.root / ".claude" / "settings.local.json").write_text("{}", encoding="utf-8")
+                (inner.root / ".vscode" / "settings.json").write_text("{}", encoding="utf-8")
+                return result
+        state = self.engine(maker=ProtectedMaker(self.root)).run(self.manifest(), execute=True)
+        self.assertEqual("MAKER_SAFETY_VIOLATION", state["stop_reason"])
+        self.assertEqual([".claude/settings.local.json", ".loop/budget.json", ".loop/config.json",
+                          ".vscode/settings.json"],
+                         state["recent_result"]["guard"]["protected_file_violations"])
+
+    def test_required_test_protected_file_change_is_blocked(self):
+        self.config["allowed_tests"][0]["argv"] = [sys.executable, "-c",
+            "from pathlib import Path; Path('.loop/config.json').write_text('{}')"]
+        state = self.engine().run(self.manifest(), execute=True)
+        self.assertEqual("REQUIRED_TEST_SAFETY_VIOLATION", state["stop_reason"])
+        self.assertEqual([".loop/config.json"], state["recent_result"]["test_guard"]["protected_file_violations"])
+
+    def test_verifier_protected_budget_change_is_blocked(self):
+        class ProtectedCodex(self.Codex):
+            def verify(inner, prompt):
+                (inner.root / ".loop" / "budget.json").write_text("{}", encoding="utf-8")
+                return super(ProtectedCodex, inner).verify(prompt)
+        codex = ProtectedCodex(["PASS"]); codex.root = self.root
+        state = self.engine(codex=codex).run(self.manifest(), execute=True)
+        self.assertEqual("VERIFIER_SAFETY_VIOLATION", state["stop_reason"])
+        self.assertEqual([".loop/budget.json"], state["recent_result"]["verifier_guard"]["protected_file_violations"])
+
+    def test_harness_pass_with_product_mutation_is_blocked(self):
+        def mutating(root, profile, **kwargs):
+            (root / "cp1.txt").write_text("harness mutation\n", encoding="utf-8")
+            return 0, {"state": "PASSED", "steps": []}
+        state = self.engine(harness_runner=mutating).run(self.manifest(), execute=True)
+        self.assertEqual("FINAL_HARNESS_MODIFIED_WORKTREE", state["stop_reason"])
+        self.assertIn("cp1.txt", state["recent_result"]["guard"]["changed_files"])
+
+    def test_harness_staged_change_is_blocked(self):
+        def staging(root, profile, **kwargs):
+            command(["git", "add", "cp1.txt", "cp2.txt"], root)
+            return 0, {"state": "PASSED", "steps": []}
+        state = self.engine(harness_runner=staging).run(self.manifest(), execute=True)
+        self.assertEqual("FINAL_HARNESS_MODIFIED_WORKTREE", state["stop_reason"])
+        self.assertTrue(state["recent_result"]["guard"]["staged_violation"])
+
+    def test_harness_head_change_is_blocked(self):
+        def committing(root, profile, **kwargs):
+            command(["git", "add", "cp1.txt", "cp2.txt"], root)
+            command(["git", "commit", "-qm", "unsafe harness fixture"], root)
+            return 0, {"state": "PASSED", "steps": []}
+        state = self.engine(harness_runner=committing).run(self.manifest(), execute=True)
+        self.assertEqual("FINAL_HARNESS_MODIFIED_WORKTREE", state["stop_reason"])
+        self.assertTrue(state["recent_result"]["guard"]["head_violation"])
+
+    def test_harness_exceptions_are_structured_blocks(self):
+        factories = [lambda: OSError("mkdir failed"), lambda: ProcessFailure(TIMEOUT, "timeout")]
+        for factory in factories:
+            with self.subTest(factory=factory):
+                def failing(root, profile, **kwargs): raise factory()
+                state = self.engine(harness_runner=failing).run(self.manifest(), execute=True)
+                self.assertEqual("FINAL_HARNESS_START_FAILED", state["stop_reason"])
+                self.assertIn("error", state["recent_result"])
+                (self.root / "cp1.txt").write_text("one-before\n", encoding="utf-8")
+                (self.root / "cp2.txt").write_text("two-before\n", encoding="utf-8")
+
+    def test_harness_keyboard_interrupt_is_structured_block(self):
+        def interrupted(root, profile, **kwargs): raise KeyboardInterrupt
+        state = self.engine(harness_runner=interrupted).run(self.manifest(), execute=True)
+        self.assertEqual("FINAL_HARNESS_INTERRUPTED", state["stop_reason"])
+        self.assertEqual("KeyboardInterrupt", state["recent_result"]["error"]["type"])
+
+    def test_post_call_cost_overrun_blocks_before_verifier(self):
+        self.config["claude_max_budget_usd"] = 0.1
+        value = dict(self.raw_manifest); value["max_claude_cost_usd"] = 0.15
+        class ExpensiveMaker(self.Maker):
+            def run(inner, prompt, session_id=None):
+                result = super().run(prompt, session_id)
+                return ClaudeInvocation(result.result, result.session_id, 0.2, result.num_turns)
+        codex = self.Codex()
+        state = self.engine(maker=ExpensiveMaker(self.root), codex=codex).run(self.manifest(value), execute=True)
+        self.assertEqual("MAX_CLAUDE_COST_USD", state["stop_reason"])
+        self.assertEqual(0.2, state["claude_cost_usd"]); self.assertEqual([], codex.prompts)
+
+    def test_resume_manifest_base_and_hash_mismatch_fail_closed(self):
+        state = self.engine(codex=self.Codex(failure_at=2)).run(self.manifest(), execute=True)
+        self.assertEqual("BLOCKED", state["state"])
+        changed = dict(self.raw_manifest); changed["objective"] = "different approved objective"
+        resumed = self.engine().run(self.manifest(changed), execute=True, resume=True)
+        self.assertEqual("RESUME_MANIFEST_MISMATCH", resumed["stop_reason"])
+        # Restore the original stopped state and exercise base-commit mismatch.
+        original_base = state["base_commit"]
+        state["base_commit"] = "different-base"
+        state["started_monotonic"] = 0
+        self.engine()._persist(state, "restore-test-state")
+        resumed = self.engine().run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("RESUME_BASE_COMMIT_MISMATCH", resumed["stop_reason"])
+        # Restore again, then corrupt a completed checkpoint file.
+        state["base_commit"] = original_base
+        state["started_monotonic"] = 0
+        self.engine()._persist(state, "restore-test-state")
+        (self.root / "cp1.txt").write_text("external mutation\n", encoding="utf-8")
+        resumed = self.engine().run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("RESUME_EXTERNAL_CHANGE_DETECTED", resumed["stop_reason"])
+
+    def test_phase_usage_at_seventy_blocks_without_model_call(self):
+        maker = self.Maker(self.root); budget = self.budget()
+        data = budget.read(); data["codex"]["period_usage_percent"] = 70
+        budget.path.write_text(json.dumps(data), encoding="utf-8")
+        state = PhaseEngine(self.root, self.config, maker, self.Codex(), budget,
+                            harness_runner=self.harness()).run(self.manifest(), execute=True)
+        self.assertEqual("BLOCKED", state["state"]); self.assertEqual(0, maker.calls)
+
+    def test_execute_and_resume_preflight_failure_blocks_without_model_call(self):
+        maker = self.Maker(self.root)
+        failure = lambda: {"integration": "codex", "kind": PROCESS_START_FAILED}
+        state = self.engine(maker=maker, preflight=failure).run(self.manifest(), execute=True)
+        self.assertEqual("EXECUTABLE_PREFLIGHT_FAILED", state["stop_reason"]); self.assertEqual(0, maker.calls)
+
+        stopped = self.engine(codex=self.Codex(failure_at=2)).run(self.manifest(), execute=True)
+        resumed_maker = self.Maker(self.root)
+        resumed = self.engine(maker=resumed_maker, preflight=failure).run(
+            self.manifest(), execute=True, resume=True)
+        self.assertEqual("RESUME_EXECUTABLE_PREFLIGHT_FAILED", resumed["stop_reason"])
+        self.assertEqual(0, resumed_maker.calls); self.assertEqual(["cp1"], stopped["completed_checkpoints"])
+
+
 if __name__ == "__main__": unittest.main()
