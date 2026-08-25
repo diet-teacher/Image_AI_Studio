@@ -8,6 +8,8 @@
   "process_timeout_seconds": 1800,
   "test_timeout_seconds": 300,
   "claude_max_budget_usd": 5.0,
+  "max_maker_continuations": 1,
+  "max_api_connection_retries": 1,
   "claude_executable": "claude",
   "codex_executable": "codex",
   "allowed_tests": [

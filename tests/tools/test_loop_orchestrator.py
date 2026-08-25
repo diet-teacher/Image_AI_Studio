@@ -15,7 +15,8 @@ from tools.loop_orchestrator.phase import PhaseManifestError, validate_phase_man
 from tools.loop_orchestrator.phase_engine import PhaseEngine
 from tools.loop_orchestrator.models import ClaudeInvocation, MakerResult, PlannerResult, State, VerifierResult
 from tools.loop_orchestrator.process import (
-    JSON_PARSE_FAILED, NONZERO_EXIT, OUTPUT_TAIL_LIMIT, PROCESS_START_FAILED, TIMEOUT,
+    API_CONNECTION_ERROR, JSON_PARSE_FAILED, MODEL_BUDGET_EXHAUSTED, MODEL_MAX_TURNS,
+    NONZERO_EXIT, OUTPUT_TAIL_LIMIT, PROCESS_START_FAILED, PROCESS_TIMEOUT, TIMEOUT,
     ProcessFailure, ProcessResult, probe_process, run_json_process,
 )
 from tools.loop_orchestrator.repository import git as repository_git
@@ -279,11 +280,14 @@ class LoopTests(unittest.TestCase):
 
     def test_temp_mkdir_failures_are_recorded_and_block_before_verifier(self):
         original_mkdir = Path.mkdir
+        required_temp_root = (self.root/".loop"/"test-temp").resolve()
         for error in (PermissionError("denied"), FileExistsError("collision")):
             with self.subTest(error=type(error).__name__):
                 codex = FakeCodex(["PASS"])
                 def mkdir(path, *args, **kwargs):
-                    if "test-temp" in path.parts: raise error
+                    resolved = path.resolve()
+                    if resolved == required_temp_root or required_temp_root in resolved.parents:
+                        raise error
                     return original_mkdir(path, *args, **kwargs)
                 original_argv = list(self.config["allowed_tests"][0]["argv"])
                 with patch.object(Path, "mkdir", new=mkdir):
@@ -330,7 +334,8 @@ class AdapterTests(unittest.TestCase):
 
     def test_claude_top_level_envelope_and_no_unrestricted_bash(self):
         captured = {}
-        def fake(argv, root, timeout): captured["argv"] = argv; return self.fixture()
+        def fake(argv, root, timeout, stdin_text=None):
+            captured["argv"] = argv; captured["stdin_text"] = stdin_text; return self.fixture()
         with patch.object(adapters, "run_json_process", side_effect=fake):
             result = ClaudeCLIAdapter(Path.cwd(), 10, 1).run("prompt")
         self.assertEqual("11111111-2222-4333-8444-555555555555", result.session_id)
@@ -338,6 +343,9 @@ class AdapterTests(unittest.TestCase):
         argv = captured["argv"]; self.assertIn("--disallowedTools", argv); self.assertEqual("Bash", argv[argv.index("--disallowedTools")+1])
         self.assertNotIn("Bash", argv[argv.index("--allowedTools")+1].split(","))
         self.assertNotIn("session_id", adapters.MAKER_SCHEMA["properties"])
+        self.assertNotIn("prompt", argv)
+        self.assertEqual("prompt", captured["stdin_text"])
+        self.assertEqual("-p", argv[1])
 
     def test_real_cli_envelope_fixture_parser_preserves_metadata(self):
         fixture = Path(__file__).parent/"fixtures"/"claude_result.json"
@@ -348,21 +356,94 @@ class AdapterTests(unittest.TestCase):
 
     def test_resume_uses_envelope_session_only(self):
         captured = {}
-        def fake(argv, root, timeout): captured["argv"] = argv; return self.fixture()
+        def fake(argv, root, timeout, stdin_text=None): captured["argv"] = argv; return self.fixture()
         with patch.object(adapters, "run_json_process", side_effect=fake): ClaudeCLIAdapter(Path.cwd(), 10, 1).run("fix", "actual-session")
         self.assertEqual("actual-session", captured["argv"][captured["argv"].index("--resume")+1])
+        self.assertNotIn("fix", captured["argv"])
 
     def test_codex_adapter_uses_shared_production_prefix(self):
         captured = {}
         payload = {"verdict":"PASS","findings":[],"failed_checks":[],"tests_observed":[],
                    "visual_verification":None,"residual_risks":[],"recommended_action":"none"}
-        def fake(argv, root, timeout, json_lines=False):
-            captured["argv"] = argv; return ProcessResult(payload, "", "", {})
+        def fake(argv, root, timeout, json_lines=False, stdin_text=None):
+            captured["argv"] = argv; captured["stdin_text"] = stdin_text; return ProcessResult(payload, "", "", {})
         adapter = CodexCLIAdapter(Path("repo"), 10, Path("schemas"), "codex-custom")
         with patch.object(adapters, "run_json_process", side_effect=fake): adapter.verify("actual prompt")
         prefix = codex_exec_prefix("codex-custom", Path("repo"))
         self.assertEqual(prefix, captured["argv"][:len(prefix)])
-        self.assertEqual("actual prompt", captured["argv"][len(prefix)])
+        self.assertNotIn("actual prompt", captured["argv"])
+        self.assertEqual("actual prompt", captured["stdin_text"])
+        self.assertIn("--json", captured["argv"]); self.assertIn("--output-schema", captured["argv"])
+
+    def test_stdin_transport_preserves_long_korean_quoted_multiline_prompt(self):
+        script = "import sys, json; print(json.dumps({'echo': sys.stdin.read()}))"
+        long_prompt = ("A" * 60000) + "\n안녕하세요 \"quoted\" text\nline2\nline3\n" + ("B" * 60000)
+        result = run_json_process([sys.executable, "-c", script], Path.cwd(), 10, stdin_text=long_prompt)
+        self.assertEqual(long_prompt, result.payload["echo"])
+
+    def test_dry_run_style_call_with_no_stdin_text_sends_nothing(self):
+        script = "import sys; data = sys.stdin.read(); print('{\"received\": %d}' % len(data))"
+        result = run_json_process([sys.executable, "-c", script], Path.cwd(), 10)
+        self.assertEqual(0, result.payload["received"])
+
+    def test_process_timeout_is_stable_alias_of_timeout(self):
+        self.assertEqual(TIMEOUT, PROCESS_TIMEOUT)
+
+    def _nonzero_envelope_script(self, envelope: dict) -> str:
+        return "import sys; print(%s); sys.exit(1)" % json.dumps(json.dumps(envelope))
+
+    def test_budget_exhausted_envelope_classifies_and_preserves_telemetry(self):
+        envelope = {"type": "result", "subtype": "error_max_budget", "is_error": True,
+                    "session_id": "sess-budget", "total_cost_usd": 4.9, "num_turns": 12, "result": "ran out"}
+        with self.assertRaises(ProcessFailure) as raised:
+            run_json_process([sys.executable, "-c", self._nonzero_envelope_script(envelope)], Path.cwd(), 10)
+        failure = raised.exception
+        self.assertEqual(MODEL_BUDGET_EXHAUSTED, failure.kind)
+        self.assertEqual("sess-budget", failure.metadata["session_id"])
+        self.assertEqual(4.9, failure.metadata["total_cost_usd"])
+        self.assertEqual(12, failure.metadata["num_turns"])
+        self.assertEqual("error_max_budget", failure.metadata["subtype"])
+
+    def test_max_turns_envelope_classifies_and_preserves_telemetry(self):
+        envelope = {"subtype": "error_max_turns", "is_error": True, "session_id": "sess-turns",
+                    "total_cost_usd": 1.2, "num_turns": 50}
+        with self.assertRaises(ProcessFailure) as raised:
+            run_json_process([sys.executable, "-c", self._nonzero_envelope_script(envelope)], Path.cwd(), 10)
+        failure = raised.exception
+        self.assertEqual(MODEL_MAX_TURNS, failure.kind)
+        self.assertEqual("sess-turns", failure.metadata["session_id"])
+        self.assertEqual(50, failure.metadata["num_turns"])
+
+    def test_api_connection_error_envelope_classifies_and_preserves_telemetry(self):
+        envelope = {"subtype": "error_api_connection", "is_error": True, "session_id": "sess-conn",
+                    "total_cost_usd": 0.0, "errors": ["api_connection_error"]}
+        with self.assertRaises(ProcessFailure) as raised:
+            run_json_process([sys.executable, "-c", self._nonzero_envelope_script(envelope)], Path.cwd(), 10)
+        failure = raised.exception
+        self.assertEqual(API_CONNECTION_ERROR, failure.kind)
+        self.assertEqual("sess-conn", failure.metadata["session_id"])
+        self.assertEqual(0.0, failure.metadata["total_cost_usd"])
+
+    def test_general_nonzero_envelope_without_markers_stays_nonzero_exit(self):
+        envelope = {"subtype": "success", "is_error": False, "session_id": "sess-ok", "total_cost_usd": 0.5}
+        with self.assertRaises(ProcessFailure) as raised:
+            run_json_process([sys.executable, "-c", self._nonzero_envelope_script(envelope)], Path.cwd(), 10)
+        self.assertEqual(NONZERO_EXIT, raised.exception.kind)
+        self.assertEqual("sess-ok", raised.exception.metadata["session_id"])
+
+    def test_malformed_nonzero_stdout_stays_nonzero_exit_with_empty_metadata(self):
+        with self.assertRaises(ProcessFailure) as raised:
+            run_json_process([sys.executable, "-c", "print('not json'); import sys; sys.exit(1)"], Path.cwd(), 10)
+        self.assertEqual(NONZERO_EXIT, raised.exception.kind)
+        self.assertEqual({}, raised.exception.metadata)
+
+    def test_codex_json_lines_nonzero_ignores_envelope_parsing(self):
+        envelope = {"subtype": "error_max_budget", "session_id": "ignored"}
+        with self.assertRaises(ProcessFailure) as raised:
+            run_json_process([sys.executable, "-c", self._nonzero_envelope_script(envelope)],
+                             Path.cwd(), 10, json_lines=True)
+        self.assertEqual(NONZERO_EXIT, raised.exception.kind)
+        self.assertEqual({}, raised.exception.metadata)
 
     def run_failure(self, script):
         with self.assertRaises(ProcessFailure) as raised:
@@ -403,7 +484,16 @@ class AdapterTests(unittest.TestCase):
         self.assertFalse(kwargs["shell"])
         self.assertEqual("utf-8", kwargs["encoding"])
         self.assertEqual("replace", kwargs["errors"])
+        self.assertEqual(subprocess.PIPE, kwargs["stdin"])
         process.kill.assert_called_once_with()
+
+    def test_stdin_text_is_forwarded_to_communicate(self):
+        process = unittest.mock.MagicMock()
+        process.returncode = 0
+        process.communicate.return_value = ('{"status":"DONE"}', "")
+        with patch("tools.loop_orchestrator.process.subprocess.Popen", return_value=process):
+            run_json_process(["fixed", "argv"], Path.cwd(), 10, stdin_text="the prompt text")
+        self.assertEqual("the prompt text", process.communicate.call_args.kwargs["input"])
 
     def test_json_parse_failure_has_structured_kind_and_tails(self):
         with self.assertRaises(ProcessFailure) as raised:
@@ -557,13 +647,25 @@ class PhaseEngineTests(unittest.TestCase):
         return run
 
     class Maker:
-        def __init__(self, root, outside=False): self.root, self.calls, self.sessions, self.outside = root, 0, [], outside
+        def __init__(self, root, outside=False):
+            self.root, self.calls, self.sessions, self.prompts, self.outside = root, 0, [], [], outside
         def run(self, prompt, session_id=None):
-            self.calls += 1; self.sessions.append(session_id)
+            self.calls += 1; self.sessions.append(session_id); self.prompts.append(prompt)
             name = "outside.txt" if self.outside else ("cp1.txt" if '"checkpoint_id": "cp1"' in prompt else "cp2.txt")
             (self.root / name).write_text(f"changed-{self.calls}\n", encoding="utf-8")
             result = MakerResult("DONE", "base", [name], [], [], "done")
             return ClaudeInvocation(result, f"session-{self.calls}", 0.1, 1)
+
+    class RecoveringMaker:
+        def __init__(self, root, failures):
+            self.root, self.failures, self.calls, self.sessions = root, list(failures), 0, []
+        def run(self, prompt, session_id=None):
+            self.calls += 1; self.sessions.append(session_id)
+            if self.failures:
+                raise self.failures.pop(0)
+            name = "cp1.txt" if '"checkpoint_id": "cp1"' in prompt else "cp2.txt"
+            (self.root / name).write_text(f"changed-{self.calls}\n", encoding="utf-8")
+            return ClaudeInvocation(MakerResult("DONE", "base", [name], [], [], "done"), f"session-{self.calls}", 0.1, 1)
 
     class Codex:
         def __init__(self, verdicts=None, mutate_root=None, failure_at=None):
@@ -944,6 +1046,395 @@ class PhaseEngineTests(unittest.TestCase):
             self.manifest(), execute=True, resume=True)
         self.assertEqual("RESUME_EXECUTABLE_PREFLIGHT_FAILED", resumed["stop_reason"])
         self.assertEqual(0, resumed_maker.calls); self.assertEqual(["cp1"], stopped["completed_checkpoints"])
+
+    def test_budget_exhausted_continues_same_session_once_then_succeeds(self):
+        failure = ProcessFailure(MODEL_BUDGET_EXHAUSTED, "budget exhausted", return_code=1,
+                                 metadata={"session_id": "resume-session", "total_cost_usd": 0.3,
+                                           "num_turns": 10, "subtype": "error_max_budget"})
+        maker, codex = self.RecoveringMaker(self.root, [failure]), self.Codex()
+        state = self.engine(maker=maker, codex=codex).run(self.manifest(), execute=True)
+        self.assertEqual("READY_TO_COMMIT", state["state"], state)
+        self.assertEqual([None, "resume-session", None], maker.sessions)
+        self.assertAlmostEqual(0.5, state["claude_cost_usd"], places=6)
+        self.assertEqual(3, maker.calls); self.assertEqual(3, state["maker_calls"])
+        self.assertEqual(5, state["model_calls"])
+
+    def test_max_turns_without_session_blocks_without_continuation(self):
+        failure = ProcessFailure(MODEL_MAX_TURNS, "max turns", return_code=1,
+                                 metadata={"total_cost_usd": 0.2, "num_turns": 40, "subtype": "error_max_turns"})
+        maker = self.RecoveringMaker(self.root, [failure])
+        state = self.engine(maker=maker).run(self.manifest(), execute=True)
+        self.assertEqual("BLOCKED", state["state"]); self.assertEqual(MODEL_MAX_TURNS, state["stop_reason"])
+        self.assertEqual(1, maker.calls); self.assertEqual(0.2, state["claude_cost_usd"])
+
+    def test_api_connection_error_retries_once_in_new_session_then_succeeds(self):
+        failure = ProcessFailure(API_CONNECTION_ERROR, "conn", return_code=1,
+                                 metadata={"session_id": "dropped", "total_cost_usd": 0.0,
+                                           "subtype": "error_api_connection"})
+        maker, codex = self.RecoveringMaker(self.root, [failure]), self.Codex()
+        state = self.engine(maker=maker, codex=codex).run(self.manifest(), execute=True)
+        self.assertEqual("READY_TO_COMMIT", state["state"], state)
+        self.assertEqual([None, None, None], maker.sessions)
+
+    def test_api_connection_error_repeated_blocks_after_one_retry(self):
+        failures = [ProcessFailure(API_CONNECTION_ERROR, "conn", return_code=1,
+                                   metadata={"subtype": "error_api_connection"}) for _ in range(2)]
+        maker = self.RecoveringMaker(self.root, failures)
+        state = self.engine(maker=maker).run(self.manifest(), execute=True)
+        self.assertEqual("BLOCKED", state["state"]); self.assertEqual(API_CONNECTION_ERROR, state["stop_reason"])
+        self.assertEqual(2, maker.calls)
+
+    def test_api_connection_error_with_file_change_blocks_without_retry(self):
+        class DirtyFailureMaker:
+            def __init__(inner, root): inner.root, inner.calls = root, 0
+            def run(inner, prompt, session_id=None):
+                inner.calls += 1
+                (inner.root / "cp1.txt").write_text("partial\n", encoding="utf-8")
+                raise ProcessFailure(API_CONNECTION_ERROR, "conn", return_code=1,
+                                     metadata={"subtype": "error_api_connection"})
+        maker = DirtyFailureMaker(self.root)
+        state = self.engine(maker=maker).run(self.manifest(), execute=True)
+        self.assertEqual("BLOCKED", state["state"]); self.assertEqual(API_CONNECTION_ERROR, state["stop_reason"])
+        self.assertEqual(1, maker.calls)
+
+    def test_safety_violation_prevents_recovery_even_with_valid_session(self):
+        class UnsafeRecoverableMaker:
+            def __init__(inner, root): inner.root, inner.calls = root, 0
+            def run(inner, prompt, session_id=None):
+                inner.calls += 1
+                (inner.root / "outside.txt").write_text("unsafe\n", encoding="utf-8")
+                raise ProcessFailure(MODEL_BUDGET_EXHAUSTED, "budget", return_code=1,
+                                     metadata={"session_id": "sess", "subtype": "error_max_budget"})
+        maker = UnsafeRecoverableMaker(self.root)
+        state = self.engine(maker=maker).run(self.manifest(), execute=True)
+        self.assertEqual("BLOCKED", state["state"]); self.assertEqual("MAKER_SAFETY_VIOLATION", state["stop_reason"])
+        self.assertEqual(1, maker.calls)
+
+    def test_cost_overflow_blocks_before_continuation_or_verifier(self):
+        config = dict(self.config, claude_max_budget_usd=0.1)
+        value = dict(self.raw_manifest); value["max_claude_cost_usd"] = 0.25
+        failure = ProcessFailure(MODEL_BUDGET_EXHAUSTED, "budget", return_code=1,
+                                 metadata={"session_id": "sess", "total_cost_usd": 0.3, "subtype": "error_max_budget"})
+        maker, codex = self.RecoveringMaker(self.root, [failure]), self.Codex()
+        engine = PhaseEngine(self.root, config, maker, codex, self.budget(), harness_runner=self.harness())
+        state = engine.run(self.manifest(value), execute=True)
+        self.assertEqual("MAX_CLAUDE_COST_USD", state["stop_reason"]); self.assertEqual(1, maker.calls)
+        self.assertEqual([], codex.prompts)
+
+    def test_maker_before_state_persists_incremented_calls_before_run(self):
+        root, seen = self.root, []
+        class InspectingMaker(self.Maker):
+            def run(inner, prompt, session_id=None):
+                wrapper = json.loads((root / ".loop" / "state.json").read_text(encoding="utf-8"))
+                saved = wrapper["state"]
+                seen.append((saved["model_calls"], saved["maker_calls"], saved["active_checkpoint"]["pending_call"]))
+                return super().run(prompt, session_id)
+        maker = InspectingMaker(self.root)
+        state = self.engine(maker=maker, codex=self.Codex()).run(self.manifest(), execute=True)
+        self.assertEqual("READY_TO_COMMIT", state["state"], state)
+        self.assertEqual(2, len(seen))
+        self.assertEqual((1, 1), seen[0][:2]); self.assertEqual((3, 2), seen[1][:2])
+        self.assertIsNotNone(seen[0][2]); self.assertIsNotNone(seen[1][2])
+        self.assertEqual(0, seen[0][2]["call_index"]); self.assertIsNone(seen[0][2]["recovery_kind"])
+        self.assertEqual(0, seen[1][2]["call_index"]); self.assertIsNone(seen[1][2]["recovery_kind"])
+
+    def test_continuation_interrupted_before_retry_resumes_same_session_with_finish_prompt(self):
+        failure = ProcessFailure(MODEL_BUDGET_EXHAUSTED, "budget exhausted", return_code=1,
+                                 metadata={"session_id": "crash-session", "total_cost_usd": 0.1,
+                                           "num_turns": 5, "subtype": "error_max_budget"})
+        setup_config = dict(self.config); setup_config["max_maker_continuations"] = 0
+        setup_maker = self.RecoveringMaker(self.root, [failure])
+        setup_engine = PhaseEngine(self.root, setup_config, setup_maker, self.Codex(), self.budget(),
+                                   harness_runner=self.harness())
+        state = setup_engine.run(self.manifest(), execute=True)
+        self.assertEqual("BLOCKED", state["state"]); self.assertEqual(1, setup_maker.calls)
+        self.assertEqual(0, state["active_checkpoint"]["continuation_count"])
+        self.assertIsNone(state["active_checkpoint"]["pending_call"])
+
+        state_path = self.root / ".loop" / "state.json"
+        wrapper = json.loads(state_path.read_text(encoding="utf-8"))
+        record = wrapper["state"]["active_checkpoint"]
+        record["continuation_count"] = 1
+        record["pending_call"] = {"attempt": 0, "call_index": 1, "recovery_kind": "continuation",
+                                  "session_id": "crash-session", "continuation_count": 1, "api_retry_count": 0}
+        state_path.write_text(json.dumps(wrapper), encoding="utf-8")
+
+        class ResumeMaker:
+            def __init__(inner, root): inner.root, inner.calls, inner.sessions, inner.prompts = root, 0, [], []
+            def run(inner, prompt, session_id=None):
+                inner.calls += 1; inner.sessions.append(session_id); inner.prompts.append(prompt)
+                name = "cp1.txt" if inner.calls == 1 else "cp2.txt"
+                (inner.root / name).write_text(f"resumed-{inner.calls}\n", encoding="utf-8")
+                return ClaudeInvocation(MakerResult("DONE", "base", [name], [], [], "done"),
+                                        f"post-crash-session-{inner.calls}", 0.05, 1)
+        resumed_maker = ResumeMaker(self.root)
+        resumed_engine = PhaseEngine(self.root, dict(self.config, max_maker_continuations=1), resumed_maker,
+                                     self.Codex(["PASS", "PASS"]), self.budget(), harness_runner=self.harness())
+        resumed = resumed_engine.run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("READY_TO_COMMIT", resumed["state"], resumed)
+        self.assertEqual(2, resumed_maker.calls)
+        self.assertEqual("crash-session", resumed_maker.sessions[0])
+        self.assertIn("CONTINUE_CHECKPOINT", resumed_maker.prompts[0])
+        self.assertIsNone(resumed_maker.sessions[1])
+
+    def test_continuation_resume_cannot_repeat_allowance_after_crash(self):
+        failure = ProcessFailure(MODEL_BUDGET_EXHAUSTED, "budget exhausted", return_code=1,
+                                 metadata={"session_id": "crash-session", "subtype": "error_max_budget"})
+        setup_config = dict(self.config); setup_config["max_maker_continuations"] = 0
+        setup_maker = self.RecoveringMaker(self.root, [failure])
+        setup_engine = PhaseEngine(self.root, setup_config, setup_maker, self.Codex(), self.budget(),
+                                   harness_runner=self.harness())
+        setup_engine.run(self.manifest(), execute=True)
+
+        state_path = self.root / ".loop" / "state.json"
+        wrapper = json.loads(state_path.read_text(encoding="utf-8"))
+        record = wrapper["state"]["active_checkpoint"]
+        record["continuation_count"] = 1
+        record["pending_call"] = {"attempt": 0, "call_index": 1, "recovery_kind": "continuation",
+                                  "session_id": "crash-session", "continuation_count": 1, "api_retry_count": 0}
+        state_path.write_text(json.dumps(wrapper), encoding="utf-8")
+
+        class FailingAgainMaker:
+            def __init__(inner, root): inner.root, inner.calls, inner.sessions = root, 0, []
+            def run(inner, prompt, session_id=None):
+                inner.calls += 1; inner.sessions.append(session_id)
+                raise ProcessFailure(MODEL_BUDGET_EXHAUSTED, "budget again", return_code=1,
+                                     metadata={"session_id": "crash-session", "subtype": "error_max_budget"})
+        resumed_maker = FailingAgainMaker(self.root)
+        resumed_engine = PhaseEngine(self.root, dict(self.config, max_maker_continuations=1), resumed_maker,
+                                     self.Codex(), self.budget(), harness_runner=self.harness())
+        resumed = resumed_engine.run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("BLOCKED", resumed["state"]); self.assertEqual(MODEL_BUDGET_EXHAUSTED, resumed["stop_reason"])
+        self.assertEqual(1, resumed_maker.calls)
+
+    def test_api_retry_interrupted_before_call_resumes_fresh_session_with_full_prompt(self):
+        failure = ProcessFailure(API_CONNECTION_ERROR, "conn", return_code=1,
+                                 metadata={"session_id": "dropped-session", "total_cost_usd": 0.0,
+                                           "subtype": "error_api_connection"})
+        setup_config = dict(self.config); setup_config["max_api_connection_retries"] = 0
+        setup_maker = self.RecoveringMaker(self.root, [failure])
+        setup_engine = PhaseEngine(self.root, setup_config, setup_maker, self.Codex(), self.budget(),
+                                   harness_runner=self.harness())
+        state = setup_engine.run(self.manifest(), execute=True)
+        self.assertEqual("BLOCKED", state["state"]); self.assertEqual(1, setup_maker.calls)
+        self.assertEqual(0, state["active_checkpoint"]["api_retry_count"])
+
+        state_path = self.root / ".loop" / "state.json"
+        wrapper = json.loads(state_path.read_text(encoding="utf-8"))
+        record = wrapper["state"]["active_checkpoint"]
+        record["api_retry_count"] = 1
+        record["pending_call"] = {"attempt": 0, "call_index": 1, "recovery_kind": "api_retry",
+                                  "session_id": None, "continuation_count": 0, "api_retry_count": 1}
+        state_path.write_text(json.dumps(wrapper), encoding="utf-8")
+
+        class ResumeMaker:
+            def __init__(inner, root): inner.root, inner.calls, inner.sessions, inner.prompts = root, 0, [], []
+            def run(inner, prompt, session_id=None):
+                inner.calls += 1; inner.sessions.append(session_id); inner.prompts.append(prompt)
+                name = "cp1.txt" if inner.calls == 1 else "cp2.txt"
+                (inner.root / name).write_text(f"resumed-{inner.calls}\n", encoding="utf-8")
+                return ClaudeInvocation(MakerResult("DONE", "base", [name], [], [], "done"),
+                                        f"fresh-session-{inner.calls}", 0.05, 1)
+        resumed_maker = ResumeMaker(self.root)
+        resumed_engine = PhaseEngine(self.root, dict(self.config, max_api_connection_retries=1), resumed_maker,
+                                     self.Codex(["PASS", "PASS"]), self.budget(), harness_runner=self.harness())
+        resumed = resumed_engine.run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("READY_TO_COMMIT", resumed["state"], resumed)
+        self.assertIsNone(resumed_maker.sessions[0])
+        self.assertNotIn("CONTINUE_CHECKPOINT", resumed_maker.prompts[0])
+
+    def test_api_retry_resume_cannot_repeat_allowance_after_crash(self):
+        failure = ProcessFailure(API_CONNECTION_ERROR, "conn", return_code=1,
+                                 metadata={"subtype": "error_api_connection"})
+        setup_config = dict(self.config); setup_config["max_api_connection_retries"] = 0
+        setup_maker = self.RecoveringMaker(self.root, [failure])
+        setup_engine = PhaseEngine(self.root, setup_config, setup_maker, self.Codex(), self.budget(),
+                                   harness_runner=self.harness())
+        setup_engine.run(self.manifest(), execute=True)
+
+        state_path = self.root / ".loop" / "state.json"
+        wrapper = json.loads(state_path.read_text(encoding="utf-8"))
+        record = wrapper["state"]["active_checkpoint"]
+        record["api_retry_count"] = 1
+        record["pending_call"] = {"attempt": 0, "call_index": 1, "recovery_kind": "api_retry",
+                                  "session_id": None, "continuation_count": 0, "api_retry_count": 1}
+        state_path.write_text(json.dumps(wrapper), encoding="utf-8")
+
+        class FailingAgainMaker:
+            def __init__(inner, root): inner.root, inner.calls, inner.sessions = root, 0, []
+            def run(inner, prompt, session_id=None):
+                inner.calls += 1; inner.sessions.append(session_id)
+                raise ProcessFailure(API_CONNECTION_ERROR, "conn again", return_code=1,
+                                     metadata={"subtype": "error_api_connection"})
+        resumed_maker = FailingAgainMaker(self.root)
+        resumed_engine = PhaseEngine(self.root, dict(self.config, max_api_connection_retries=1), resumed_maker,
+                                     self.Codex(), self.budget(), harness_runner=self.harness())
+        resumed = resumed_engine.run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("BLOCKED", resumed["state"]); self.assertEqual(API_CONNECTION_ERROR, resumed["stop_reason"])
+        self.assertEqual(1, resumed_maker.calls)
+
+    def test_resume_ambiguous_recovery_state_fails_closed(self):
+        failure = ProcessFailure(API_CONNECTION_ERROR, "conn", return_code=1,
+                                 metadata={"subtype": "error_api_connection"})
+        setup_config = dict(self.config); setup_config["max_api_connection_retries"] = 0
+        cases = [
+            {"attempt": 0, "call_index": 1, "recovery_kind": "continuation", "session_id": None},
+            {"attempt": 0, "call_index": 1, "recovery_kind": "api_retry", "session_id": "should-be-null"},
+            {"attempt": 1, "call_index": 1, "recovery_kind": "continuation", "session_id": "sess"},
+            {"attempt": 0, "call_index": 1, "recovery_kind": "unknown", "session_id": None},
+            {"attempt": 0, "call_index": "not-an-int", "recovery_kind": None, "session_id": None},
+        ]
+        for pending in cases:
+            with self.subTest(pending=pending):
+                setup_maker = self.RecoveringMaker(self.root, [failure])
+                setup_engine = PhaseEngine(self.root, setup_config, setup_maker, self.Codex(), self.budget(),
+                                           harness_runner=self.harness())
+                state = setup_engine.run(self.manifest(), execute=True)
+                self.assertEqual("BLOCKED", state["state"])
+                state_path = self.root / ".loop" / "state.json"
+                wrapper = json.loads(state_path.read_text(encoding="utf-8"))
+                wrapper["state"]["active_checkpoint"]["pending_call"] = pending
+                state_path.write_text(json.dumps(wrapper), encoding="utf-8")
+                resumed_maker = self.Maker(self.root)
+                resumed = self.engine(maker=resumed_maker).run(self.manifest(), execute=True, resume=True)
+                self.assertEqual("RESUME_RECOVERY_STATE_INCOMPLETE", resumed["stop_reason"])
+                self.assertEqual(0, resumed_maker.calls)
+
+    def test_repeated_recoverable_failures_block_after_exactly_one_continuation(self):
+        for kind, subtype in ((MODEL_BUDGET_EXHAUSTED, "error_max_budget"), (MODEL_MAX_TURNS, "error_max_turns")):
+            with self.subTest(kind=kind):
+                first = ProcessFailure(kind, "first", return_code=1,
+                                       metadata={"session_id": "sess-1", "subtype": subtype})
+                second = ProcessFailure(kind, "second", return_code=1,
+                                        metadata={"session_id": "sess-1", "subtype": subtype})
+                maker = self.RecoveringMaker(self.root, [first, second])
+                state = self.engine(maker=maker).run(self.manifest(), execute=True)
+                self.assertEqual("BLOCKED", state["state"]); self.assertEqual(kind, state["stop_reason"])
+                self.assertEqual(2, maker.calls)
+                self.assertEqual(1, state["active_checkpoint"]["continuation_count"])
+                self.assertEqual(2, state["maker_calls"]); self.assertEqual(2, state["model_calls"])
+                (self.root / "cp1.txt").write_text("one-before\n", encoding="utf-8")
+
+    def _crash_on_nth_claude_before_call(self, n):
+        original = PhaseEngine._before_call
+        calls = []
+        def patched(inner, state, manifest, role):
+            result = original(inner, state, manifest, role)
+            if role == "claude":
+                calls.append(1)
+                if len(calls) == n:
+                    raise SystemExit("simulated crash before next model call")
+            return result
+        return patched
+
+    def test_continuation_recovery_transition_persists_before_next_call_and_survives_crash(self):
+        failure = ProcessFailure(MODEL_BUDGET_EXHAUSTED, "budget exhausted", return_code=1,
+                                 metadata={"session_id": "crash-session", "total_cost_usd": 0.1,
+                                           "num_turns": 5, "subtype": "error_max_budget"})
+        maker = self.RecoveringMaker(self.root, [failure])
+        engine = PhaseEngine(self.root, dict(self.config, max_maker_continuations=1), maker,
+                             self.Codex(), self.budget(), harness_runner=self.harness())
+        with patch.object(PhaseEngine, "_before_call", self._crash_on_nth_claude_before_call(3)):
+            with self.assertRaises(SystemExit):
+                engine.run(self.manifest(), execute=True)
+        self.assertEqual(1, maker.calls)
+
+        wrapper = json.loads((self.root / ".loop" / "state.json").read_text(encoding="utf-8"))
+        crashed = wrapper["state"]
+        record = crashed["active_checkpoint"]
+        self.assertEqual(1, record["continuation_count"])
+        self.assertEqual({"attempt": 0, "call_index": 1, "recovery_kind": "continuation",
+                          "session_id": "crash-session", "continuation_count": 1, "api_retry_count": 0},
+                         record["pending_call"])
+        self.assertAlmostEqual(0.1, crashed["claude_cost_usd"], places=6)
+        self.assertEqual(1, crashed["model_calls"]); self.assertEqual(1, crashed["maker_calls"])
+
+        resumed_maker = self.Maker(self.root)
+        resumed = PhaseEngine(self.root, dict(self.config, max_maker_continuations=1), resumed_maker,
+                             self.Codex(["PASS", "PASS"]), self.budget(), harness_runner=self.harness()
+                             ).run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("READY_TO_COMMIT", resumed["state"], resumed)
+        self.assertEqual(2, resumed_maker.calls)
+        self.assertEqual("crash-session", resumed_maker.sessions[0])
+        self.assertIn("CONTINUE_CHECKPOINT", resumed_maker.prompts[0])
+        self.assertIsNone(resumed_maker.sessions[1])
+        self.assertEqual(2, len(resumed["checkpoints"][0]["attempts"]))
+        self.assertAlmostEqual(0.3, resumed["claude_cost_usd"], places=6)
+        self.assertEqual(5, resumed["model_calls"]); self.assertEqual(3, resumed["maker_calls"])
+
+    def test_api_retry_recovery_transition_persists_before_next_call_and_survives_crash(self):
+        failure = ProcessFailure(API_CONNECTION_ERROR, "conn", return_code=1,
+                                 metadata={"session_id": "dropped-session", "total_cost_usd": 0.0,
+                                           "subtype": "error_api_connection"})
+        maker = self.RecoveringMaker(self.root, [failure])
+        engine = PhaseEngine(self.root, dict(self.config, max_api_connection_retries=1), maker,
+                             self.Codex(), self.budget(), harness_runner=self.harness())
+        with patch.object(PhaseEngine, "_before_call", self._crash_on_nth_claude_before_call(3)):
+            with self.assertRaises(SystemExit):
+                engine.run(self.manifest(), execute=True)
+        self.assertEqual(1, maker.calls)
+
+        wrapper = json.loads((self.root / ".loop" / "state.json").read_text(encoding="utf-8"))
+        crashed = wrapper["state"]
+        record = crashed["active_checkpoint"]
+        self.assertEqual(1, record["api_retry_count"])
+        self.assertEqual({"attempt": 0, "call_index": 1, "recovery_kind": "api_retry",
+                          "session_id": None, "continuation_count": 0, "api_retry_count": 1},
+                         record["pending_call"])
+
+        resumed_maker = self.Maker(self.root)
+        resumed = PhaseEngine(self.root, dict(self.config, max_api_connection_retries=1), resumed_maker,
+                             self.Codex(["PASS", "PASS"]), self.budget(), harness_runner=self.harness()
+                             ).run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("READY_TO_COMMIT", resumed["state"], resumed)
+        self.assertIsNone(resumed_maker.sessions[0])
+        self.assertNotIn("CONTINUE_CHECKPOINT", resumed_maker.prompts[0])
+        self.assertEqual(2, len(resumed["checkpoints"][0]["attempts"]))
+        self.assertAlmostEqual(0.2, resumed["claude_cost_usd"], places=6)
+        self.assertEqual(5, resumed["model_calls"]); self.assertEqual(3, resumed["maker_calls"])
+
+    def test_resume_missing_pending_call_after_recorded_recovery_decision_fails_closed(self):
+        failure = ProcessFailure(MODEL_BUDGET_EXHAUSTED, "budget exhausted", return_code=1,
+                                 metadata={"session_id": "crash-session", "subtype": "error_max_budget"})
+        setup_config = dict(self.config); setup_config["max_maker_continuations"] = 0
+        setup_maker = self.RecoveringMaker(self.root, [failure])
+        setup_engine = PhaseEngine(self.root, setup_config, setup_maker, self.Codex(), self.budget(),
+                                   harness_runner=self.harness())
+        setup_engine.run(self.manifest(), execute=True)
+
+        state_path = self.root / ".loop" / "state.json"
+        wrapper = json.loads(state_path.read_text(encoding="utf-8"))
+        record = wrapper["state"]["active_checkpoint"]
+        record["continuation_count"] = 1
+        record["pending_call"] = None
+        state_path.write_text(json.dumps(wrapper), encoding="utf-8")
+
+        resumed_maker = self.Maker(self.root)
+        resumed = self.engine(maker=resumed_maker).run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("RESUME_RECOVERY_STATE_INCOMPLETE", resumed["stop_reason"])
+        self.assertEqual(0, resumed_maker.calls)
+
+    def test_resume_inconsistent_recovery_counters_fail_closed(self):
+        failure = ProcessFailure(MODEL_BUDGET_EXHAUSTED, "budget exhausted", return_code=1,
+                                 metadata={"session_id": "crash-session", "subtype": "error_max_budget"})
+        setup_config = dict(self.config); setup_config["max_maker_continuations"] = 0
+        setup_maker = self.RecoveringMaker(self.root, [failure])
+        setup_engine = PhaseEngine(self.root, setup_config, setup_maker, self.Codex(), self.budget(),
+                                   harness_runner=self.harness())
+        setup_engine.run(self.manifest(), execute=True)
+
+        state_path = self.root / ".loop" / "state.json"
+        wrapper = json.loads(state_path.read_text(encoding="utf-8"))
+        record = wrapper["state"]["active_checkpoint"]
+        record["continuation_count"] = 1
+        record["pending_call"] = {"attempt": 0, "call_index": 1, "recovery_kind": "continuation",
+                                  "session_id": "crash-session", "continuation_count": 5, "api_retry_count": 0}
+        state_path.write_text(json.dumps(wrapper), encoding="utf-8")
+
+        resumed_maker = self.Maker(self.root)
+        resumed = self.engine(maker=resumed_maker).run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("RESUME_RECOVERY_STATE_INCOMPLETE", resumed["stop_reason"])
+        self.assertEqual(0, resumed_maker.calls)
 
 
 if __name__ == "__main__": unittest.main()

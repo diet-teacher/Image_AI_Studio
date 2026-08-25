@@ -16,7 +16,8 @@ from tools.project_harness.runner import execute_profile
 
 from .goal import GoalError, path_allowed
 from .models import VerifierResult
-from .process import PROCESS_START_FAILED, TIMEOUT, ProcessFailure
+from .process import (API_CONNECTION_ERROR, MODEL_BUDGET_EXHAUSTED, MODEL_MAX_TURNS,
+                      PROCESS_START_FAILED, TIMEOUT, ProcessFailure)
 from .prompts import MAKER, VERIFIER
 from .repository import base_commit, file_snapshot, git, worktree_snapshot
 
@@ -227,75 +228,188 @@ class PhaseEngine:
                   "baseline_protected": guard["protected"], "baseline_head": guard["head"],
                   "baseline_staged": guard["staged"], "last_observed_snapshot": guard["repository"],
                   "last_observed_protected": guard["protected"], "attempts": [], "next_attempt": 0,
-                  "session_id": None, "rework": ""}
+                  "session_id": None, "rework": "", "continuation_count": 0, "api_retry_count": 0,
+                  "pending_call": None}
         state["active_checkpoint"] = record
         self._persist(state, "checkpoint-baseline", record)
         return record
 
+    def _recovery_limits(self) -> tuple[int, int]:
+        def _bounded(value: object, default: int = 1) -> int:
+            return int(value) if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else default
+        return (_bounded(self.config.get("max_maker_continuations", 1)),
+                _bounded(self.config.get("max_api_connection_retries", 1)))
+
+    @staticmethod
+    def _full_maker_prompt(entry: dict, goal: dict, record: dict) -> str:
+        return MAKER.format(goal=json.dumps(goal), checkpoint=entry["checkpoint_id"], rework=record.get("rework", ""))
+
+    @staticmethod
+    def _continuation_prompt(entry: dict, goal: dict) -> str:
+        return ("CONTINUE_CHECKPOINT: resume this exact session and finish only "
+               f"checkpoint {entry['checkpoint_id']} without restarting or expanding "
+               f"scope.\nGOAL:\n{json.dumps(goal)}")
+
+    @staticmethod
+    def _pending_call_record(record: dict, attempt: int, call_index: int, recovery_kind, session_id) -> dict:
+        return {"attempt": attempt, "call_index": call_index, "recovery_kind": recovery_kind,
+                "session_id": session_id, "continuation_count": record["continuation_count"],
+                "api_retry_count": record["api_retry_count"]}
+
+    def _pending_call_intent(self, record: dict, entry: dict, goal: dict, attempt: int):
+        """Reconstruct the exact next maker call from durable state.
+
+        Returns (session_id, prompt, recovery_kind, call_index, error). ``error`` is
+        non-None when a persisted ``pending_call`` exists but is incomplete or
+        ambiguous, in which case resume must fail closed rather than guess.
+        """
+        pending = record.get("pending_call")
+        if pending is None:
+            attempts = record.get("attempts") or []
+            last = attempts[-1] if attempts else None
+            if isinstance(last, dict) and last.get("attempt") == attempt and "maker_error" in last:
+                return None, None, None, None, "RESUME_RECOVERY_STATE_INCOMPLETE"
+            return record.get("session_id"), self._full_maker_prompt(entry, goal, record), None, 0, None
+        if not isinstance(pending, dict) or pending.get("attempt") != attempt:
+            return None, None, None, None, "RESUME_RECOVERY_STATE_INCOMPLETE"
+        if (pending.get("continuation_count") != record.get("continuation_count")
+                or pending.get("api_retry_count") != record.get("api_retry_count")):
+            return None, None, None, None, "RESUME_RECOVERY_STATE_INCOMPLETE"
+        call_index = pending.get("call_index")
+        if not isinstance(call_index, int) or isinstance(call_index, bool) or call_index < 0:
+            return None, None, None, None, "RESUME_RECOVERY_STATE_INCOMPLETE"
+        recovery_kind, session_id = pending.get("recovery_kind"), pending.get("session_id")
+        if recovery_kind is None:
+            prompt = self._full_maker_prompt(entry, goal, record)
+        elif recovery_kind == "continuation":
+            if not isinstance(session_id, str) or not session_id:
+                return None, None, None, None, "RESUME_RECOVERY_STATE_INCOMPLETE"
+            prompt = self._continuation_prompt(entry, goal)
+        elif recovery_kind == "api_retry":
+            if session_id is not None:
+                return None, None, None, None, "RESUME_RECOVERY_STATE_INCOMPLETE"
+            prompt = self._full_maker_prompt(entry, goal, record)
+        else:
+            return None, None, None, None, "RESUME_RECOVERY_STATE_INCOMPLETE"
+        return session_id, prompt, recovery_kind, call_index, None
+
     def _run_checkpoints(self, state: dict, manifest: dict, start_index: int) -> dict:
+        max_continuations, max_api_retries = self._recovery_limits()
         for index in range(start_index, len(manifest["checkpoints"])):
             entry, goal = manifest["checkpoints"][index], manifest["checkpoints"][index]["goal_value"]
             state["current_checkpoint_index"], state["current_checkpoint_id"] = index, entry["checkpoint_id"]
             record = state.get("active_checkpoint") or self._new_checkpoint(state, entry)
             if not record:
                 return self._stop(state, "BLOCKED", "CHECKPOINT_BASELINE_GIT_INTEGRITY_FAILURE")
+            record.setdefault("continuation_count", 0)
+            record.setdefault("api_retry_count", 0)
+            record.setdefault("pending_call", None)
             max_reworks = min(manifest["max_rework_rounds"],
                               int(self.config.get("max_rework_rounds", manifest["max_rework_rounds"])))
             for attempt in range(int(record.get("next_attempt", 0)), max_reworks + 1):
-                allowed, reason = self._before_call(state, manifest, "claude")
-                if not allowed:
-                    return self._stop(state, "BLOCKED", reason, record)
                 record.update({"stage": "MAKER_RUNNING", "next_attempt": attempt})
-                self._persist(state, "maker-before", record)
-                before = git_guard(self.root)
-                state["model_calls"] += 1; state["maker_calls"] += 1
-                invocation = None; maker_error = None; interrupted = False
-                try:
-                    invocation = self.maker.run(MAKER.format(
-                        goal=json.dumps(goal), checkpoint=entry["checkpoint_id"],
-                        rework=record.get("rework", "")), record.get("session_id"))
-                except KeyboardInterrupt:
-                    interrupted = True
-                except Exception as exc:
-                    maker_error = exc
-                after = git_guard(self.root)
-                maker_guard = guard_diagnostics(before, after, state["base_commit"], goal["allowed_files"], self.root)
-                baseline_files, baseline_diff, baseline_diagnostics = snapshot_delta(record["baseline"], after["repository"])
-                maker_record = {"attempt": attempt, "guard": maker_guard,
-                                "checkpoint_changed_files": baseline_files, "checkpoint_diff": baseline_diff,
-                                "checkpoint_file_diagnostics": baseline_diagnostics}
-                record["attempts"].append(maker_record)
-                record["last_observed_snapshot"], record["last_observed_protected"] = after["repository"], after["protected"]
-                record["stage"] = "MAKER_FINISHED"; self._persist(state, "maker-after", maker_record)
-                cost_invalid = False
-                if invocation is not None:
-                    cost = invocation.total_cost_usd
-                    if not isinstance(cost, (int, float)) or isinstance(cost, bool) or cost < 0:
-                        cost_invalid = True
-                    else:
-                        state["claude_cost_usd"] += float(cost)
-                    record["session_id"] = invocation.session_id
-                    maker_record.update({"session_id": invocation.session_id, "total_cost_usd": cost,
-                                         "num_turns": invocation.num_turns, "maker_status": invocation.result.status})
+                session_id, prompt, recovery_kind, call_index, intent_error = self._pending_call_intent(
+                    record, entry, goal, attempt)
+                if intent_error:
+                    return self._stop(state, "BLOCKED", intent_error, record)
+                maker_record = None
+                while True:
+                    allowed, reason = self._before_call(state, manifest, "claude")
+                    if not allowed:
+                        return self._stop(state, "BLOCKED", reason, record)
+                    record["pending_call"] = self._pending_call_record(record, attempt, call_index,
+                                                                       recovery_kind, session_id)
+                    state["model_calls"] += 1; state["maker_calls"] += 1
+                    self._persist(state, "maker-before", record)
+                    before = git_guard(self.root)
+                    invocation = None; maker_error = None; interrupted = False
+                    try:
+                        invocation = self.maker.run(prompt, session_id)
+                    except KeyboardInterrupt:
+                        interrupted = True
+                    except Exception as exc:
+                        maker_error = exc
+                    after = git_guard(self.root)
+                    maker_guard = guard_diagnostics(before, after, state["base_commit"], goal["allowed_files"], self.root)
+                    baseline_files, baseline_diff, baseline_diagnostics = snapshot_delta(record["baseline"], after["repository"])
+                    record["pending_call"] = None
+                    maker_record = {"attempt": attempt, "call_index": call_index, "recovery_kind": recovery_kind,
+                                    "guard": maker_guard, "checkpoint_changed_files": baseline_files,
+                                    "checkpoint_diff": baseline_diff, "checkpoint_file_diagnostics": baseline_diagnostics}
+                    record["attempts"].append(maker_record)
+                    record["last_observed_snapshot"], record["last_observed_protected"] = after["repository"], after["protected"]
+                    record["stage"] = "MAKER_FINISHED"; self._persist(state, "maker-after", maker_record)
+
+                    cost_invalid, telemetry_session = False, None
+                    if invocation is not None:
+                        cost = invocation.total_cost_usd
+                        if not isinstance(cost, (int, float)) or isinstance(cost, bool) or cost < 0:
+                            cost_invalid = True
+                        else:
+                            state["claude_cost_usd"] += float(cost)
+                        telemetry_session = invocation.session_id
+                        maker_record.update({"session_id": invocation.session_id, "total_cost_usd": cost,
+                                             "num_turns": invocation.num_turns, "maker_status": invocation.result.status})
+                    elif isinstance(maker_error, ProcessFailure):
+                        meta = maker_error.metadata
+                        maker_record["maker_error"] = maker_error.diagnostics()
+                        meta_cost = meta.get("total_cost_usd")
+                        if isinstance(meta_cost, (int, float)) and not isinstance(meta_cost, bool) and meta_cost >= 0:
+                            state["claude_cost_usd"] += float(meta_cost)
+                        if isinstance(meta.get("session_id"), str) and meta["session_id"]:
+                            telemetry_session = meta["session_id"]
+                        maker_record.update({"session_id": telemetry_session, "total_cost_usd": meta.get("total_cost_usd"),
+                                             "num_turns": meta.get("num_turns")})
+                    if telemetry_session:
+                        record["session_id"] = telemetry_session
+                    maker_record["continuation_count"] = record["continuation_count"]
+                    maker_record["api_retry_count"] = record["api_retry_count"]
                     self._persist(state, "maker-result", maker_record)
-                if has_guard_violation(maker_guard):
-                    return self._stop(state, "BLOCKED", "MAKER_SAFETY_VIOLATION", maker_record)
-                if invocation is not None:
-                    if cost_invalid:
+
+                    if has_guard_violation(maker_guard):
+                        return self._stop(state, "BLOCKED", "MAKER_SAFETY_VIOLATION", maker_record)
+                    if invocation is not None and cost_invalid:
                         return self._stop(state, "BLOCKED", "CLAUDE_COST_UNKNOWN", maker_record)
                     if state["claude_cost_usd"] > manifest["max_claude_cost_usd"]:
                         return self._stop(state, "BLOCKED", "MAX_CLAUDE_COST_USD", maker_record)
-                    if invocation.result.status.upper() == "BLOCKED":
-                        return self._stop(state, "BLOCKED", "MAKER_BLOCKED", maker_record)
-                if interrupted:
-                    return self._stop(state, "BLOCKED", "INTERRUPTED", maker_record)
-                if maker_error is not None:
+                    if invocation is not None:
+                        if invocation.result.status.upper() == "BLOCKED":
+                            return self._stop(state, "BLOCKED", "MAKER_BLOCKED", maker_record)
+                        break
+                    if interrupted:
+                        return self._stop(state, "BLOCKED", "INTERRUPTED", maker_record)
+
+                    kind = maker_error.kind if isinstance(maker_error, ProcessFailure) else None
+                    if kind in (MODEL_BUDGET_EXHAUSTED, MODEL_MAX_TURNS):
+                        session = maker_error.metadata.get("session_id")
+                        next_allowed, _ = self._before_call(state, manifest, "claude")
+                        if (isinstance(session, str) and session
+                                and record["continuation_count"] < max_continuations and next_allowed):
+                            record["continuation_count"] += 1
+                            session_id, call_index, recovery_kind = session, call_index + 1, "continuation"
+                            prompt = self._continuation_prompt(entry, goal)
+                            record["pending_call"] = self._pending_call_record(record, attempt, call_index,
+                                                                               recovery_kind, session_id)
+                            self._persist(state, "recovery-transition", record)
+                            continue
+                        return self._stop(state, "BLOCKED", kind, maker_record)
+                    if kind == API_CONNECTION_ERROR:
+                        next_allowed, _ = self._before_call(state, manifest, "claude")
+                        if (not maker_guard["changed_files"]
+                                and record["api_retry_count"] < max_api_retries and next_allowed):
+                            record["api_retry_count"] += 1
+                            session_id, call_index, recovery_kind = None, call_index + 1, "api_retry"
+                            record["pending_call"] = self._pending_call_record(record, attempt, call_index,
+                                                                               recovery_kind, session_id)
+                            self._persist(state, "recovery-transition", record)
+                            continue
+                        return self._stop(state, "BLOCKED", kind, maker_record)
                     if isinstance(maker_error, ProcessFailure):
-                        maker_record["maker_error"] = maker_error.diagnostics()
                         final = "BLOCKED" if maker_error.kind in {PROCESS_START_FAILED, TIMEOUT} else "FAILED"
                         return self._stop(state, final, f"MAKER_ERROR: {maker_error.kind}", maker_record)
                     maker_record["maker_error"] = {"type": type(maker_error).__name__, "error": str(maker_error)[-4000:]}
                     return self._stop(state, "FAILED", "MAKER_ERROR", maker_record)
+
                 stopped = self._run_tests_and_verifier(state, manifest, record, maker_record, goal, attempt, max_reworks)
                 if stopped is not None:
                     if stopped.get("state") in {"BLOCKED", "FAILED", "READY_TO_COMMIT"}:

@@ -23,12 +23,12 @@ class ClaudeCLIAdapter:
         self.executable = "claude"
 
     def run(self, prompt: str, session_id: str | None = None) -> ClaudeInvocation:
-        argv = [self.executable, "-p", prompt, "--output-format", "json", "--json-schema", json.dumps(MAKER_SCHEMA),
+        argv = [self.executable, "-p", "--output-format", "json", "--json-schema", json.dumps(MAKER_SCHEMA),
                 "--max-budget-usd", str(self.max_budget_usd), "--permission-mode", "acceptEdits",
                 "--allowedTools", "Read,Edit,Write,Glob,Grep", "--disallowedTools", "Bash"]
         if session_id:
             argv += ["--resume", session_id]
-        process = run_json_process(argv, self.root, self.timeout)
+        process = run_json_process(argv, self.root, self.timeout, stdin_text=prompt)
         actual_session = process.metadata.get("session_id")
         if not isinstance(actual_session, str) or not actual_session:
             raise ValueError("Claude JSON envelope has no valid top-level session_id")
@@ -41,9 +41,9 @@ class CodexCLIAdapter:
         self.root, self.timeout, self.schema_dir, self.executable = root, timeout, schema_dir, executable
 
     def _run(self, prompt: str, schema_name: str) -> dict:
-        argv = [*codex_exec_prefix(self.executable, self.root), prompt, "--json", "--ephemeral",
+        argv = [*codex_exec_prefix(self.executable, self.root), "--json", "--ephemeral",
                 "--output-schema", str(self.schema_dir / schema_name)]
-        return run_json_process(argv, self.root, self.timeout, json_lines=True).payload
+        return run_json_process(argv, self.root, self.timeout, json_lines=True, stdin_text=prompt).payload
 
     def verify(self, prompt: str) -> VerifierResult:
         return VerifierResult(**self._run(prompt, "verifier.schema.json"))
