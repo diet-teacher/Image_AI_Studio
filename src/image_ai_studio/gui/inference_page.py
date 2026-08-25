@@ -9,7 +9,17 @@ InferenceResult fields (predicted class, confidence, class probabilities,
 inference duration) after a successful run, without recalculating any
 prediction values. CP4 adds `is_inference_active()`/`request_close()` so
 MainWindow can defer window close until an active run finishes naturally
-(no cancellation API)."""
+(no cancellation API).
+
+Phase 7 CP2: the Model JSON field is now optional. When left blank,
+`_build_request()` derives `training_output_dir/model_definition.json`
+(the canonical artifact `imagefolder_workflow.py` now writes alongside
+`best_model_state_dict.pt`/`class_mapping.json`) the same way it already
+derives those two fixed paths. An explicit Model JSON value still wins --
+this keeps outputs produced before Phase 7 (no `model_definition.json`)
+working unchanged. No ModelSpec parsing happens here; a missing canonical
+file still surfaces only through the existing `build_inference_request` ->
+`InferenceController` -> worker `failed` path."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -45,6 +55,11 @@ def _detect_device_choices() -> list[str]:
 
 
 _RESULT_PLACEHOLDER = "--"
+
+_MODEL_DEFINITION_FILENAME = "model_definition.json"
+"""training output directory에 `imagefolder_workflow.py`가 저장하는 canonical
+ModelSpec 파일명 -- `best_model_state_dict.pt`/`class_mapping.json`과 동일하게
+고정된 이름으로 derive한다(Phase 7 CP2)."""
 
 
 def _format_confidence(confidence: float) -> str:
@@ -114,11 +129,17 @@ class InferencePage(QWidget):
 
     def _build_request(self) -> InferenceRequest:
         """Convert widget values to InferenceRequest. Derives the two fixed
-        artifact paths from the training output directory."""
+        artifact paths from the training output directory. Model JSON is a
+        third derived path (`training_output_dir/model_definition.json`)
+        unless the user typed an explicit override -- that override always
+        wins, so pre-Phase-7 outputs (no `model_definition.json`) keep
+        working exactly as before (Phase 7 CP2)."""
         output_dir = self._training_output_dir_edit.text().strip()
         output_path = Path(output_dir) if output_dir else Path("")
+        model_json_override = self._model_json_edit.text().strip()
+        model_json_path = model_json_override or str(output_path / _MODEL_DEFINITION_FILENAME)
         return build_inference_request(
-            model_json_path=self._model_json_edit.text().strip(),
+            model_json_path=model_json_path,
             state_dict_path=str(output_path / "best_model_state_dict.pt"),
             class_mapping_path=str(output_path / "class_mapping.json"),
             image_path=self._image_path_edit.text().strip(),
@@ -150,6 +171,9 @@ class InferencePage(QWidget):
         form.addRow("Training Output Dir:", output_row)
 
         self._model_json_edit = QLineEdit()
+        self._model_json_edit.setPlaceholderText(
+            f"Auto: <Training Output Dir>/{_MODEL_DEFINITION_FILENAME} (leave blank to use it)"
+        )
         self._browse_model_button = QPushButton("Browse...")
         self._browse_model_button.clicked.connect(self._browse_model_json)
         model_row = QHBoxLayout()

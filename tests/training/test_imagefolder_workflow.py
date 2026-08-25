@@ -17,7 +17,7 @@ from PIL import Image
 from torch.utils.data import DataLoader
 
 from image_ai_studio.model_definition.builder import build_model
-from image_ai_studio.model_definition.serialization import save_model_spec
+from image_ai_studio.model_definition.serialization import load_model_spec, save_model_spec
 from image_ai_studio.model_definition.specs import (
     BatchNorm2dSpec,
     Conv2dSpec,
@@ -37,6 +37,7 @@ from image_ai_studio.training.imagefolder_resume import (
 from image_ai_studio.training.imagefolder_workflow import (
     ImageFolderWorkflowRequest,
     ImageFolderWorkflowResult,
+    _MODEL_DEFINITION_FILENAME,
     _capture_cuda_rng_state,
     _cuda_deterministic_context,
     _is_cuda_device,
@@ -2751,3 +2752,143 @@ def test_workflow_cuda_pin_memory_non_blocking_resume_boundary_option_change_exa
     # scaler_state_dict는 FP32 기본값 그대로 항상 None이다.
     assert payload_a["scaler_state_dict"] is None
     assert payload_b["scaler_state_dict"] is None
+
+
+# -- Phase 7 checkpoint 1: portable model_definition.json artifact -----------
+
+
+def test_workflow_saves_model_definition_json_at_canonical_path(tmp_path: Path) -> None:
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    output_dir = tmp_path / "out"
+
+    run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+            output_dir=output_dir,
+            export_torchscript=False,
+            seed=SEED,
+        )
+    )
+
+    assert _MODEL_DEFINITION_FILENAME == "model_definition.json"
+    model_definition_path = output_dir / _MODEL_DEFINITION_FILENAME
+    assert model_definition_path.exists()
+
+
+def test_model_definition_json_round_trips_regardless_of_source_formatting_and_filename(
+    tmp_path: Path,
+) -> None:
+    """원본 --model-json 파일이 save_model_spec()이 생성하는 표준
+    포맷팅과 다르거나(공백 없는 압축 JSON) 파일명이 고정 산출물 이름과
+    달라도, output_dir/model_definition.json은 실제로 검증/학습에 쓰인
+    ModelSpec과 의미적으로 동일해야 한다(바이트 단위 비교가 아니라
+    load_model_spec()으로 다시 읽은 ModelSpec 객체 비교)."""
+    _make_standard_dataset(tmp_path)
+    spec = _spec(name="compact_source_model")
+    from image_ai_studio.model_definition.serialization import model_spec_to_dict
+
+    compact_path = tmp_path / "not_model_definition.json"
+    compact_path.write_text(json.dumps(model_spec_to_dict(spec)), encoding="utf-8")  # no indent, 다른 파일명
+    output_dir = tmp_path / "out"
+
+    run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=compact_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+            output_dir=output_dir,
+            export_torchscript=False,
+            seed=SEED,
+        )
+    )
+
+    round_tripped = load_model_spec(output_dir / _MODEL_DEFINITION_FILENAME)
+    assert round_tripped == spec
+
+
+def test_model_definition_json_replaced_by_later_run_with_different_spec(tmp_path: Path) -> None:
+    """같은 output_dir을 재사용하는 두 번째 실행은 model_definition.json을
+    (첫 실행의 spec이 아니라) 두 번째 실행에서 실제로 검증/학습에 쓰인
+    spec으로 결정적으로 교체해야 한다."""
+    _make_standard_dataset(tmp_path)
+    output_dir = tmp_path / "out"
+
+    first_spec = _spec(name="first_model")
+    first_model_json_path = _write_model_json(tmp_path / "first", first_spec)
+    run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=first_model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+            output_dir=output_dir,
+            export_torchscript=False,
+            seed=SEED,
+        )
+    )
+
+    second_spec = ModelSpec(
+        name="second_model",
+        input_shape=INPUT_SHAPE,
+        layers=[
+            FlattenSpec(),
+            LinearSpec(out_features=32),
+            ReLUSpec(),
+            LinearSpec(out_features=2),
+        ],
+    )
+    second_model_json_path = _write_model_json(tmp_path / "second", second_spec)
+    run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=second_model_json_path,
+            dataset_root=tmp_path,
+            training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+            output_dir=output_dir,
+            export_torchscript=False,
+            seed=SEED,
+        )
+    )
+
+    round_tripped = load_model_spec(output_dir / _MODEL_DEFINITION_FILENAME)
+    assert round_tripped == second_spec
+    assert round_tripped != first_spec
+    # 재사용된 output_dir의 다른 고정 산출물은 여전히 존재해야 한다(삭제되지 않음).
+    assert (output_dir / "best_model_state_dict.pt").exists()
+    assert (output_dir / "class_mapping.json").exists()
+
+
+def test_model_definition_json_write_failure_propagates_and_is_not_swallowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """model_definition.json 저장이 실패하면(OSError 등) 그 예외가 그대로
+    전파돼야 한다 -- 다른 산출물 저장과 동일한 fail-fast 계약이며, 이
+    실패를 감싸거나 조용히 무시하지 않는다."""
+    import image_ai_studio.training.imagefolder_workflow as workflow_module
+
+    _make_standard_dataset(tmp_path)
+    model_json_path = _write_model_json(tmp_path, _spec())
+    output_dir = tmp_path / "out"
+
+    def raise_oserror(model_spec, path):
+        raise OSError(f"simulated write failure for {path}")
+
+    monkeypatch.setattr(workflow_module, "save_model_spec", raise_oserror)
+
+    with pytest.raises(OSError, match="simulated write failure"):
+        run_imagefolder_training_workflow(
+            ImageFolderWorkflowRequest(
+                model_json_path=model_json_path,
+                dataset_root=tmp_path,
+                training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+                output_dir=output_dir,
+                export_torchscript=False,
+                seed=SEED,
+            )
+        )
+
+    # 학습 자체가 시작되기 전에 실패해야 한다 -- best_model_state_dict.pt 등
+    # 이후 단계의 산출물이 전혀 생성되지 않았어야 한다.
+    assert not (output_dir / "best_model_state_dict.pt").exists()
+    assert not (output_dir / "training_history.json").exists()

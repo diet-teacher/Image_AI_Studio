@@ -36,7 +36,7 @@ from torch.utils.data import DataLoader
 
 from image_ai_studio.export.torchscript_exporter import TorchScriptExporter
 from image_ai_studio.model_definition.builder import build_model
-from image_ai_studio.model_definition.serialization import load_model_spec
+from image_ai_studio.model_definition.serialization import load_model_spec, save_model_spec
 from image_ai_studio.model_definition.specs import ModelSpec
 from image_ai_studio.model_definition.validation import validate_model_spec
 from image_ai_studio.training.checkpoint import (
@@ -84,6 +84,11 @@ SEED = 20260730
 
 _TORCHSCRIPT_MODEL_FILENAME = "model.ts"
 _TORCHSCRIPT_METADATA_FILENAME = "model_metadata.json"
+# Phase 7 checkpoint 1: 학습에 실제로 쓰인, 검증까지 끝난 ModelSpec을
+# output_dir 안에 고정 파일명으로 함께 남긴다 -- output_dir 하나만 있으면
+# (원본 --model-json 파일의 위치/파일명/포맷팅과 무관하게) 그 학습 결과가
+# 어떤 모델 구조에서 나왔는지 다시 알 수 있게 하기 위함(portable artifact).
+_MODEL_DEFINITION_FILENAME = "model_definition.json"
 
 
 @dataclass
@@ -578,6 +583,16 @@ def run_imagefolder_training_workflow(
 
     output_dir = request.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Phase 7 checkpoint 1: 이미 load_model_spec()으로 읽고
+    # validate_model_spec()으로 검증까지 마친 바로 그 model_spec을 다시
+    # 직렬화한다 -- request.model_json_path의 원본 bytes를 복사하지 않는다
+    # (포맷팅/공백 차이와 무관하게 항상 정규화된 표현을 남기기 위함, 그리고
+    # 파일이 존재하지 않게 될 미래의 원본 경로 이동/삭제에도 output_dir가
+    # 영향받지 않게 하기 위함). save_model_spec()은 실패를 감싸지 않고
+    # 그대로 전파한다(OSError 등) -- 다른 산출물 저장과 동일한 계약.
+    model_definition_path = output_dir / _MODEL_DEFINITION_FILENAME
+    save_model_spec(model_spec, model_definition_path)
 
     training_history_path = output_dir / "training_history.json"
     save_training_history(history, training_history_path)

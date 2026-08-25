@@ -5,7 +5,16 @@ widget-to-InferenceRequest mapping. CP2 (below) verifies the async
 Run Inference lifecycle -- Running/Finished/Failed status, control
 disable/enable, overlap prevention, off-GUI-thread backend execution,
 worker/thread reference cleanup, and rerun -- using fake backends plus
-threading.Event synchronization (same approach as test_training_page.py)."""
+threading.Event synchronization (same approach as test_training_page.py).
+
+Phase 7 CP2 (near the bottom): covers the now-optional Model JSON field --
+auto-derivation of `training_output_dir/model_definition.json` when blank,
+explicit-value override compatibility, the UI placeholder cue, missing-
+canonical-artifact failure through the existing worker/controller `failed`
+path, and that CP2/CP3/CP4 lifecycle behavior (Running/Finished/Failed,
+control restore, stale result clearing) is unaffected in auto-discovery
+mode. All still use fake backends -- no real model, CUDA, or image
+inference."""
 from __future__ import annotations
 
 import threading
@@ -926,3 +935,143 @@ def test_successful_run_removes_previous_error_and_shows_only_new_result(tmp_pat
     assert page._status_label.text() == "Finished"
     assert page._predicted_class_value_label.text() == "second_run_class"
     assert page._confidence_value_label.text() == "42.00%"
+
+
+# ===============================================================================
+# Phase 7 CP2: canonical model_definition.json auto-discovery
+# ===============================================================================
+
+
+@pytest.mark.phase7_cp2_inference_bundle_discovery
+def test_model_json_path_auto_derived_when_field_blank(tmp_path, qtbot) -> None:
+    page = _make_page(qtbot)
+    page._training_output_dir_edit.setText(str(tmp_path))
+    page._image_path_edit.setText(str(tmp_path / "image.png"))
+    # Model JSON field left blank -- must be auto-derived, not empty/invalid.
+
+    request = page._build_request()
+
+    assert request.model_json_path == tmp_path / "model_definition.json"
+
+
+@pytest.mark.phase7_cp2_inference_bundle_discovery
+def test_model_json_auto_derivation_uses_fixed_filename_and_output_dir(tmp_path, qtbot) -> None:
+    output_dir = tmp_path / "run_007"
+    output_dir.mkdir()
+    page = _make_page(qtbot)
+    page._training_output_dir_edit.setText(str(output_dir))
+    page._image_path_edit.setText(str(tmp_path / "image.png"))
+
+    request = page._build_request()
+
+    assert request.model_json_path.name == "model_definition.json"
+    assert request.model_json_path.parent == output_dir
+
+
+@pytest.mark.phase7_cp2_inference_bundle_discovery
+def test_explicit_model_json_overrides_auto_discovery(tmp_path, qtbot) -> None:
+    """explicit Model JSON은 Phase 7 이전 output(model_definition.json이
+    없는 output directory)에서도 동작해야 하므로, 값이 있으면 canonical
+    경로 대신 그 값이 그대로 request에 실린다."""
+    page = _make_page(qtbot)
+    legacy_model_json = tmp_path / "legacy_arch.json"
+    page._training_output_dir_edit.setText(str(tmp_path))
+    page._model_json_edit.setText(str(legacy_model_json))
+    page._image_path_edit.setText(str(tmp_path / "image.png"))
+
+    request = page._build_request()
+
+    assert request.model_json_path == legacy_model_json
+    assert request.model_json_path != tmp_path / "model_definition.json"
+
+
+@pytest.mark.phase7_cp2_inference_bundle_discovery
+def test_model_json_placeholder_communicates_auto_discovery(qtbot) -> None:
+    page = _make_page(qtbot)
+    assert "model_definition.json" in page._model_json_edit.placeholderText()
+
+
+@pytest.mark.phase7_cp2_inference_bundle_discovery
+def test_model_json_field_still_starts_empty(qtbot) -> None:
+    """placeholder text는 hint일 뿐 실제 값이 아니다 -- CP1의 초기 상태
+    계약(모든 path field가 비어 있음)이 그대로 유지돼야 한다."""
+    page = _make_page(qtbot)
+    assert page._model_json_edit.text() == ""
+
+
+@pytest.mark.phase7_cp2_inference_bundle_discovery
+def test_missing_canonical_model_definition_fails_through_existing_error_path(tmp_path, qtbot) -> None:
+    """Model JSON이 비어 있고 training output dir에 canonical
+    model_definition.json이 없으면, request는 존재하지 않는 canonical
+    경로로 조립되고 그 실패는 기존 worker/controller failed 경로(상태
+    표시 + controls 복원 + thread/worker cleanup)를 통해서만 드러난다.
+    real model/CUDA/image 없이, fake backend가 그 경로의 부재를 확인하고
+    실패를 던지는 것으로 이를 검증한다."""
+
+    def missing_file_backend(request):
+        assert not request.model_json_path.exists()
+        raise FileNotFoundError(f"No such file: {request.model_json_path}")
+
+    controller = InferenceController(backend=missing_file_backend)
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    page._training_output_dir_edit.setText(str(tmp_path))
+    page._image_path_edit.setText(str(tmp_path / "image.png"))
+    # Model JSON left blank -- auto-discovery path.
+
+    _start_and_wait(page, qtbot)
+
+    assert page._status_label.text().startswith("Failed")
+    assert controller.state == "failed"
+    assert page._run_button.isEnabled() is True
+    assert page._thread is None
+    assert page._worker is None
+
+
+@pytest.mark.phase7_cp2_inference_bundle_discovery
+def test_successful_run_with_auto_discovered_model_json(tmp_path, qtbot) -> None:
+    """CP2 async lifecycle과 CP3 result presentation이 auto-discovery
+    경로에서도 그대로 성립하는지 확인한다."""
+    controller = InferenceController(backend=lambda request: _fake_inference_result())
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    page._training_output_dir_edit.setText(str(tmp_path))
+    page._image_path_edit.setText(str(tmp_path / "image.png"))
+    # Model JSON left blank -- auto-discovery path.
+
+    _start_and_wait(page, qtbot)
+
+    assert page._status_label.text() == "Finished"
+    assert page._predicted_class_value_label.text() == "cat"
+    assert controller.state == "finished"
+    assert page._thread is None
+    assert page._worker is None
+
+
+@pytest.mark.phase7_cp2_inference_bundle_discovery
+def test_failed_auto_discovery_run_clears_previous_successful_result(tmp_path, qtbot) -> None:
+    calls = {"n": 0}
+
+    def flaky_backend(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _fake_inference_result()
+        raise FileNotFoundError("model_definition.json not found")
+
+    controller = InferenceController(backend=flaky_backend)
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    page._training_output_dir_edit.setText(str(tmp_path))
+    page._image_path_edit.setText(str(tmp_path / "image.png"))
+    # Model JSON left blank for both runs -- auto-discovery path.
+
+    _start_and_wait(page, qtbot)
+    assert page._predicted_class_value_label.text() == "cat"
+
+    _start_and_wait(page, qtbot)
+
+    assert page._status_label.text().startswith("Failed")
+    assert page._predicted_class_value_label.text() == "--"
+    assert page._confidence_value_label.text() == "--"
+    assert page._probabilities_value_label.text() == "--"
+    assert page._duration_value_label.text() == "--"

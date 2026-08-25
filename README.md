@@ -1708,6 +1708,29 @@ coordination, 검증 범위(자동화/CUDA 조건부/수동 실행 구분)는
 
 ---
 
+## Phase 7: 휴대 가능한 학습 산출물 (Portable Training-Output Bundle)
+
+Phase 6까지는 Inference tab에서 학습 output directory를 선택하면
+`best_model_state_dict.pt`/`class_mapping.json` 두 고정 파일명은 자동으로
+찾았지만, Model JSON(모델 구조 정의)은 output_dir에 저장되지 않아 매번
+직접 다시 지정해야 했습니다. Phase 7은 `run_imagefolder_training_workflow()`
+가 학습에 실제로 쓰인 검증된 `ModelSpec`을 `model_definition.json`이라는
+세 번째 고정 파일명으로 output_dir에 함께 저장하도록 확장했습니다(기존
+`best_model_state_dict.pt`/`class_mapping.json`과 동일한 위치, 동일한
+덮어쓰기 정책 -- 세 파일을 하나로 묶는 새 manifest/archive 포맷은 아닙니다).
+
+Inference tab의 Model JSON 입력란은 이제 선택 필드입니다: 비워 두면
+`Training Output Dir/model_definition.json`을 자동으로 찾고, 값을 입력하면
+그 값이 항상 우선합니다. 이 override 덕분에 Phase 7 이전에 생성된(즉
+`model_definition.json`이 없는) output directory도 원래대로 Model JSON을
+직접 지정해 계속 사용할 수 있습니다.
+
+세부 소유권/canonical 경로/overwrite·실패 동작, 검증 범위(자동화 CPU
+커버리지와 CUDA 조건부 커버리지의 구분), residual risk는
+`docs/phase7_portable_artifact_bundle.md`를 참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
