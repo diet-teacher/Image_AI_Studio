@@ -1,0 +1,23 @@
+{
+  "template": false,
+  "checkpoint_id": "phase7-cp1-portable-model-definition-artifact",
+  "objective": "Make each successful ImageFolder training output self-describing by saving the validated model definition under a canonical filename in the output directory.",
+  "acceptance_criteria": [
+    "run_imagefolder_training_workflow saves the validated ModelSpec as output_dir/model_definition.json using the existing model-definition serialization contract.",
+    "The saved model_definition.json round-trips through load_model_spec and represents the exact validated ModelSpec used to build and train the model, independent of the source JSON formatting or filename.",
+    "The canonical model definition is written only after request validation and output directory creation, and filesystem failures remain explicit rather than being silently ignored.",
+    "Repeated successful runs targeting the same output directory deterministically replace the canonical model definition with the current validated specification without deleting unrelated artifacts.",
+    "Existing best_model_state_dict.pt, class_mapping.json, checkpoint, history, metrics, TorchScript, resume, CPU, and conditional CUDA behavior remains unchanged.",
+    "Focused tests cover canonical path creation, semantic round-trip, replacement on a later run, and write failure without performing network access or paid-model calls.",
+    "No inference GUI behavior, new manifest/bundle format, packaging feature, or public Phase 6B controller/worker API is introduced in this checkpoint."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/training/imagefolder_workflow.py",
+    "tests/training/test_imagefolder_workflow.py"
+  ],
+  "required_tests": [
+    "phase7_cp1_portable_model_definition"
+  ],
+  "claude_prompt": "Implement only Phase 7 checkpoint 1 in the two allowed files. Extend the existing ImageFolder workflow to serialize the already loaded and validated ModelSpec to the fixed path output_dir/model_definition.json using the existing serialization API; do not copy raw source bytes and do not invent a bundle manifest. Preserve all existing training, resume, artifact, export, device, precision, and error contracts. Add focused deterministic tests for the canonical artifact, semantic round-trip, replacement, and write failure. Do not change public APIs unless strictly required by the stated artifact contract, do not touch inference or GUI code, and do not claim any execution result that was not actually observed. Do not use Git or Bash, do not commit or push, and do not perform unrelated refactoring.",
+  "estimated_scope": "Small training-artifact slice: one existing workflow module and one focused test module, approximately 60-120 changed lines combined."
+}

@@ -1,0 +1,22 @@
+{
+  "template": false,
+  "checkpoint_id": "phase7-cp3-portable-bundle-real-cpu-integration",
+  "objective": "Prove with a permanent real-CPU GUI integration test that a freshly trained output directory can drive inference without separately selecting the original model JSON.",
+  "acceptance_criteria": [
+    "The existing real TrainingPage-to-InferencePage integration test uses one MainWindow session, a deterministic tiny ImageFolder dataset, and the production CPU training and inference backends.",
+    "Training produces model_definition.json, best_model_state_dict.pt, and class_mapping.json in the selected output directory; the test does not manufacture, copy, or edit substitutes.",
+    "Inference succeeds after selecting the training output directory and input image while leaving the explicit Model JSON field empty.",
+    "The predicted class belongs to the generated class mapping, the established confidence/probability/duration presentation remains valid, and controls plus thread/worker references are restored after cleanup.",
+    "A focused compatibility case proves that an explicit external Model JSON still overrides automatic discovery for a legacy-style output directory.",
+    "Synchronization uses qtbot and bounded event waiting without QThread.wait, terminate, busy loops, processEvents polling, or sleeps as correctness conditions.",
+    "No production source, fake backend substitution, CUDA requirement, artifact manifest, packaging behavior, or unrelated integration scenario is added."
+  ],
+  "allowed_files": [
+    "tests/gui/test_training_inference_integration.py"
+  ],
+  "required_tests": [
+    "phase7_cp3_portable_bundle_integration"
+  ],
+  "claude_prompt": "Implement only Phase 7 checkpoint 3 by updating the allowed real-CPU GUI integration test module. Use the existing production TrainingPage and InferencePage in one MainWindow. Assert that real training creates the canonical model_definition.json and that real inference succeeds with the Model JSON field left empty, using the just-created output directory and a real generated image. Retain a focused explicit-path compatibility check for legacy outputs. Do not alter product code, fabricate artifacts or results, require CUDA, weaken synchronization, or broaden into close coordination, batch inference, preview, cancellation, or packaging. If production behavior cannot satisfy the contract, return BLOCKED rather than editing outside the allowed file. Do not claim unexecuted results. Do not use Git or Bash, do not commit or push, and avoid unrelated refactoring.",
+  "estimated_scope": "Small verification-only slice: one existing real-backend GUI integration test module, approximately 40-100 changed lines."
+}

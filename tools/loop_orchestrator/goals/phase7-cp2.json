@@ -1,0 +1,23 @@
+{
+  "template": false,
+  "checkpoint_id": "phase7-cp2-inference-bundle-auto-discovery",
+  "objective": "Let InferencePage use the canonical model_definition.json from a training output directory while preserving explicit legacy Model JSON selection as a compatible override.",
+  "acceptance_criteria": [
+    "When the Model JSON field is empty, InferencePage builds its request with training_output_dir/model_definition.json alongside the existing fixed state-dict and class-mapping paths.",
+    "When the user supplies an explicit Model JSON path, that path remains authoritative so outputs created before Phase 7 continue to work.",
+    "The page does not parse, duplicate, or recalculate the ModelSpec; validation and inference remain delegated to the existing build_inference_request and InferenceController path.",
+    "The UI clearly communicates the automatic canonical-path behavior without adding a third artifact abstraction or hiding the compatibility override.",
+    "CP1 request construction, CP2 asynchronous lifecycle, CP3 result presentation, CP4 close coordination, overlap prevention, control restoration, success/failure reruns, and MainWindow integration remain intact.",
+    "Focused qtbot tests cover automatic discovery, explicit override compatibility, missing canonical artifact failure through the existing error path, lifecycle preservation, and stale result/error clearing without real model, CUDA, or image inference.",
+    "No training implementation, Phase 6B public API, batch inference, image preview, cancellation, packaging, or MainWindow behavior is changed."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/gui/inference_page.py",
+    "tests/gui/test_inference_page.py"
+  ],
+  "required_tests": [
+    "phase7_cp2_inference_bundle_discovery"
+  ],
+  "claude_prompt": "Implement only Phase 7 checkpoint 2 in InferencePage and its focused tests. If the existing Model JSON text field is blank, derive model_definition.json from the selected training output directory; if it is non-empty, preserve it as an explicit backward-compatible override. Continue to use the existing _build_request/build_inference_request, controller, worker, QThread, result, and close-coordination paths. Make the automatic behavior understandable with a minimal UI cue, and test it with qtbot and fake backends, including missing-artifact failure via existing validation and all relevant rerun/cleanup behavior. Do not modify training, MainWindow, controllers, workers, or core APIs; do not add batch inference, preview, cancellation, packaging, or abstractions. Do not claim unexecuted results. Do not use Git or Bash, do not commit or push, and avoid unrelated refactoring.",
+  "estimated_scope": "Small GUI compatibility slice: one existing page and its focused test module, approximately 70-140 changed lines combined."
+}

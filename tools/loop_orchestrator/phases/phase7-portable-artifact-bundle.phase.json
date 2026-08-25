@@ -1,0 +1,52 @@
+{
+  "phase_id": "phase7-portable-training-artifact-bundle",
+  "objective": "Make successful training outputs self-describing and directly usable by the existing inference GUI while preserving legacy explicit-model compatibility and the established training and inference architecture.",
+  "checkpoints": [
+    {
+      "checkpoint_id": "phase7-cp1-portable-model-definition-artifact",
+      "goal": "tools/loop_orchestrator/goals/phase7-cp1.json"
+    },
+    {
+      "checkpoint_id": "phase7-cp2-inference-bundle-auto-discovery",
+      "goal": "tools/loop_orchestrator/goals/phase7-cp2.json"
+    },
+    {
+      "checkpoint_id": "phase7-cp3-portable-bundle-real-cpu-integration",
+      "goal": "tools/loop_orchestrator/goals/phase7-cp3.json"
+    },
+    {
+      "checkpoint_id": "phase7-cp4-portable-bundle-graduation-docs",
+      "goal": "tools/loop_orchestrator/goals/phase7-cp4.json"
+    }
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/training/imagefolder_workflow.py",
+    "tests/training/test_imagefolder_workflow.py",
+    "src/image_ai_studio/gui/inference_page.py",
+    "tests/gui/test_inference_page.py",
+    "tests/gui/test_training_inference_integration.py",
+    "README.md",
+    "docs/phase7_portable_artifact_bundle.md"
+  ],
+  "allowed_tests": [
+    "phase7_cp1_portable_model_definition",
+    "phase7_cp2_inference_bundle_discovery",
+    "phase7_cp3_portable_bundle_integration",
+    "phase7_cp4_portable_bundle_graduation"
+  ],
+  "final_harness_profile": "full",
+  "max_checkpoints": 4,
+  "max_rework_rounds": 1,
+  "max_model_calls": 14,
+  "max_claude_cost_usd": 8.0,
+  "max_elapsed_seconds": 14400,
+  "completion_conditions": [
+    "Every checkpoint verifier returns PASS and no checkpoint exceeds one rework round, one maker continuation, or one transient API retry.",
+    "New training outputs contain a canonical model_definition.json that round-trips to the validated ModelSpec without changing established artifacts or public APIs.",
+    "The inference GUI automatically uses the canonical model definition when no explicit override is supplied, while legacy explicit-path behavior remains covered.",
+    "The real CPU TrainingPage-to-InferencePage workflow passes without separately selecting the source model JSON.",
+    "The Phase 7 documentation accurately reflects committed behavior and automated evidence.",
+    "The fixed full project harness runs exactly once and passes without protected-file, HEAD, staged-index, out-of-scope worktree, or harness mutation.",
+    "The Phase stops after this manifest; no later Phase is executed and no commit, push, or pull request is performed."
+  ]
+}

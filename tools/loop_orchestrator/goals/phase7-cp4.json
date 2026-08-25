@@ -1,0 +1,23 @@
+{
+  "template": false,
+  "checkpoint_id": "phase7-cp4-portable-bundle-graduation-docs",
+  "objective": "Document the verified portable training-output workflow, compatibility behavior, evidence, limitations, and Phase 7 graduation contract without changing runtime behavior.",
+  "acceptance_criteria": [
+    "docs/phase7_portable_artifact_bundle.md documents the canonical model_definition.json contract, its relationship to best_model_state_dict.pt and class_mapping.json, ownership, overwrite semantics, and failure behavior.",
+    "The document describes the user workflow for new self-describing outputs and the explicit Model JSON override for legacy outputs without calling the three files a new manifest or archive format.",
+    "README.md is updated minimally to describe output-directory auto-discovery and link the Phase 7 document while preserving accurate launch, training, and inference instructions.",
+    "The documentation distinguishes permanent automated CPU evidence from conditional CUDA coverage and does not invent test counts, timings, costs, executions, or compatibility guarantees not represented by repository behavior.",
+    "Residual risks and non-goals explicitly include legacy outputs without model_definition.json, no integrity/signature manifest, no packaging/installer, no batch inference, no image preview, and no inference cancellation.",
+    "PHASE 7 COMPLETE is conditional on all fixed checkpoint tests and the final full project harness passing on the committed implementation.",
+    "No Python source, test behavior, configuration, goal, orchestrator, packaging, or later-phase file is changed."
+  ],
+  "allowed_files": [
+    "README.md",
+    "docs/phase7_portable_artifact_bundle.md"
+  ],
+  "required_tests": [
+    "phase7_cp4_portable_bundle_graduation"
+  ],
+  "claude_prompt": "Implement only Phase 7 checkpoint 4 in README.md and a new docs/phase7_portable_artifact_bundle.md. Read the committed Phase 7 implementation and tests, then document the canonical model_definition.json artifact, the complete new-output workflow, the explicit legacy override, automated evidence, failure semantics, non-goals, and residual risks. Keep README changes focused. Do not call this a manifest/archive format, do not fabricate test totals, execution results, costs, timings, CUDA observations, or guarantees, and make graduation conditional on the fixed tests and full harness. Do not modify code, tests, config, goals, orchestrator files, or unrelated historical docs. Do not use Git or Bash, do not commit or push, and avoid unrelated rewriting.",
+  "estimated_scope": "Documentation-only graduation slice: one new focused document and a small README update, approximately 180-320 lines combined."
+}
