@@ -21,7 +21,10 @@ API_CONNECTION_ERROR = "API_CONNECTION_ERROR"
 MAKER_SAFETY_VIOLATION = "MAKER_SAFETY_VIOLATION"
 
 _ENVELOPE_SCALAR_KEYS = ("session_id", "total_cost_usd", "num_turns", "terminal_reason",
-                         "subtype", "stop_reason", "is_error")
+                         "subtype", "stop_reason", "is_error", "requested_model")
+_MODEL_USAGE_NUMERIC_FIELDS = ("inputTokens", "outputTokens", "cacheReadInputTokens",
+                               "cacheCreationInputTokens", "costUSD")
+_MODEL_USAGE_LIMIT = 50
 _BUDGET_MARKERS = {"error_max_budget", "budget_exhausted", "error_budget_exceeded", "max_budget_usd_exceeded"}
 _MAX_TURNS_MARKERS = {"error_max_turns", "max_turns_exceeded", "max_turns"}
 _CONNECTION_MARKERS = {"error_api_connection", "api_connection_error", "error_network",
@@ -53,7 +56,56 @@ def _bounded_text(value) -> str:
     return str(value)[:ENVELOPE_TEXT_LIMIT]
 
 
-def _extract_envelope_metadata(envelope: dict) -> dict:
+def _numeric(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _extract_model_usage(envelope: dict, requested_model: str | None = None) -> dict:
+    """Bounded, validated, JSON-serializable canonical-model usage telemetry.
+
+    Never guesses: primary_canonical_model is only set when requested_model exactly
+    matches one of the canonical keys observed in modelUsage.
+    """
+    raw = envelope.get("modelUsage")
+    usage: dict[str, dict] = {}
+    invalid: list[str] = []
+    if isinstance(raw, dict):
+        for canonical_model, entry in list(raw.items())[:_MODEL_USAGE_LIMIT]:
+            key = _bounded_text(canonical_model)
+            if not isinstance(entry, dict):
+                invalid.append(key)
+                continue
+            record: dict[str, object] = {}
+            bad = False
+            for field_name in _MODEL_USAGE_NUMERIC_FIELDS:
+                if field_name not in entry:
+                    continue
+                value = entry[field_name]
+                if not _numeric(value):
+                    bad = True
+                    continue
+                record[field_name] = value
+            canonical = entry.get("canonicalModel")
+            if isinstance(canonical, str) and canonical:
+                record["canonicalModel"] = _bounded_text(canonical)
+            if bad:
+                invalid.append(key)
+            usage[key] = record
+    elif raw is not None:
+        invalid.append("modelUsage")
+    canonical_models = sorted({str(item.get("canonicalModel")) for item in usage.values()
+                               if item.get("canonicalModel")})
+    result = {"model_usage": usage, "canonical_models": canonical_models}
+    if invalid:
+        result["model_usage_invalid"] = invalid
+    requested = requested_model if requested_model is not None else envelope.get("requested_model")
+    primary = requested if isinstance(requested, str) and requested in canonical_models else None
+    result["requested_model"] = requested if isinstance(requested, str) and requested else None
+    result["primary_canonical_model"] = primary
+    return result
+
+
+def _extract_envelope_metadata(envelope: dict, requested_model: str | None = None) -> dict:
     """Bounded, secret-free, prompt-free telemetry preserved from a Claude JSON envelope."""
     metadata = {key: envelope[key] for key in _ENVELOPE_SCALAR_KEYS if key in envelope}
     if "errors" in envelope:
@@ -64,6 +116,7 @@ def _extract_envelope_metadata(envelope: dict) -> dict:
             metadata["errors"] = _bounded_text(errors)
     if isinstance(envelope.get("result"), str):
         metadata["result"] = _bounded_text(envelope["result"])
+    metadata.update(_extract_model_usage(envelope, requested_model))
     return metadata
 
 
@@ -120,7 +173,7 @@ class ProcessResult:
 
 
 def run_json_process(argv: Sequence[str], cwd: Path, timeout: int, *, json_lines: bool = False,
-                     stdin_text: str | None = None) -> ProcessResult:
+                     stdin_text: str | None = None, requested_model: str | None = None) -> ProcessResult:
     """Run a fixed adapter-built argv; never interprets model-produced commands.
 
     The prompt (if any) is supplied only via stdin_text over stdin, never argv, so it never
@@ -154,7 +207,7 @@ def run_json_process(argv: Sequence[str], cwd: Path, timeout: int, *, json_lines
             except json.JSONDecodeError:
                 envelope = None
             if isinstance(envelope, dict):
-                metadata = _extract_envelope_metadata(envelope)
+                metadata = _extract_envelope_metadata(envelope, requested_model)
                 kind = _classify_nonzero_envelope(envelope)
         raise ProcessFailure(kind,
             f"{kind} {process.returncode}: stdout_tail={stdout_tail!r}; stderr_tail={stderr_tail!r}",
@@ -186,5 +239,5 @@ def run_json_process(argv: Sequence[str], cwd: Path, timeout: int, *, json_lines
     except (json.JSONDecodeError, ValueError) as exc:
         raise ProcessFailure(JSON_PARSE_FAILED, f"JSON_PARSE_FAILED: {exc}",
                              stdout_tail=stdout, stderr_tail=stderr) from exc
-    metadata = {} if json_lines else envelope
+    metadata = {} if json_lines else {**envelope, **_extract_model_usage(envelope, requested_model)}
     return ProcessResult(payload, stdout, stderr, metadata)

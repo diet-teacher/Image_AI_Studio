@@ -34,6 +34,7 @@ class ClaudeInvocation:
     session_id: str
     total_cost_usd: float | None = None
     num_turns: int | None = None
+    telemetry: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

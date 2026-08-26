@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from tools.loop_orchestrator import adapters, cli
+from tools.loop_orchestrator import adapters, cli, process
 from tools.loop_orchestrator.adapters import ClaudeCLIAdapter, CodexCLIAdapter, codex_exec_prefix
 from tools.loop_orchestrator.budget import BudgetManager
 from tools.loop_orchestrator.engine import LoopEngine
@@ -346,6 +346,70 @@ class AdapterTests(unittest.TestCase):
         self.assertNotIn("prompt", argv)
         self.assertEqual("prompt", captured["stdin_text"])
         self.assertEqual("-p", argv[1])
+
+    def test_claude_model_usage_preserves_primary_and_helpers(self):
+        envelope = {
+            "session_id": "session-models", "total_cost_usd": 0.3, "num_turns": 2,
+            "terminal_reason": "completed", "subtype": "success",
+            "result": json.dumps({"status": "DONE", "base_commit": "base", "changed_files": [],
+                                  "tests_run": [], "known_risks": [], "summary": "done"}),
+            "modelUsage": {
+                "sonnet-key": {"canonicalModel": "claude-sonnet-5", "inputTokens": 10,
+                               "outputTokens": 20, "cacheReadInputTokens": 30,
+                               "cacheCreationInputTokens": 40, "costUSD": 0.29},
+                "haiku-key": {"canonicalModel": "claude-haiku-4-5", "inputTokens": 1,
+                              "outputTokens": 2, "cacheReadInputTokens": 3,
+                              "cacheCreationInputTokens": 4, "costUSD": 0.01},
+            },
+        }
+        payload = json.loads(envelope["result"])
+        captured = {}
+        def fake(argv, root, timeout, **kwargs):
+            captured.update(kwargs)
+            metadata = {**envelope, **process._extract_model_usage(envelope, kwargs.get("requested_model"))}
+            return ProcessResult(payload, "", "", metadata)
+        with patch.object(adapters, "run_json_process", side_effect=fake):
+            result = ClaudeCLIAdapter(Path.cwd(), 10, 1, "claude-sonnet-5").run("prompt")
+        self.assertEqual("claude-sonnet-5", result.telemetry["primary_canonical_model"])
+        self.assertEqual(["claude-haiku-4-5", "claude-sonnet-5"], result.telemetry["canonical_models"])
+        self.assertEqual(30, result.telemetry["model_usage"]["sonnet-key"]["cacheReadInputTokens"])
+        self.assertEqual("claude-sonnet-5", captured["requested_model"])
+
+    def test_claude_model_omitted_does_not_guess_primary(self):
+        envelope = {"modelUsage": {"only": {"canonicalModel": "claude-sonnet-5", "costUSD": 0.1}}}
+        telemetry = process._extract_model_usage(envelope)
+        self.assertIsNone(telemetry["primary_canonical_model"])
+        self.assertEqual(["claude-sonnet-5"], telemetry["canonical_models"])
+
+    def test_claude_model_config_argv_once_and_prompt_stdin(self):
+        captured = {}
+        def fake(argv, root, timeout, **kwargs):
+            captured["argv"], captured["kwargs"] = argv, kwargs
+            return self.fixture()
+        with patch.object(adapters, "run_json_process", side_effect=fake):
+            ClaudeCLIAdapter(Path.cwd(), 10, 1, "claude-sonnet-5").run("secret prompt")
+        self.assertEqual(1, captured["argv"].count("--model"))
+        self.assertEqual("claude-sonnet-5", captured["argv"][captured["argv"].index("--model") + 1])
+        self.assertNotIn("secret prompt", captured["argv"])
+        self.assertEqual("secret prompt", captured["kwargs"]["stdin_text"])
+
+    def test_malformed_model_usage_has_explicit_diagnostics(self):
+        telemetry = process._extract_model_usage({"modelUsage": {
+            "bad": {"canonicalModel": "claude-sonnet-5", "inputTokens": True, "costUSD": "x"}}})
+        self.assertEqual(["bad"], telemetry["model_usage_invalid"])
+        self.assertEqual({}, {k: v for k, v in telemetry["model_usage"]["bad"].items()
+                              if k != "canonicalModel"})
+
+    def test_nonzero_model_usage_telemetry_is_preserved(self):
+        envelope = {"subtype": "error_max_budget", "session_id": "s", "total_cost_usd": 0.2,
+                    "modelUsage": {"m": {"canonicalModel": "claude-sonnet-5", "inputTokens": 3,
+                                             "outputTokens": 4, "costUSD": 0.2}}}
+        with self.assertRaises(ProcessFailure) as raised:
+            run_json_process([sys.executable, "-c", self._nonzero_envelope_script(envelope)],
+                             Path.cwd(), 10, requested_model="claude-sonnet-5")
+        metadata = raised.exception.metadata
+        self.assertEqual("claude-sonnet-5", metadata["primary_canonical_model"])
+        self.assertEqual(4, metadata["model_usage"]["m"]["outputTokens"])
 
     def test_real_cli_envelope_fixture_parser_preserves_metadata(self):
         fixture = Path(__file__).parent/"fixtures"/"claude_result.json"
@@ -770,9 +834,45 @@ class PhaseEngineTests(unittest.TestCase):
         codex = self.Codex(); state = self.engine(codex=codex).run(self.manifest(), execute=True)
         self.assertEqual("READY_TO_COMMIT", state["state"], state)
         self.assertIn("cp1.txt", codex.prompts[0]); self.assertNotIn("cp2.txt", codex.prompts[0])
-        self.assertIn("cp2.txt", codex.prompts[1]); self.assertNotIn("a/cp1.txt", codex.prompts[1])
+        second = codex.prompts[1]
+        checkpoint_section = second.split("PHASE-WIDE CHANGED FILES:", 1)[0]
+        phase_section = second.split("PHASE-WIDE CHANGED FILES:", 1)[1]
+        self.assertIn("cp2.txt", checkpoint_section); self.assertNotIn("cp1.txt", checkpoint_section)
+        self.assertIn("cp1.txt", phase_section); self.assertIn("cp2.txt", phase_section)
         self.assertTrue((self.root / "cp1.txt").read_text().startswith("changed"))
         self.assertTrue((self.root / "cp2.txt").read_text().startswith("changed"))
+
+    def test_phase_baseline_missing_on_resume_fails_closed(self):
+        stopped = self.engine(codex=self.Codex(failure_at=2)).run(self.manifest(), execute=True)
+        state_path = self.root / ".loop" / "state.json"
+        wrapper = json.loads(state_path.read_text(encoding="utf-8"))
+        wrapper["state"].pop("phase_baseline")
+        state_path.write_text(json.dumps(wrapper), encoding="utf-8")
+        resumed = self.engine().run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("RESUME_INCOMPLETE_CHECKPOINT_STATE", resumed["stop_reason"])
+
+    def test_checkpoint_baseline_digest_mismatch_on_resume_fails_closed(self):
+        self.engine(codex=self.Codex(failure_at=2)).run(self.manifest(), execute=True)
+        state_path = self.root / ".loop" / "state.json"
+        wrapper = json.loads(state_path.read_text(encoding="utf-8"))
+        wrapper["state"]["active_checkpoint"]["baseline"]["cp2.txt"]["sha256"] = "tampered"
+        state_path.write_text(json.dumps(wrapper), encoding="utf-8")
+        maker = self.Maker(self.root)
+        resumed = self.engine(maker=maker).run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("RESUME_INCOMPLETE_CHECKPOINT_STATE", resumed["stop_reason"])
+        self.assertEqual(0, maker.calls)
+
+    def test_final_phase_guard_uses_manifest_union(self):
+        class LateMutationHarness:
+            def __call__(inner, root, profile, **kwargs):
+                raise AssertionError("harness must not run")
+        manifest = self.manifest()
+        state = self.engine()._initial_state(manifest)
+        state.update({"phase_baseline": {}, "completed_checkpoints": ["cp1", "cp2"],
+                      "started_monotonic": 0})
+        (self.root / "outside.txt").write_text("bad", encoding="utf-8")
+        result = self.engine(harness_runner=LateMutationHarness())._final_harness(state, manifest)
+        self.assertEqual("FINAL_PHASE_SCOPE_VIOLATION", result["stop_reason"])
 
     def test_prior_checkpoint_file_cannot_be_modified_without_current_permission(self):
         class BadMaker(self.Maker):
@@ -855,11 +955,18 @@ class PhaseEngineTests(unittest.TestCase):
             def run(inner, prompt, session_id=None):
                 invocation = super().run(prompt, session_id)
                 return ClaudeInvocation(MakerResult("BLOCKED", "base", ["cp1.txt"], [], [], "blocked"),
-                                        invocation.session_id, 0.25, 2)
+                                        invocation.session_id, 0.25, 2,
+                                        {"requested_model": "claude-sonnet-5",
+                                         "canonical_models": ["claude-haiku-4-5", "claude-sonnet-5"],
+                                         "primary_canonical_model": "claude-sonnet-5"})
         state = self.engine(maker=BlockedMaker(self.root)).run(self.manifest(), execute=True)
         self.assertEqual("MAKER_BLOCKED", state["stop_reason"])
         self.assertEqual(0.25, state["claude_cost_usd"])
         self.assertEqual(["cp1.txt"], state["recent_result"]["checkpoint_changed_files"])
+        self.assertEqual("claude-sonnet-5", state["recent_result"]["telemetry"]["primary_canonical_model"])
+        handoff = json.loads((self.root / ".loop" / "handoff.json").read_text(encoding="utf-8"))
+        self.assertEqual(["claude-haiku-4-5", "claude-sonnet-5"],
+                         handoff["details"]["telemetry"]["canonical_models"])
 
     def test_maker_process_failure_after_edit_records_delta(self):
         class FailureMaker:

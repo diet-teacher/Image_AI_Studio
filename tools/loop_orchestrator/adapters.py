@@ -18,22 +18,36 @@ def codex_exec_prefix(executable: str, root: Path) -> list[str]:
 
 
 class ClaudeCLIAdapter:
-    def __init__(self, root: Path, timeout: int, max_budget_usd: float):
+    def __init__(self, root: Path, timeout: int, max_budget_usd: float, claude_model: str | None = None):
         self.root, self.timeout, self.max_budget_usd = root, timeout, max_budget_usd
         self.executable = "claude"
+        self.claude_model = claude_model
 
     def run(self, prompt: str, session_id: str | None = None) -> ClaudeInvocation:
         argv = [self.executable, "-p", "--output-format", "json", "--json-schema", json.dumps(MAKER_SCHEMA),
                 "--max-budget-usd", str(self.max_budget_usd), "--permission-mode", "acceptEdits",
                 "--allowedTools", "Read,Edit,Write,Glob,Grep", "--disallowedTools", "Bash"]
+        if self.claude_model:
+            argv += ["--model", self.claude_model]
         if session_id:
             argv += ["--resume", session_id]
-        process = run_json_process(argv, self.root, self.timeout, stdin_text=prompt)
+        process_kwargs = {"stdin_text": prompt}
+        if self.claude_model:
+            process_kwargs["requested_model"] = self.claude_model
+        process = run_json_process(argv, self.root, self.timeout, **process_kwargs)
         actual_session = process.metadata.get("session_id")
         if not isinstance(actual_session, str) or not actual_session:
             raise ValueError("Claude JSON envelope has no valid top-level session_id")
+        telemetry = {
+            "requested_model": process.metadata.get("requested_model"),
+            "model_usage": process.metadata.get("model_usage", {}),
+            "canonical_models": process.metadata.get("canonical_models", []),
+            "primary_canonical_model": process.metadata.get("primary_canonical_model"),
+            "terminal_reason": process.metadata.get("terminal_reason"),
+            "subtype": process.metadata.get("subtype"),
+        }
         return ClaudeInvocation(MakerResult(**process.payload), actual_session,
-                                process.metadata.get("total_cost_usd"), process.metadata.get("num_turns"))
+                                process.metadata.get("total_cost_usd"), process.metadata.get("num_turns"), telemetry)
 
 
 class CodexCLIAdapter:

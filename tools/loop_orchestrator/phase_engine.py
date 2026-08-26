@@ -33,6 +33,10 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _snapshot_digest(snapshot: dict) -> str:
+    return hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
 def _entry(path: Path) -> dict:
     if path.is_symlink():
         target = os.readlink(path)
@@ -208,6 +212,12 @@ class PhaseEngine:
         state = self._initial_state(manifest)
         if worktree_snapshot(self.root).strip():
             return self._stop(state, "BLOCKED", "DIRTY_WORKTREE")
+        phase_guard = git_guard(self.root)
+        state["phase_baseline"] = phase_guard["repository"]
+        state["phase_baseline_digest"] = _snapshot_digest(phase_guard["repository"])
+        state["phase_baseline_protected"] = phase_guard["protected"]
+        state["last_observed_snapshot"] = phase_guard["repository"]
+        state["last_observed_protected"] = phase_guard["protected"]
         for role in ("claude", "codex"):
             ok, reason = self._budget_valid(role)
             if not ok:
@@ -225,6 +235,7 @@ class PhaseEngine:
             return {}
         record = {"checkpoint_id": entry["checkpoint_id"], "goal": entry["goal"],
                   "stage": "MAKER_PENDING", "baseline": guard["repository"],
+                  "baseline_digest": _snapshot_digest(guard["repository"]),
                   "baseline_protected": guard["protected"], "baseline_head": guard["head"],
                   "baseline_staged": guard["staged"], "last_observed_snapshot": guard["repository"],
                   "last_observed_protected": guard["protected"], "attempts": [], "next_attempt": 0,
@@ -349,7 +360,8 @@ class PhaseEngine:
                             state["claude_cost_usd"] += float(cost)
                         telemetry_session = invocation.session_id
                         maker_record.update({"session_id": invocation.session_id, "total_cost_usd": cost,
-                                             "num_turns": invocation.num_turns, "maker_status": invocation.result.status})
+                                             "num_turns": invocation.num_turns, "telemetry": invocation.telemetry,
+                                             "maker_status": invocation.result.status})
                     elif isinstance(maker_error, ProcessFailure):
                         meta = maker_error.metadata
                         maker_record["maker_error"] = maker_error.diagnostics()
@@ -359,7 +371,11 @@ class PhaseEngine:
                         if isinstance(meta.get("session_id"), str) and meta["session_id"]:
                             telemetry_session = meta["session_id"]
                         maker_record.update({"session_id": telemetry_session, "total_cost_usd": meta.get("total_cost_usd"),
-                                             "num_turns": meta.get("num_turns")})
+                                             "num_turns": meta.get("num_turns"), "telemetry": {
+                                                 key: meta.get(key) for key in (
+                                                     "requested_model", "model_usage", "canonical_models",
+                                                     "primary_canonical_model", "terminal_reason", "subtype")
+                                             }})
                     if telemetry_session:
                         record["session_id"] = telemetry_session
                     maker_record["continuation_count"] = record["continuation_count"]
@@ -447,12 +463,14 @@ class PhaseEngine:
             return self._stop(state, "BLOCKED", reason, record)
         verifier_before = git_guard(self.root)
         baseline_files, baseline_diff, baseline_diagnostics = snapshot_delta(record["baseline"], verifier_before["repository"])
+        phase_files, phase_diff, phase_diagnostics = snapshot_delta(state["phase_baseline"], verifier_before["repository"])
         record["stage"] = "VERIFIER_RUNNING"; self._persist(state, "verifier-before", record)
         state["model_calls"] += 1; state["verifier_calls"] += 1
         verifier = None; verifier_error = None; verifier_interrupted = False
         try:
-            verifier = self.codex.verify(VERIFIER.format(goal=json.dumps(goal), base=state["base_commit"],
-                                                         files=baseline_files, diff=baseline_diff, tests=tests))
+            verifier = self.codex.verify(VERIFIER.format(
+                goal=json.dumps(goal), base=state["base_commit"], checkpoint_files=baseline_files,
+                checkpoint_diff=baseline_diff, phase_files=phase_files, phase_diff=phase_diff, tests=tests))
         except KeyboardInterrupt:
             verifier_interrupted = True
         except Exception as exc:
@@ -462,6 +480,8 @@ class PhaseEngine:
                                            require_unchanged=True)
         maker_record.update({"checkpoint_changed_files": baseline_files, "checkpoint_diff": baseline_diff,
                              "checkpoint_file_diagnostics": baseline_diagnostics,
+                             "phase_changed_files": phase_files, "phase_diff": phase_diff,
+                             "phase_file_diagnostics": phase_diagnostics,
                              "verifier_guard": verifier_guard})
         record["last_observed_snapshot"], record["last_observed_protected"] = verifier_after["repository"], verifier_after["protected"]
         record["stage"] = "VERIFIER_FINISHED"; self._persist(state, "verifier-after", maker_record)
@@ -486,7 +506,10 @@ class PhaseEngine:
             record.update({"stage": "COMPLETE", "final_files": baseline_files,
                            "final_hashes": file_snapshot(self.root), "next_attempt": attempt})
             state["checkpoints"].append(record); state["completed_checkpoints"].append(record["checkpoint_id"])
-            state["active_checkpoint"] = None; self._persist(state, "checkpoint-complete", record)
+            state["active_checkpoint"] = None
+            state["last_observed_snapshot"] = verifier_after["repository"]
+            state["last_observed_protected"] = verifier_after["protected"]
+            self._persist(state, "checkpoint-complete", record)
             return {"checkpoint_passed": True}
         if verifier.verdict == "BLOCKED":
             return self._stop(state, "BLOCKED", "VERIFIER_BLOCKED", record)
@@ -500,6 +523,24 @@ class PhaseEngine:
     def _final_harness(self, state: dict, manifest: dict) -> dict:
         if state["completed_checkpoints"] != [item["checkpoint_id"] for item in manifest["checkpoints"]]:
             return self._stop(state, "BLOCKED", "PHASE_INCOMPLETE")
+        if "phase_baseline" not in state:
+            return self._stop(state, "BLOCKED", "PHASE_BASELINE_MISSING")
+        current = git_guard(self.root)
+        phase_files, phase_diff, phase_diagnostics = snapshot_delta(state["phase_baseline"], current["repository"])
+        violations = []
+        for path_name in phase_files:
+            try:
+                if not path_allowed(path_name, manifest["allowed_files"], self.root):
+                    violations.append(path_name)
+            except GoalError:
+                violations.append(path_name)
+        if violations or current["head"] != state["base_commit"] or current["staged"]:
+            return self._stop(state, "BLOCKED", "FINAL_PHASE_SCOPE_VIOLATION", {
+                "phase_changed_files": phase_files, "phase_diff": phase_diff,
+                "phase_file_diagnostics": phase_diagnostics,
+                "allowed_files_violations": sorted(set(violations)),
+                "head": current["head"], "staged": current["staged"],
+            })
         remaining = manifest["max_elapsed_seconds"] - (self.clock() - state["started_monotonic"])
         if remaining <= 0:
             return self._stop(state, "BLOCKED", "MAX_ELAPSED_SECONDS")
@@ -547,6 +588,12 @@ class PhaseEngine:
                     "completed_checkpoints", "checkpoints", "current_checkpoint_index"}
         if not isinstance(saved, dict) or saved.get("record_type") != "phase" or not required.issubset(saved):
             return self._resume_invalid(manifest, "RESUME_STATE_NOT_PHASE")
+        phase_fields = {"phase_baseline", "phase_baseline_digest", "phase_baseline_protected", "last_observed_snapshot",
+                        "last_observed_protected"}
+        if not phase_fields.issubset(saved):
+            return self._stop(saved, "BLOCKED", "RESUME_INCOMPLETE_CHECKPOINT_STATE")
+        if saved["phase_baseline_digest"] != _snapshot_digest(saved["phase_baseline"]):
+            return self._stop(saved, "BLOCKED", "RESUME_INCOMPLETE_CHECKPOINT_STATE")
         saved["started_monotonic"] = self.clock() - float(saved.get("elapsed_seconds", 0))
         if saved.get("phase_id") != manifest["phase_id"] or saved.get("manifest_digest") != manifest["manifest_digest"]:
             return self._stop(saved, "BLOCKED", "RESUME_MANIFEST_MISMATCH")
@@ -554,11 +601,13 @@ class PhaseEngine:
             return self._stop(saved, "BLOCKED", "RESUME_BASE_COMMIT_MISMATCH")
         active = saved.get("active_checkpoint"); completed = len(saved.get("completed_checkpoints", []))
         if completed < len(manifest["checkpoints"]):
-            baseline_fields = {"checkpoint_id", "goal", "baseline", "baseline_protected", "stage",
+            baseline_fields = {"checkpoint_id", "goal", "baseline", "baseline_digest", "baseline_protected", "stage",
                                "last_observed_snapshot", "last_observed_protected", "next_attempt",
                                "session_id", "rework", "attempts"}
             expected = manifest["checkpoints"][completed]
             if not isinstance(active, dict) or not baseline_fields.issubset(active):
+                return self._stop(saved, "BLOCKED", "RESUME_INCOMPLETE_CHECKPOINT_STATE")
+            if active["baseline_digest"] != _snapshot_digest(active["baseline"]):
                 return self._stop(saved, "BLOCKED", "RESUME_INCOMPLETE_CHECKPOINT_STATE")
             if active["checkpoint_id"] != expected["checkpoint_id"] or active["goal"] != expected["goal"]:
                 return self._stop(saved, "BLOCKED", "RESUME_INCOMPLETE_CHECKPOINT_STATE")
@@ -579,6 +628,11 @@ class PhaseEngine:
                 return self._stop(saved, "BLOCKED", "RESUME_ALLOWED_FILES_VIOLATION", {"files": violations})
         elif active is not None:
             return self._stop(saved, "BLOCKED", "RESUME_INCOMPLETE_CHECKPOINT_STATE")
+        else:
+            current_phase = git_guard(self.root)
+            if (current_phase["repository"] != saved["last_observed_snapshot"]
+                    or current_phase["protected"] != saved["last_observed_protected"]):
+                return self._stop(saved, "BLOCKED", "RESUME_EXTERNAL_CHANGE_DETECTED")
         for role in ("claude", "codex"):
             ok, reason = self._budget_valid(role)
             if not ok:

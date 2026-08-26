@@ -11,6 +11,7 @@
   "max_maker_continuations": 1,
   "max_api_connection_retries": 1,
   "claude_executable": "claude",
+  "claude_model": "claude-sonnet-5",
   "codex_executable": "codex",
   "allowed_tests": [
     {"name": "orchestrator", "argv": ["python", "-m", "unittest", "discover", "-s", "tests/tools", "-v"]}

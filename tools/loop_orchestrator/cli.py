@@ -95,7 +95,8 @@ def main(argv=None) -> int:
             return 0
         budget = BudgetManager(RUNTIME / "budget.json", config["soft_stop_percent"],
                                config["hard_stop_percent"], config["budget_validity_hours"])
-        maker = ClaudeCLIAdapter(ROOT, config["process_timeout_seconds"], config["claude_max_budget_usd"])
+        maker = ClaudeCLIAdapter(ROOT, config["process_timeout_seconds"], config["claude_max_budget_usd"],
+                                 config.get("claude_model"))
         maker.executable = config.get("claude_executable", "claude")
         codex = CodexCLIAdapter(ROOT, config["process_timeout_seconds"], PACKAGE / "schemas",
                                 config.get("codex_executable", "codex"))
@@ -120,7 +121,8 @@ def main(argv=None) -> int:
     try: goal = json.loads(args.goal.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc: parser.error(f"invalid goal JSON: {exc}")
     config = load_config(); budget = BudgetManager(RUNTIME / "budget.json", config["soft_stop_percent"], config["hard_stop_percent"], config["budget_validity_hours"])
-    maker = ClaudeCLIAdapter(ROOT, config["process_timeout_seconds"], config["claude_max_budget_usd"])
+    maker = ClaudeCLIAdapter(ROOT, config["process_timeout_seconds"], config["claude_max_budget_usd"],
+                             config.get("claude_model"))
     maker.executable = config.get("claude_executable", "claude")
     codex = CodexCLIAdapter(ROOT, config["process_timeout_seconds"], PACKAGE / "schemas", config.get("codex_executable", "codex"))
     state = LoopEngine(ROOT, config, maker, codex, budget).run(goal, args.max_checkpoints, execute=args.execute)

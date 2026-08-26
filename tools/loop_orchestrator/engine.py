@@ -113,7 +113,8 @@ class LoopEngine:
                     state.move(State.FAILED, f"MAKER_ERROR: {exc}"); self._save(state, "maker"); return state
                 maker, session_id = invocation.result, invocation.session_id
                 maker_record = asdict(maker) | {"session_id": session_id, "total_cost_usd": invocation.total_cost_usd,
-                                                  "num_turns": invocation.num_turns, "worktree_changed": worktree_snapshot(self.root) != before_maker}
+                                                  "num_turns": invocation.num_turns, "telemetry": invocation.telemetry,
+                                                  "worktree_changed": worktree_snapshot(self.root) != before_maker}
                 self._save(state, "maker", maker_record)
                 if maker.status.upper() == "BLOCKED": state.move(State.BLOCKED, maker.summary); self._save(state); return state
                 after_files = file_snapshot(self.root)
@@ -141,7 +142,10 @@ class LoopEngine:
                 if not self._budget(state, "codex"): return state
                 state.move(State.VERIFYING); self._save(state, "verifier")
                 diff = git(self.root, "diff", "--binary", "--no-ext-diff")
-                try: verifier = self.codex.verify(VERIFIER.format(goal=json.dumps(goal), base=state.base_commit, files=changed_files(self.root), diff=diff, tests=tests))
+                try: verifier = self.codex.verify(VERIFIER.format(
+                    goal=json.dumps(goal), base=state.base_commit,
+                    checkpoint_files=changed_files(self.root), checkpoint_diff=diff,
+                    phase_files=changed_files(self.root), phase_diff=diff, tests=tests))
                 except KeyboardInterrupt:
                     state.move(State.BLOCKED, "INTERRUPTED"); self._save(state, "verifier"); return state
                 except ProcessFailure as exc:
