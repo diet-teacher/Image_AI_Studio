@@ -1,0 +1,53 @@
+{
+  "phase_id": "phase8-atomic-training-artifacts",
+  "objective": "Prevent partially written individual portable training artifacts by adopting same-directory atomic publication for the established model definition, class mapping, and best model state_dict while preserving formats, APIs, and the non-transactional three-file bundle contract.",
+  "checkpoints": [
+    {
+      "checkpoint_id": "phase8-cp1-atomic-artifact-io-primitives",
+      "goal": "tools/loop_orchestrator/goals/phase8-cp1.json"
+    },
+    {
+      "checkpoint_id": "phase8-cp2-atomic-portable-artifact-writers",
+      "goal": "tools/loop_orchestrator/goals/phase8-cp2.json"
+    },
+    {
+      "checkpoint_id": "phase8-cp3-atomic-bundle-workflow-graduation",
+      "goal": "tools/loop_orchestrator/goals/phase8-cp3.json"
+    }
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/training/artifact_io.py",
+    "tests/training/test_artifact_io.py",
+    "src/image_ai_studio/model_definition/serialization.py",
+    "src/image_ai_studio/training/torchvision_dataset.py",
+    "src/image_ai_studio/training/checkpoint.py",
+    "tests/model_definition/test_serialization.py",
+    "tests/training/test_imagefolder_dataset.py",
+    "tests/training/test_checkpoint.py",
+    "tests/training/test_imagefolder_workflow.py",
+    "tests/gui/test_training_inference_integration.py",
+    "README.md",
+    "docs/phase8_atomic_training_artifacts.md"
+  ],
+  "allowed_tests": [
+    "phase8_cp1_atomic_artifact_io_primitives",
+    "phase8_cp2_atomic_portable_artifact_writers",
+    "phase8_cp3_atomic_bundle_workflow_graduation"
+  ],
+  "final_harness_profile": "full",
+  "max_checkpoints": 3,
+  "max_rework_rounds": 1,
+  "max_model_calls": 16,
+  "max_claude_cost_usd": 7.5,
+  "max_elapsed_seconds": 14400,
+  "completion_conditions": [
+    "Every checkpoint verifier returns PASS with checkpoint-baseline scope separated from cumulative Phase-wide context, and no checkpoint exceeds one rework round, one maker continuation, or one transient API retry.",
+    "The three established portable training artifacts are each published with same-directory temporary files, completed-byte flush/fsync, and os.replace while retaining their paths, formats, APIs, and individual overwrite semantics.",
+    "Failure before publication preserves the affected artifact's previous destination and cleans the helper-created temporary file without claiming rollback or transactionality across the other artifacts.",
+    "Claude invocation records preserve requested and canonical model telemetry, all reported modelUsage entries, costs, turns, sessions, and terminal reasons without duplicate cost accumulation.",
+    "The fixed CPU workflow and inference compatibility tests pass without actual CUDA, external network, packaging, deployment, or product-service calls.",
+    "Phase 8 documentation accurately distinguishes per-file atomicity from a multi-file transaction and makes graduation conditional on fixed tests and the final harness.",
+    "The fixed full project harness runs exactly once and passes without protected-file, HEAD, staged-index, out-of-scope worktree, or harness mutation.",
+    "The Phase stops after this manifest; no later Phase is executed and no commit, push, or pull request is performed."
+  ]
+}

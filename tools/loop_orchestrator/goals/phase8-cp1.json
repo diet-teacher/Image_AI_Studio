@@ -1,0 +1,23 @@
+{
+  "template": false,
+  "checkpoint_id": "phase8-cp1-atomic-artifact-io-primitives",
+  "objective": "Introduce focused internal same-directory atomic write primitives for text and PyTorch artifacts without changing existing artifact writers or public training APIs yet.",
+  "acceptance_criteria": [
+    "A new internal training artifact I/O module provides text and PyTorch-save operations that write to a uniquely named temporary file in the destination directory, flush and fsync completed bytes, and publish with os.replace.",
+    "If serialization, flush, fsync, or replace fails before publication, an existing destination remains byte-for-byte unchanged and the helper makes a best-effort cleanup of its own temporary file without masking the original exception.",
+    "Successful publication leaves no helper-owned temporary file and produces content loadable through the corresponding standard text or torch.load path.",
+    "The helpers do not fall back to another directory, do not delete or reuse pre-existing arbitrary files, and do not claim multi-file transactional semantics.",
+    "The module remains internal and does not alter Phase 6 or Phase 7 public controller, worker, request, result, training workflow, model-definition, or dataset APIs.",
+    "Focused CPU-only tests use temporary directories and fault injection to cover success, preservation of an existing destination, replace failure, serializer failure, cleanup, Unicode text, and shell=False/network-free behavior.",
+    "No existing artifact writer is migrated in this checkpoint and no later-checkpoint documentation or bundle transaction format is introduced."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/training/artifact_io.py",
+    "tests/training/test_artifact_io.py"
+  ],
+  "required_tests": [
+    "phase8_cp1_atomic_artifact_io_primitives"
+  ],
+  "claude_prompt": "Implement only Phase 8 checkpoint 1 in the two allowed files. Add a small internal artifact_io module with same-directory temporary-file plus flush/fsync/os.replace primitives for UTF-8 text and torch serialization, following the repository's proven checkpoint/imagefolder-resume safety patterns without changing those existing modules. Preserve an existing destination on every pre-publication failure, clean up only the helper-created temporary file, propagate the original error, and explicitly avoid claiming a transaction across multiple artifacts. Add focused CPU-only fault-injection tests. Do not migrate save_model_spec, save_class_mapping, or save_state_dict yet; that is checkpoint 2. Do not modify public APIs, GUI, workflow, docs, goals, config, dependencies, or unrelated code. Do not use actual CUDA, models, external network, Bash, or Git; do not commit or push; do not claim unexecuted tests; do not implement later checkpoints or unrelated refactors.",
+  "estimated_scope": "Small internal infrastructure slice: one new training utility and one focused test module, approximately 140-240 changed lines combined."
+}

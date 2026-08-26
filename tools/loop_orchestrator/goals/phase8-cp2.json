@@ -1,0 +1,28 @@
+{
+  "template": false,
+  "checkpoint_id": "phase8-cp2-atomic-portable-artifact-writers",
+  "objective": "Migrate the three existing Phase 7 portable training artifact writers to the tested atomic primitives while preserving their paths, formats, overwrite behavior, and public APIs.",
+  "acceptance_criteria": [
+    "save_model_spec publishes the same deterministic UTF-8 JSON representation through the checkpoint 1 atomic text primitive and retains its existing signature and load_model_spec round-trip contract.",
+    "save_class_mapping publishes the same deterministic JSON payload through the atomic text primitive and retains its existing signature, validation, ordering, and load_class_mapping behavior.",
+    "save_state_dict publishes the same model.state_dict payload through the atomic PyTorch primitive and retains its existing signature and torch.load compatibility.",
+    "Each writer preserves a pre-existing destination if serialization or os.replace fails, propagates the original exception, and leaves no helper-owned temporary file after success or handled failure.",
+    "Successful repeated writes still replace the individual destination with the latest valid artifact; the change does not promise atomicity across the three-file bundle as a whole.",
+    "Existing checkpoint save/load, resume metadata, history, training workflow, inference auto-discovery, controller, worker, device, precision, CPU, and conditional CUDA contracts remain unchanged.",
+    "Focused tests verify byte/content compatibility, round-trip loading, overwrite, fault preservation, and cleanup without actual training, CUDA, external network, or model-service calls.",
+    "No ImageFolder workflow ordering, GUI behavior, documentation, archive, integrity manifest, migration, or recovery scanning is implemented in this checkpoint."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/model_definition/serialization.py",
+    "src/image_ai_studio/training/torchvision_dataset.py",
+    "src/image_ai_studio/training/checkpoint.py",
+    "tests/model_definition/test_serialization.py",
+    "tests/training/test_imagefolder_dataset.py",
+    "tests/training/test_checkpoint.py"
+  ],
+  "required_tests": [
+    "phase8_cp2_atomic_portable_artifact_writers"
+  ],
+  "claude_prompt": "Implement only Phase 8 checkpoint 2 in the six allowed files. Reuse the committed internal atomic artifact I/O primitives from checkpoint 1 to migrate save_model_spec, save_class_mapping, and save_state_dict. Preserve every existing function signature, serialized payload, canonical filename ownership, validation rule, ordering, overwrite behavior, and loader compatibility. Add focused tests for successful round-trip, latest-write replacement, existing-destination preservation on serialization/replace failure, propagated exceptions, and temporary-file cleanup. Do not modify artifact_io.py in this checkpoint; report a blocker rather than expanding its contract. Do not change ImageFolder workflow ordering, GUI/application/controller/worker APIs, checkpoint/resume formats, history, docs, dependencies, or introduce a multi-file transaction, manifest, archive, recovery scanner, or later-checkpoint behavior. Use CPU/fakes only; no actual CUDA, external network, Bash, or Git; do not commit/push or claim unexecuted tests; avoid unrelated refactoring.",
+  "estimated_scope": "Focused writer migration: three existing writer modules and their three existing test modules, approximately 160-280 changed lines combined."
+}

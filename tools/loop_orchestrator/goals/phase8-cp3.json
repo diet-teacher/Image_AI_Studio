@@ -1,0 +1,26 @@
+{
+  "template": false,
+  "checkpoint_id": "phase8-cp3-atomic-bundle-workflow-graduation",
+  "objective": "Verify the existing real CPU ImageFolder workflow uses individually atomic portable artifacts and document the exact guarantees, failure boundaries, residual risks, and Phase 8 graduation contract.",
+  "acceptance_criteria": [
+    "Real CPU ImageFolder workflow tests demonstrate that model_definition.json, class_mapping.json, and best_model_state_dict.pt remain loadable at their established canonical paths after a successful run.",
+    "Fault-injection workflow tests demonstrate that a failed replacement preserves the corresponding pre-existing artifact and propagates the original failure without asserting that the other two artifacts roll back as a transaction.",
+    "Repeated successful workflow execution continues to publish the latest valid individual artifacts and produces no helper-owned temporary files in output_dir.",
+    "Inference auto-discovery and the explicit legacy Model JSON override remain unchanged and are covered by the fixed integration allowlist.",
+    "docs/phase8_atomic_training_artifacts.md accurately distinguishes per-file atomic publication from a multi-file transaction and documents ownership, overwrite semantics, failure behavior, CPU evidence, conditional CUDA scope, and residual risks.",
+    "README.md receives only a concise link and accurate summary; it does not claim new packaging, archive, signature, migration, cancellation, batch inference, image preview, CUDA execution, or recovery guarantees.",
+    "Phase 8 completion remains conditional on all fixed checkpoint tests and exactly one final full project harness passing on the committed implementation.",
+    "No production source, public API, goal, manifest, config, launcher, packaging, or later-Phase feature is changed in this documentation-and-integration checkpoint."
+  ],
+  "allowed_files": [
+    "tests/training/test_imagefolder_workflow.py",
+    "tests/gui/test_training_inference_integration.py",
+    "README.md",
+    "docs/phase8_atomic_training_artifacts.md"
+  ],
+  "required_tests": [
+    "phase8_cp3_atomic_bundle_workflow_graduation"
+  ],
+  "claude_prompt": "Implement only Phase 8 checkpoint 3 in the four allowed files. Do not modify production source. Add focused real-CPU and fault-injection integration coverage proving the existing ImageFolder workflow publishes loadable canonical model_definition.json, class_mapping.json, and best_model_state_dict.pt using the checkpoint 2 writers, preserves the specifically failing artifact's previous bytes when publication fails, propagates the error, and leaves no helper-owned temp files. Keep inference auto-discovery and legacy explicit override covered. Write docs/phase8_atomic_training_artifacts.md and a minimal README link that state the exact per-file guarantee and explicitly deny a transaction across the three files. Do not fabricate test counts, runs, timings, costs, CUDA observations, or guarantees. Do not change APIs, product source, config, goals, packaging, launcher, batch inference, preview, cancellation, integrity manifests, archives, migration, or later-Phase behavior. Use CPU/fakes only; no actual CUDA/model service/network, Bash, or Git; do not commit/push or claim unexecuted tests; avoid unrelated rewriting.",
+  "estimated_scope": "Integration and documentation graduation slice: two existing focused test modules, one new design/result document, and a small README update, approximately 260-420 changed lines combined."
+}
