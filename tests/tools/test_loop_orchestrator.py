@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from tools.loop_orchestrator import adapters, cli, process
 from tools.loop_orchestrator.adapters import ClaudeCLIAdapter, CodexCLIAdapter, codex_exec_prefix
-from tools.loop_orchestrator.budget import BudgetManager
+from tools.loop_orchestrator.budget import BudgetDecision, BudgetManager
 from tools.loop_orchestrator.engine import LoopEngine
 from tools.loop_orchestrator.goal import GoalError
 from tools.loop_orchestrator.phase import PhaseManifestError, validate_phase_manifest
@@ -622,6 +622,51 @@ class BudgetAndDoctorTests(unittest.TestCase):
                 path.write_text(json.dumps({"claude":entry}), encoding="utf-8")
                 self.assertEqual("BUDGET_UNKNOWN", BudgetManager(path, now=lambda:now).check("claude").code)
 
+    def test_configured_95_95_thresholds_allow_below_95_block_at_and_above(self):
+        now = datetime(2026, 1, 2, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)/"budget.json"
+            manager = BudgetManager(path, soft_stop=95, hard_stop=95, now=lambda: now)
+            for usage in (0, 69.9, 70, 94.9):
+                path.write_text(json.dumps({"claude": {"period_usage_percent": usage, "updated_at": now.isoformat(), "source": "manual"}}), encoding="utf-8")
+                decision = manager.check("claude", starting_checkpoint=True)
+                self.assertTrue(decision.allowed, f"usage {usage} should be allowed")
+            for usage in (95, 100):
+                path.write_text(json.dumps({"claude": {"period_usage_percent": usage, "updated_at": now.isoformat(), "source": "manual"}}), encoding="utf-8")
+                decision = manager.check("claude", starting_checkpoint=True)
+                self.assertFalse(decision.allowed, f"usage {usage} should be blocked")
+                self.assertEqual("HARD_STOP", decision.code)
+
+    def test_configured_70_70_thresholds_allow_69_9_block_70(self):
+        now = datetime(2026, 1, 2, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)/"budget.json"
+            manager = BudgetManager(path, soft_stop=70, hard_stop=70, now=lambda: now)
+            path.write_text(json.dumps({"claude": {"period_usage_percent": 69.9, "updated_at": now.isoformat(), "source": "manual"}}), encoding="utf-8")
+            self.assertTrue(manager.check("claude", starting_checkpoint=True).allowed)
+            path.write_text(json.dumps({"claude": {"period_usage_percent": 70, "updated_at": now.isoformat(), "source": "manual"}}), encoding="utf-8")
+            self.assertFalse(manager.check("claude", starting_checkpoint=True).allowed)
+
+    def test_unknown_stale_invalid_future_and_naive_timestamps_remain_blocked(self):
+        now = datetime(2026, 1, 2, tzinfo=timezone.utc)
+        cases = {
+            "stale": {"period_usage_percent": 10, "updated_at": (now - timedelta(hours=25)).isoformat(), "source": "manual"},
+            "future": {"period_usage_percent": 10, "updated_at": (now + timedelta(seconds=1)).isoformat(), "source": "manual"},
+            "out_of_range": {"period_usage_percent": 101, "updated_at": now.isoformat(), "source": "manual"},
+            "missing_source": {"period_usage_percent": 10, "updated_at": now.isoformat()},
+            "invalid_source": {"period_usage_percent": 10, "updated_at": now.isoformat(), "source": "   "},
+            "naive_timestamp": {"period_usage_percent": 10, "updated_at": datetime(2026, 1, 2).isoformat(), "source": "manual"},
+            "unknown_missing_entry": {},
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)/"budget.json"
+            manager = BudgetManager(path, now=lambda: now)
+            for name, entry in cases.items():
+                path.write_text(json.dumps({"claude": entry}), encoding="utf-8")
+                decision = manager.check("claude", starting_checkpoint=True)
+                self.assertFalse(decision.allowed, f"{name} should be blocked")
+                self.assertEqual("BUDGET_UNKNOWN", decision.code, name)
+
     def test_doctor_fails_when_codex_subprocess_cannot_start(self):
         def fake(argv, cwd, timeout):
             if "codex" in str(argv[0]):
@@ -742,6 +787,17 @@ class PhaseEngineTests(unittest.TestCase):
             verdict = self.verdicts.pop(0)
             return VerifierResult(verdict, [] if verdict == "PASS" else ["fix"], [], [], None, [], "rework")
         def plan(self, prompt): self.plans += 1; raise AssertionError("phase mode never calls planner")
+
+    class FakeBudget:
+        """Scripted BudgetDecision source used to prove Phase mode defers to the decision alone (no extra 70% policy)."""
+        def __init__(inner, usage=10.0, soft_stop=75.0, hard_stop=80.0):
+            inner.usage, inner.soft_stop, inner.hard_stop = usage, soft_stop, hard_stop
+        def check(inner, role, *, starting_checkpoint=False):
+            if inner.usage >= inner.hard_stop:
+                return BudgetDecision(False, "HARD_STOP", inner.usage)
+            if inner.usage >= inner.soft_stop and starting_checkpoint:
+                return BudgetDecision(False, "SOFT_STOP", inner.usage)
+            return BudgetDecision(True, "OK", inner.usage)
 
     def engine(self, maker=None, codex=None, **kwargs):
         return PhaseEngine(self.root, self.config, maker or self.Maker(self.root), codex or self.Codex(),
@@ -1133,9 +1189,9 @@ class PhaseEngineTests(unittest.TestCase):
         resumed = self.engine().run(self.manifest(), execute=True, resume=True)
         self.assertEqual("RESUME_EXTERNAL_CHANGE_DETECTED", resumed["stop_reason"])
 
-    def test_phase_usage_at_seventy_blocks_without_model_call(self):
+    def test_phase_usage_at_configured_hard_stop_blocks_without_model_call(self):
         maker = self.Maker(self.root); budget = self.budget()
-        data = budget.read(); data["codex"]["period_usage_percent"] = 70
+        data = budget.read(); data["codex"]["period_usage_percent"] = 95
         budget.path.write_text(json.dumps(data), encoding="utf-8")
         state = PhaseEngine(self.root, self.config, maker, self.Codex(), budget,
                             harness_runner=self.harness()).run(self.manifest(), execute=True)
@@ -1520,6 +1576,108 @@ class PhaseEngineTests(unittest.TestCase):
         resumed = self.engine(maker=resumed_maker).run(self.manifest(), execute=True, resume=True)
         self.assertEqual("RESUME_RECOVERY_STATE_INCOMPLETE", resumed["stop_reason"])
         self.assertEqual(0, resumed_maker.calls)
+
+    def test_no_hardcoded_70_percent_policy_maker_runs_at_70_under_default_75_80_thresholds(self):
+        manifest = self.manifest()
+        budget = self.FakeBudget(usage=70, soft_stop=75.0, hard_stop=80.0)
+        maker, codex = self.Maker(self.root), self.Codex()
+        engine = PhaseEngine(self.root, self.config, maker, codex, budget, harness_runner=self.harness())
+        state = engine.run(manifest, execute=True)
+        self.assertEqual("READY_TO_COMMIT", state["state"], state)
+        self.assertGreaterEqual(maker.calls, 1)
+
+    def test_phase_maker_called_at_94_9_under_95_95_thresholds(self):
+        manifest = self.manifest()
+        budget = self.FakeBudget(usage=94.9, soft_stop=95.0, hard_stop=95.0)
+        maker, codex = self.Maker(self.root), self.Codex()
+        engine = PhaseEngine(self.root, self.config, maker, codex, budget, harness_runner=self.harness())
+        state = engine.run(manifest, execute=True)
+        self.assertEqual("READY_TO_COMMIT", state["state"], state)
+        self.assertGreaterEqual(maker.calls, 1)
+
+    def test_phase_maker_not_called_at_95_under_95_95_thresholds(self):
+        manifest = self.manifest()
+        budget = self.FakeBudget(usage=95.0, soft_stop=95.0, hard_stop=95.0)
+        maker, codex = self.Maker(self.root), self.Codex()
+        engine = PhaseEngine(self.root, self.config, maker, codex, budget, harness_runner=self.harness())
+        state = engine.run(manifest, execute=True)
+        self.assertEqual("BLOCKED", state["state"])
+        self.assertIn("HARD_STOP", state["stop_reason"])
+        self.assertEqual(0, maker.calls)
+
+    def test_phase_retry_not_blocked_at_94_9(self):
+        manifest = self.manifest()
+        budget = self.FakeBudget(usage=94.9, soft_stop=95.0, hard_stop=95.0)
+        failure = ProcessFailure(API_CONNECTION_ERROR, "conn", return_code=1, metadata={"subtype": "error_api_connection"})
+        maker, codex = self.RecoveringMaker(self.root, [failure]), self.Codex()
+        engine = PhaseEngine(self.root, self.config, maker, codex, budget, harness_runner=self.harness())
+        state = engine.run(manifest, execute=True)
+        self.assertEqual("READY_TO_COMMIT", state["state"], state)
+        self.assertEqual(3, maker.calls)
+
+    def test_phase_retry_blocked_before_follow_up_call_when_budget_decision_shifts_to_95(self):
+        manifest = self.manifest()
+        budget = self.FakeBudget(usage=94.9, soft_stop=95.0, hard_stop=95.0)
+        class ShiftingMaker:
+            def __init__(inner, root): inner.root, inner.calls = root, 0
+            def run(inner, prompt, session_id=None):
+                inner.calls += 1
+                if inner.calls == 1:
+                    budget.usage = 95.0
+                    raise ProcessFailure(API_CONNECTION_ERROR, "conn", return_code=1, metadata={"subtype": "error_api_connection"})
+                (inner.root / "cp1.txt").write_text("changed\n", encoding="utf-8")
+                return ClaudeInvocation(MakerResult("DONE", "base", ["cp1.txt"], [], [], "done"), "session", 0.1, 1)
+        maker, codex = ShiftingMaker(self.root), self.Codex()
+        engine = PhaseEngine(self.root, self.config, maker, codex, budget, harness_runner=self.harness())
+        state = engine.run(manifest, execute=True)
+        self.assertEqual("BLOCKED", state["state"]); self.assertEqual(API_CONNECTION_ERROR, state["stop_reason"])
+        self.assertEqual(1, maker.calls)
+
+    def test_phase_continuation_not_blocked_at_94_9(self):
+        manifest = self.manifest()
+        budget = self.FakeBudget(usage=94.9, soft_stop=95.0, hard_stop=95.0)
+        failure = ProcessFailure(MODEL_BUDGET_EXHAUSTED, "budget exhausted", return_code=1,
+                                 metadata={"session_id": "resume-session", "total_cost_usd": 0.1, "subtype": "error_max_budget"})
+        maker, codex = self.RecoveringMaker(self.root, [failure]), self.Codex()
+        engine = PhaseEngine(self.root, self.config, maker, codex, budget, harness_runner=self.harness())
+        state = engine.run(manifest, execute=True)
+        self.assertEqual("READY_TO_COMMIT", state["state"], state)
+        self.assertEqual(3, maker.calls)
+
+    def test_phase_continuation_blocked_before_follow_up_call_when_budget_decision_shifts_to_95(self):
+        manifest = self.manifest()
+        budget = self.FakeBudget(usage=94.9, soft_stop=95.0, hard_stop=95.0)
+        class ShiftingMaker:
+            def __init__(inner, root): inner.root, inner.calls = root, 0
+            def run(inner, prompt, session_id=None):
+                inner.calls += 1
+                if inner.calls == 1:
+                    budget.usage = 95.0
+                    raise ProcessFailure(MODEL_BUDGET_EXHAUSTED, "budget exhausted", return_code=1,
+                                         metadata={"session_id": "resume-session", "subtype": "error_max_budget"})
+                (inner.root / "cp1.txt").write_text("changed\n", encoding="utf-8")
+                return ClaudeInvocation(MakerResult("DONE", "base", ["cp1.txt"], [], [], "done"), "session", 0.1, 1)
+        maker, codex = ShiftingMaker(self.root), self.Codex()
+        engine = PhaseEngine(self.root, self.config, maker, codex, budget, harness_runner=self.harness())
+        state = engine.run(manifest, execute=True)
+        self.assertEqual("BLOCKED", state["state"]); self.assertEqual(MODEL_BUDGET_EXHAUSTED, state["stop_reason"])
+        self.assertEqual(1, maker.calls)
+
+    def test_phase_verifier_gated_by_same_budget_decision_policy(self):
+        manifest = self.manifest()
+        budget = self.FakeBudget(usage=94.9, soft_stop=95.0, hard_stop=95.0)
+        class BudgetShiftingAfterMaker:
+            def __init__(inner, root): inner.root, inner.calls = root, 0
+            def run(inner, prompt, session_id=None):
+                inner.calls += 1
+                budget.usage = 95.0
+                (inner.root / "cp1.txt").write_text("changed\n", encoding="utf-8")
+                return ClaudeInvocation(MakerResult("DONE", "base", ["cp1.txt"], [], [], "done"), "session", 0.1, 1)
+        maker, codex = BudgetShiftingAfterMaker(self.root), self.Codex()
+        engine = PhaseEngine(self.root, self.config, maker, codex, budget, harness_runner=self.harness())
+        state = engine.run(manifest, execute=True)
+        self.assertEqual("BLOCKED", state["state"]); self.assertEqual("HARD_STOP", state["stop_reason"])
+        self.assertEqual(1, maker.calls); self.assertEqual(0, len(codex.prompts))
 
     def test_resume_inconsistent_recovery_counters_fail_closed(self):
         failure = ProcessFailure(MODEL_BUDGET_EXHAUSTED, "budget exhausted", return_code=1,

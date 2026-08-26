@@ -172,8 +172,6 @@ class PhaseEngine:
         decision = self.budget.check(role, starting_checkpoint=True)
         if not decision.allowed:
             return False, decision.code
-        if decision.usage_percent is None or decision.usage_percent >= 70:
-            return False, "PHASE_USAGE_LIMIT"
         return True, "OK"
 
     def _before_call(self, state: dict, manifest: dict, role: str) -> tuple[bool, str]:
