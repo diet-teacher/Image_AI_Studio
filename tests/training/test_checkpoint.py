@@ -965,3 +965,155 @@ def test_require_compatible_resume_config_rejects_mismatched_scheduler_fields(
 
     with pytest.raises(ValueError, match="cannot resume"):
         require_compatible_resume_config(payload["training_config"], mismatched_config)
+
+
+# -- Phase 8 checkpoint 2: atomic portable artifact writer migration --------
+#
+# save_state_dict()는 이제 내부 원자적 primitive(training/artifact_io.py의
+# atomic_torch_save, save_training_checkpoint()이 쓰는 _atomic_torch_save와
+# 동일한 패턴)를 통해 게시한다. 저장하는 payload(model.state_dict())/파일
+# 이름/덮어쓰기 동작/서명, torch.load & load_state_dict 호환성은 그대로여야
+# 하고, 직렬화나 os.replace가 게시 이전에 실패하면 기존 파일이 바이트
+# 단위로 보존되고 원래 예외가 재시도/폴백 없이 전파되며 helper 임시 파일도
+# 남지 않아야 한다. 전부 CPU 전용 -- 실제 학습/CUDA/네트워크 없음.
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_state_dict_payload_matches_model_state_dict_and_torch_load(tmp_path: Path) -> None:
+    torch.manual_seed(0)
+    model = build_model(_spec())
+    path = tmp_path / "model_state_dict.pt"
+    save_state_dict(model, path)
+
+    loaded = torch.load(path, weights_only=True)
+    expected = model.state_dict()
+    assert loaded.keys() == expected.keys()
+    for name, tensor in expected.items():
+        assert torch.equal(loaded[name], tensor)
+    assert list(tmp_path.iterdir()) == [path]  # helper 임시 파일 미잔존
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_state_dict_round_trips_through_load_state_dict(tmp_path: Path) -> None:
+    spec = _spec()
+    torch.manual_seed(0)
+    source_model = build_model(spec).eval()
+    example_input = torch.randn(2, *spec.input_shape)
+    with torch.inference_mode():
+        source_output = source_model(example_input)
+
+    path = tmp_path / "model_state_dict.pt"
+    save_state_dict(source_model, path)
+
+    torch.manual_seed(123)
+    target_model = build_model(spec).eval()
+    load_state_dict(target_model, path)
+    with torch.inference_mode():
+        reloaded_output = target_model(example_input)
+
+    assert torch.allclose(source_output, reloaded_output)
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_state_dict_repeated_write_replaces_with_latest_weights(tmp_path: Path) -> None:
+    spec = _spec()
+    path = tmp_path / "model_state_dict.pt"
+
+    torch.manual_seed(1)
+    save_state_dict(build_model(spec), path)
+
+    torch.manual_seed(2)
+    latest_model = build_model(spec)
+    save_state_dict(latest_model, path)
+
+    loaded = torch.load(path, weights_only=True)
+    for name, tensor in latest_model.state_dict().items():
+        assert torch.equal(loaded[name], tensor)
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_state_dict_preserves_existing_file_on_replace_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "model_state_dict.pt"
+    torch.manual_seed(0)
+    save_state_dict(build_model(_spec()), path)
+    original_bytes = path.read_bytes()
+
+    def failing_replace(*args: object, **kwargs: object) -> None:
+        raise OSError("permission denied")
+
+    monkeypatch.setattr("image_ai_studio.training.artifact_io.os.replace", failing_replace)
+
+    torch.manual_seed(9)
+    with pytest.raises(OSError, match="permission denied"):
+        save_state_dict(build_model(_spec()), path)
+
+    assert path.read_bytes() == original_bytes  # byte-for-byte 보존
+    assert list(tmp_path.iterdir()) == [path]  # helper 임시 파일 미잔존
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_state_dict_preserves_existing_file_on_serialization_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "model_state_dict.pt"
+    torch.manual_seed(0)
+    save_state_dict(build_model(_spec()), path)
+    original_bytes = path.read_bytes()
+
+    def failing_torch_save(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr("image_ai_studio.training.artifact_io.torch.save", failing_torch_save)
+
+    with pytest.raises(RuntimeError, match="disk full"):
+        save_state_dict(build_model(_spec()), path)
+
+    assert path.read_bytes() == original_bytes
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_state_dict_cleanup_failure_does_not_mask_original_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "model_state_dict.pt"
+
+    def failing_torch_save(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("original failure")
+
+    def failing_unlink(self: Path, *args: object, **kwargs: object) -> None:
+        raise OSError("cleanup also failed")
+
+    monkeypatch.setattr("image_ai_studio.training.artifact_io.torch.save", failing_torch_save)
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+
+    with pytest.raises(RuntimeError, match="original failure"):
+        save_state_dict(build_model(_spec()), path)
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_state_dict_serialization_failure_without_existing_dest_leaves_dir_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "model_state_dict.pt"
+
+    def failing_torch_save(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("image_ai_studio.training.artifact_io.torch.save", failing_torch_save)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        save_state_dict(build_model(_spec()), path)
+
+    assert list(tmp_path.iterdir()) == []  # partial/temp 파일 미잔존
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_state_dict_signature_is_unchanged() -> None:
+    import inspect
+
+    params = list(inspect.signature(save_state_dict).parameters)
+    assert params == ["model", "path"]

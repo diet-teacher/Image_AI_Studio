@@ -50,8 +50,9 @@ from image_ai_studio.training.imagefolder_workflow import (
     _validate_precision_device_compatibility,
     run_imagefolder_training_workflow,
 )
+from image_ai_studio.training import artifact_io
 from image_ai_studio.training.loop import TrainingHistory, evaluate_classification_metrics, run_training
-from image_ai_studio.training.torchvision_dataset import make_imagefolder_datasets
+from image_ai_studio.training.torchvision_dataset import load_class_mapping, make_imagefolder_datasets
 
 INPUT_SHAPE = (3, 8, 8)
 SEED = 20260803
@@ -2892,3 +2893,219 @@ def test_model_definition_json_write_failure_propagates_and_is_not_swallowed(
     # 이후 단계의 산출물이 전혀 생성되지 않았어야 한다.
     assert not (output_dir / "best_model_state_dict.pt").exists()
     assert not (output_dir / "training_history.json").exists()
+
+
+# -- Phase 8 checkpoint 3: per-file 원자적 게시 (portable artifacts) ----------
+#
+# CP1은 training/artifact_io.py에 원자적 primitive(atomic_write_text /
+# atomic_torch_save)를, CP2는 save_model_spec() / save_class_mapping() /
+# save_state_dict()의 게시 단계를 그 primitive로 옮겼다. 아래 테스트는
+# 커밋된 real CPU ImageFolder 워크플로우가 실제로 세 산출물
+# (model_definition.json / class_mapping.json / best_model_state_dict.pt)을
+# 각자 canonical 경로에 개별적으로 원자적으로 게시한다는 것과, 그것이 세
+# 파일에 걸친 트랜잭션이 아니라는 것(한 게시 실패 시 먼저 게시된 형제는
+# 롤백되지 않음)을 고정한다. docs/phase8_atomic_training_artifacts.md 참고.
+
+_PHASE8_CP3 = pytest.mark.phase8_cp3_atomic_bundle_workflow_graduation
+
+_CANONICAL_ATOMIC_ARTIFACTS = (
+    "model_definition.json",
+    "class_mapping.json",
+    "best_model_state_dict.pt",
+)
+
+
+def _second_spec() -> ModelSpec:
+    """첫 실행과 확실히 다른 spec -- model_definition.json 교체 여부를
+    ModelSpec 객체 동등성으로 관찰하기 위함."""
+    return ModelSpec(
+        name="phase8_cp3_second_model",
+        input_shape=INPUT_SHAPE,
+        layers=[FlattenSpec(), LinearSpec(out_features=32), ReLUSpec(), LinearSpec(out_features=2)],
+    )
+
+
+def _make_two_class_dataset(root: Path, class_names: tuple[str, str]) -> None:
+    """cat/dog 고정(_make_standard_dataset) 대신 임의의 두 class 이름으로
+    train/val/test 3-split 데이터셋을 만든다 -- 반복 실행 간
+    class_mapping.json이 실제로 교체되는지를 관찰하기 위함. 두 class라
+    _spec()/_second_spec()의 최종 LinearSpec(out_features=2)와 그대로
+    호환된다."""
+    for split in ("train", "val", "test"):
+        for class_name, base_color in zip(class_names, ((250, 250, 250), (5, 5, 5))):
+            class_dir = root / split / class_name
+            class_dir.mkdir(parents=True)
+            for i in range(4):
+                Image.new("RGB", (20, 20), color=base_color).save(class_dir / f"{i}.png")
+
+
+def _helper_temp_files(output_dir: Path) -> list[str]:
+    """artifact_io._publish_atomically()가 만드는 helper 임시 파일
+    (.{name}.XXXX.tmp)의 이름 목록. 성공 게시 뒤에는 임시 파일이 목적지로
+    교체되어 남지 않고, 게시 실패 시에도 정상 정리 경로에서는(unlink이
+    성공하면) 남지 않는다 -- 정리 자체는 best-effort다(unlink이 실패하면
+    임시 파일이 남을 수 있으나 원래 예외를 가리지는 않는다)."""
+    return sorted(
+        p.name for p in output_dir.iterdir() if p.name.startswith(".") and p.name.endswith(".tmp")
+    )
+
+
+def _run_once(model_json_path: Path, dataset_root: Path, output_dir: Path) -> ImageFolderWorkflowResult:
+    return run_imagefolder_training_workflow(
+        ImageFolderWorkflowRequest(
+            model_json_path=model_json_path,
+            dataset_root=dataset_root,
+            training_config=TrainingConfig(epochs=1, batch_size=4, learning_rate=1e-2),
+            output_dir=output_dir,
+            export_torchscript=False,
+            seed=SEED,
+        )
+    )
+
+
+@_PHASE8_CP3
+def test_successful_run_publishes_loadable_canonical_artifacts_via_atomic_writers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """정상 실행은 model_definition.json / class_mapping.json /
+    best_model_state_dict.pt 세 개를 canonical 경로에 게시하고, 셋 다
+    artifact_io._publish_atomically()(= CP2 writer)를 거치며, 저장 뒤
+    established load_* 경로로 다시 읽힌다. 성공 게시 뒤 output_dir에는
+    helper 임시 파일이 남지 않는다."""
+    _make_standard_dataset(tmp_path)
+    spec = _spec()
+    model_json_path = _write_model_json(tmp_path, spec)
+    output_dir = tmp_path / "out"
+
+    published: list[str] = []
+    real_publish = artifact_io._publish_atomically
+
+    def spy_publish(path, serialize):
+        published.append(Path(path).name)
+        return real_publish(path, serialize)
+
+    monkeypatch.setattr(artifact_io, "_publish_atomically", spy_publish)
+
+    result = _run_once(model_json_path, tmp_path, output_dir)
+
+    # 셋 다 원자적 primitive를 거쳤다.
+    assert set(_CANONICAL_ATOMIC_ARTIFACTS) <= set(published)
+
+    # 셋 다 canonical 경로에 존재하고 established load 경로로 읽힌다.
+    assert result.class_mapping_path == output_dir / "class_mapping.json"
+    assert result.best_model_state_dict_path == output_dir / "best_model_state_dict.pt"
+    assert load_model_spec(output_dir / _MODEL_DEFINITION_FILENAME) == spec
+    assert load_class_mapping(result.class_mapping_path)["classes"] == ["cat", "dog"]
+    load_state_dict(build_model(spec), result.best_model_state_dict_path)  # torch.load 경로
+
+    assert _helper_temp_files(output_dir) == []
+
+
+@_PHASE8_CP3
+def test_repeated_successful_runs_publish_latest_and_leave_no_helper_temp_files(tmp_path: Path) -> None:
+    """같은 output_dir 재사용 -- 두 번째 성공 실행이 최신 유효 산출물을
+    게시하고(model_definition.json은 두 번째 spec으로, class_mapping.json은
+    두 번째 실행의 class 매핑으로 원자적으로 교체), output_dir에 helper 소유
+    임시 파일이 남지 않는다. 두 실행은 서로 다른 valid class 이름을 쓰는
+    별개 데이터셋을 학습해, 최종 class_mapping.json이 두 번째 실행의
+    매핑과 정확히 일치하고 stale한 첫 실행 매핑일 수는 없음을 관찰한다."""
+    output_dir = tmp_path / "out"
+
+    first_root = tmp_path / "first_ds"
+    _make_two_class_dataset(first_root, ("ant", "bee"))
+    first_spec = _spec(name="phase8_cp3_first_model")
+    _run_once(_write_model_json(tmp_path / "first", first_spec), first_root, output_dir)
+    first_mapping = json.loads((output_dir / "class_mapping.json").read_text())
+    assert first_mapping["classes"] == ["ant", "bee"]
+
+    second_root = tmp_path / "second_ds"
+    _make_two_class_dataset(second_root, ("cat", "dog"))
+    second_spec = _second_spec()
+    result = _run_once(_write_model_json(tmp_path / "second", second_spec), second_root, output_dir)
+
+    assert load_model_spec(output_dir / _MODEL_DEFINITION_FILENAME) == second_spec
+    load_state_dict(build_model(second_spec), result.best_model_state_dict_path)
+
+    # class_mapping.json은 두 번째 실행의 매핑으로 원자적으로 교체됐다 --
+    # 첫 실행의 stale한 ant/bee 매핑이 아니라 두 번째 실행과 정확히 일치.
+    final_mapping = json.loads(result.class_mapping_path.read_text())
+    assert final_mapping == {"classes": ["cat", "dog"], "class_to_idx": {"cat": 0, "dog": 1}}
+    assert load_class_mapping(result.class_mapping_path)["classes"] == ["cat", "dog"]
+    assert final_mapping != first_mapping
+    assert "ant" not in final_mapping["class_to_idx"] and "bee" not in final_mapping["class_to_idx"]
+
+    assert _helper_temp_files(output_dir) == []
+
+
+@_PHASE8_CP3
+def test_failed_model_definition_publication_preserves_previous_bytes_and_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """model_definition.json 게시의 os.replace가 실패하면: 그 목적지
+    파일의 기존 바이트가 그대로 보존되고, 원래 OSError가 재시도/폴백
+    없이 전파되며, helper 임시 파일이 남지 않는다. (이 테스트는 다른 두
+    산출물이 트랜잭션처럼 롤백된다고 주장하지 않는다 -- 여기서는
+    model_definition.json이 첫 게시라 형제가 아직 재게시되지 않았을 뿐이다.)"""
+    _make_standard_dataset(tmp_path)
+    output_dir = tmp_path / "out"
+
+    first_spec = _spec(name="phase8_cp3_preserved_model")
+    _run_once(_write_model_json(tmp_path / "first", first_spec), tmp_path, output_dir)
+    model_def_path = output_dir / _MODEL_DEFINITION_FILENAME
+    preserved_bytes = model_def_path.read_bytes()
+
+    # 두 번째 model.json은 monkeypatch를 걸기 전에 만들어 둔다 -- _write_model_json
+    # 자체가 save_model_spec()(= atomic_write_text -> os.replace)를 쓰므로,
+    # patch 이후에 부르면 워크플로우가 아니라 이 fixture 준비 단계에서 터진다.
+    second_json = _write_model_json(tmp_path / "second", _second_spec())
+
+    def failing_replace(*args: object, **kwargs: object) -> None:
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(artifact_io.os, "replace", failing_replace)
+
+    with pytest.raises(OSError, match="simulated replace failure"):
+        _run_once(second_json, tmp_path, output_dir)
+
+    assert model_def_path.read_bytes() == preserved_bytes
+    assert load_model_spec(model_def_path) == first_spec
+    assert _helper_temp_files(output_dir) == []
+
+
+@_PHASE8_CP3
+def test_failed_state_dict_publication_preserves_that_file_but_not_siblings_as_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """best_model_state_dict.pt 게시(torch.save 직렬화)가 실패하면: 그
+    파일만 이전 실행의 바이트를 유지하고 원래 RuntimeError가 전파된다.
+    이 테스트는 그 실행에서 **먼저** 게시된 model_definition.json이 새
+    내용을 담은 채 남는다는 것을 확인한다 -- 세 파일이 트랜잭션으로 함께
+    롤백된다고 주장하지 않는다(docs/phase8_atomic_training_artifacts.md §4-2)."""
+    _make_standard_dataset(tmp_path)
+    output_dir = tmp_path / "out"
+
+    first_spec = _spec(name="phase8_cp3_first_model")
+    _run_once(_write_model_json(tmp_path / "first", first_spec), tmp_path, output_dir)
+    state_dict_path = output_dir / "best_model_state_dict.pt"
+    preserved_state_dict_bytes = state_dict_path.read_bytes()
+
+    second_spec = _second_spec()
+    second_json = _write_model_json(tmp_path / "second", second_spec)
+
+    def failing_torch_save(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("simulated state_dict serialization failure")
+
+    # export_torchscript=False + checkpoint_out 없음이라, 워크플로우에서
+    # artifact_io.torch.save를 실제로 호출하는 지점은 save_state_dict()뿐이다.
+    monkeypatch.setattr(artifact_io.torch, "save", failing_torch_save)
+
+    with pytest.raises(RuntimeError, match="simulated state_dict serialization failure"):
+        _run_once(second_json, tmp_path, output_dir)
+
+    # 실패한 파일: 이전 실행의 바이트를 그대로 유지.
+    assert state_dict_path.read_bytes() == preserved_state_dict_bytes
+
+    # 먼저 게시된 형제: 트랜잭션 롤백 없음 -- 새 실행의 내용으로 이미 게시됨.
+    assert load_model_spec(output_dir / _MODEL_DEFINITION_FILENAME) == second_spec
+
+    assert _helper_temp_files(output_dir) == []

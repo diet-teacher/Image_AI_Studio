@@ -1731,6 +1731,22 @@ Inference tab의 Model JSON 입력란은 이제 선택 필드입니다: 비워 �
 
 ---
 
+## Phase 8: 원자적 학습 산출물 (Atomic Training Artifacts)
+
+Phase 7의 세 휴대 산출물(`model_definition.json` / `class_mapping.json` /
+`best_model_state_dict.pt`)은 이제 각각 원자적으로 게시됩니다 -- 목적지와
+같은 디렉터리의 임시 파일에 쓴 뒤 `os.replace()`로 교체하므로, 저장이
+도중에 실패해도 목적지 경로에는 이전의 완전한 파일이나 새 완전한 파일만
+존재하고 반쯤 쓰인 파일은 남지 않습니다. 직렬화 표현, 고정 파일명,
+덮어쓰기 정책, `load_*` 호환성은 그대로이며 새
+packaging/archive/manifest 포맷은 추가되지 않았습니다.
+
+파일 단위 보장의 정확한 계약과 경계(세 파일을 하나로 묶는 트랜잭션은
+아님), 실패 시 동작, CPU 검증 근거와 CUDA 조건부 범위, residual risk는
+[docs/phase8_atomic_training_artifacts.md](docs/phase8_atomic_training_artifacts.md)를 참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON

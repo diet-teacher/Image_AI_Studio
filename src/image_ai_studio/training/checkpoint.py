@@ -38,6 +38,7 @@ from pathlib import Path
 import torch
 from torch import nn
 
+from image_ai_studio.training.artifact_io import atomic_torch_save
 from image_ai_studio.training.config import (
     RESUME_CONFIG_FIELDS,
     RESUME_CONFIG_LEGACY_DEFAULTS,
@@ -100,10 +101,16 @@ def _atomic_torch_save(payload: dict[str, object], path: Path) -> None:
 
 
 def save_state_dict(model: nn.Module, path: str | Path) -> None:
-    """model.state_dict()를 파일로 저장. 상위 디렉터리 자동 생성."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(model.state_dict(), path)
+    """model.state_dict()를 파일로 저장. 상위 디렉터리 자동 생성.
+
+    저장하는 payload(``model.state_dict()``)와 파일 이름/덮어쓰기 동작,
+    ``load_state_dict()``/``torch.load()`` 호환성은 그대로다 -- 게시만 내부
+    원자적 primitive(``training/artifact_io.py``의 ``atomic_torch_save``,
+    ``save_training_checkpoint()``이 쓰는 ``_atomic_torch_save``와 동일한
+    "같은 디렉터리 임시 파일 -> flush/fsync -> os.replace" 패턴)를 거친다.
+    직렬화나 교체가 실패하면 기존 파일이 바이트 단위로 보존되고 원래
+    예외가 재시도/폴백 없이 전파되며 helper 임시 파일도 남지 않는다."""
+    atomic_torch_save(model.state_dict(), path)
 
 
 def load_state_dict(model: nn.Module, path: str | Path, *, map_location: str = "cpu") -> nn.Module:

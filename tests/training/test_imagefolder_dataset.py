@@ -6,6 +6,8 @@ train/val/test ImageFolder 구조를 직접 만들어 완전히 오프라인으�
 """
 from __future__ import annotations
 
+import inspect
+import json
 from pathlib import Path
 
 import pytest
@@ -229,3 +231,134 @@ def test_load_class_mapping_rejects_duplicate_class_names_without_class_to_idx(t
 # import하는 것은 make_imagefolder_datasets/require_matching_num_classes/
 # save_class_mapping/load_class_mapping뿐이며, 이 중 어느 것도 네트워크
 # 접근이 필요한 코드 경로를 갖지 않는다.
+
+
+# -- Phase 8 checkpoint 2: atomic portable artifact writer migration --------
+#
+# save_class_mapping()은 이제 내부 원자적 primitive(training/artifact_io.py의
+# atomic_write_text)를 통해 게시한다. 저장하는 결정론적 JSON payload/파일
+# 이름/덮어쓰기 동작/서명/ordering, 그리고 load_class_mapping()의 검증
+# 계약은 그대로여야 하고, 직렬화나 os.replace가 게시 이전에 실패하면 기존
+# 파일이 바이트 단위로 보존되고 원래 예외가 그대로 전파되며 helper 임시
+# 파일도 남지 않아야 한다. 전부 CPU 전용이며 tmp_path에 직접 만든
+# 리스트/딕셔너리만 쓴다 -- 실제 학습/CUDA/네트워크/모델 서비스 호출 없음.
+
+_CLASSES = ["airplane", "bird", "cat"]
+_CLASS_TO_IDX = {"airplane": 0, "bird": 1, "cat": 2}
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_class_mapping_writes_same_deterministic_json_payload(tmp_path: Path) -> None:
+    path = tmp_path / "classes.json"
+    save_class_mapping(_CLASSES, _CLASS_TO_IDX, path)
+
+    expected = json.dumps(
+        {"classes": _CLASSES, "class_to_idx": _CLASS_TO_IDX}, indent=2
+    )
+    assert path.read_bytes() == expected.encode("utf-8")
+    assert list(tmp_path.iterdir()) == [path]  # helper 임시 파일 미잔존
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_class_mapping_round_trips_through_load_class_mapping(tmp_path: Path) -> None:
+    path = tmp_path / "classes.json"
+    save_class_mapping(_CLASSES, _CLASS_TO_IDX, path)
+
+    loaded = load_class_mapping(path)
+    assert loaded["classes"] == _CLASSES
+    assert loaded["class_to_idx"] == _CLASS_TO_IDX
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_class_mapping_preserves_class_order_for_loader_validation(tmp_path: Path) -> None:
+    """save_class_mapping은 넘어온 리스트 순서를 그대로 직렬화하고,
+    load_class_mapping의 order-consistency 검증은 그 순서를 그대로
+    통과시킨다(migration으로 ordering 계약이 바뀌지 않음)."""
+    classes = ["zebra", "ant", "moose"]
+    class_to_idx = {"zebra": 0, "ant": 1, "moose": 2}
+    path = tmp_path / "classes.json"
+    save_class_mapping(classes, class_to_idx, path)
+
+    assert json.loads(path.read_text(encoding="utf-8"))["classes"] == classes
+    assert load_class_mapping(path)["class_to_idx"] == class_to_idx
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_class_mapping_repeated_write_replaces_with_latest_payload(tmp_path: Path) -> None:
+    path = tmp_path / "classes.json"
+    save_class_mapping(_CLASSES, _CLASS_TO_IDX, path)
+
+    newer_classes = ["dog", "frog"]
+    newer_map = {"dog": 0, "frog": 1}
+    save_class_mapping(newer_classes, newer_map, path)
+
+    loaded = load_class_mapping(path)
+    assert loaded["classes"] == newer_classes
+    assert loaded["class_to_idx"] == newer_map
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_class_mapping_preserves_existing_file_on_replace_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "classes.json"
+    save_class_mapping(_CLASSES, _CLASS_TO_IDX, path)
+    original_bytes = path.read_bytes()
+
+    def failing_replace(*args: object, **kwargs: object) -> None:
+        raise OSError("cross-device link")
+
+    monkeypatch.setattr("image_ai_studio.training.artifact_io.os.replace", failing_replace)
+
+    with pytest.raises(OSError, match="cross-device link"):
+        save_class_mapping(["new"], {"new": 0}, path)
+
+    assert path.read_bytes() == original_bytes  # byte-for-byte 보존
+    assert list(tmp_path.iterdir()) == [path]  # helper 임시 파일 미잔존
+    assert load_class_mapping(path)["classes"] == _CLASSES
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_class_mapping_preserves_existing_file_on_serialization_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "classes.json"
+    save_class_mapping(_CLASSES, _CLASS_TO_IDX, path)
+    original_bytes = path.read_bytes()
+
+    def failing_dumps(*args: object, **kwargs: object) -> str:
+        raise RuntimeError("serialization boom")
+
+    monkeypatch.setattr(
+        "image_ai_studio.training.torchvision_dataset.json.dumps", failing_dumps
+    )
+
+    with pytest.raises(RuntimeError, match="serialization boom"):
+        save_class_mapping(["new"], {"new": 0}, path)
+
+    assert path.read_bytes() == original_bytes
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_class_mapping_serialization_failure_without_existing_dest_leaves_dir_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "classes.json"
+
+    def failing_replace(*args: object, **kwargs: object) -> None:
+        raise OSError("nope")
+
+    monkeypatch.setattr("image_ai_studio.training.artifact_io.os.replace", failing_replace)
+
+    with pytest.raises(OSError, match="nope"):
+        save_class_mapping(_CLASSES, _CLASS_TO_IDX, path)
+
+    assert list(tmp_path.iterdir()) == []  # partial/temp 파일 미잔존
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_class_mapping_signature_is_unchanged() -> None:
+    params = list(inspect.signature(save_class_mapping).parameters)
+    assert params == ["classes", "class_to_idx", "path"]

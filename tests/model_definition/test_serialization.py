@@ -303,3 +303,100 @@ def test_branch_json_nested_branch_raises_model_validation_error() -> None:
                 ],
             }
         )
+
+
+# -- Phase 8 checkpoint 2: atomic portable artifact writer migration --------
+#
+# save_model_spec()는 이제 내부 원자적 primitive(training/artifact_io.py의
+# atomic_write_text)를 통해 게시한다. 직렬화한 결정론적 UTF-8 JSON 표현/
+# 파일 이름/덮어쓰기 동작/load_model_spec round-trip 계약은 그대로여야
+# 하고, 직렬화나 os.replace가 게시 이전에 실패하면 기존 파일이 바이트
+# 단위로 보존되고 원래 예외가 그대로 전파되며 helper 임시 파일도 남지
+# 않아야 한다. 전부 CPU 전용이며 tmp_path만 쓴다 -- CUDA/네트워크/모델
+# 서비스 호출 없음, 실제 학습 없음.
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_model_spec_writes_same_deterministic_utf8_json_bytes(tmp_path: Path) -> None:
+    spec = _example_model_spec()
+    path = tmp_path / "model.json"
+    save_model_spec(spec, path)
+
+    expected = json.dumps(model_spec_to_dict(spec), indent=2)
+    assert path.read_bytes() == expected.encode("utf-8")
+    assert list(tmp_path.iterdir()) == [path]  # helper 임시 파일 미잔존
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_model_spec_round_trips_through_load_model_spec(tmp_path: Path) -> None:
+    spec = _example_model_spec()
+    path = tmp_path / "model.json"
+    save_model_spec(spec, path)
+
+    assert load_model_spec(path) == spec
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_model_spec_repeated_write_replaces_with_latest_spec(tmp_path: Path) -> None:
+    path = tmp_path / "model.json"
+    save_model_spec(_example_model_spec(), path)
+
+    newer = ModelSpec(
+        name="newer_model",
+        input_shape=(3, 32, 32),
+        layers=[FlattenSpec(), LinearSpec(out_features=7)],
+    )
+    save_model_spec(newer, path)
+
+    assert load_model_spec(path) == newer
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_model_spec_preserves_existing_file_on_replace_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "model.json"
+    save_model_spec(_example_model_spec(), path)
+    original_bytes = path.read_bytes()
+
+    def failing_replace(*args: object, **kwargs: object) -> None:
+        raise OSError("permission denied")
+
+    monkeypatch.setattr("image_ai_studio.training.artifact_io.os.replace", failing_replace)
+
+    replacement = ModelSpec(name="doomed", input_shape=(3, 8, 8), layers=[FlattenSpec()])
+    with pytest.raises(OSError, match="permission denied"):
+        save_model_spec(replacement, path)
+
+    assert path.read_bytes() == original_bytes  # byte-for-byte 보존
+    assert list(tmp_path.iterdir()) == [path]  # helper 임시 파일 미잔존
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_model_spec_preserves_existing_file_on_serialization_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "model.json"
+    save_model_spec(_example_model_spec(), path)
+    original_bytes = path.read_bytes()
+
+    def failing_dumps(*args: object, **kwargs: object) -> str:
+        raise RuntimeError("serialization boom")
+
+    monkeypatch.setattr("image_ai_studio.model_definition.serialization.json.dumps", failing_dumps)
+
+    replacement = ModelSpec(name="doomed", input_shape=(3, 8, 8), layers=[FlattenSpec()])
+    with pytest.raises(RuntimeError, match="serialization boom"):
+        save_model_spec(replacement, path)
+
+    assert path.read_bytes() == original_bytes
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.phase8_cp2_atomic_portable_artifact_writers
+def test_save_model_spec_signature_is_unchanged() -> None:
+    import inspect
+
+    params = list(inspect.signature(save_model_spec).parameters)
+    assert params == ["model_spec", "path"]

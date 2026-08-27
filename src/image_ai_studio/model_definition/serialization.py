@@ -13,6 +13,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from image_ai_studio.model_definition.errors import ModelValidationError
+from image_ai_studio.training.artifact_io import atomic_write_text
 from image_ai_studio.model_definition.specs import (
     AdaptiveAvgPool2dSpec,
     BatchNorm2dSpec,
@@ -125,10 +126,16 @@ def model_spec_from_dict(data: dict) -> ModelSpec:
 
 
 def save_model_spec(model_spec: ModelSpec, path: str | Path) -> None:
-    """model_spec을 JSON 파일로 저장. 상위 디렉터리 자동 생성."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(model_spec_to_dict(model_spec), indent=2), encoding="utf-8")
+    """model_spec을 JSON 파일로 저장. 상위 디렉터리 자동 생성.
+
+    직렬화 표현(``json.dumps(..., indent=2)``의 결정론적 UTF-8 텍스트)과
+    파일 이름/덮어쓰기 동작은 그대로다 -- 게시만 내부 원자적 primitive
+    (``training/artifact_io.py``의 ``atomic_write_text``)를 거친다: 목적지와
+    같은 디렉터리의 임시 파일에 쓴 뒤 ``os.replace()``로 교체하므로,
+    직렬화나 교체가 실패하면 기존 파일이 바이트 단위로 보존되고 원래
+    예외가 그대로 전파되며 helper 임시 파일도 남지 않는다.
+    """
+    atomic_write_text(json.dumps(model_spec_to_dict(model_spec), indent=2), path)
 
 
 def load_model_spec(path: str | Path) -> ModelSpec:

@@ -26,6 +26,8 @@ from torch.utils.data import Dataset, Subset, random_split
 from torchvision import transforms
 from torchvision.datasets import CIFAR10, ImageFolder
 
+from image_ai_studio.training.artifact_io import atomic_write_text
+
 NUM_CLASSES = 10
 DEFAULT_VAL_FRACTION = 0.1  # 공식 train 50,000 -> train 45,000 / val 5,000
 
@@ -229,11 +231,17 @@ def save_class_mapping(classes: list[str], class_to_idx: dict[str, int], path: s
     """class 이름 목록/매핑을 JSON으로 저장 (best model과 함께 inference에
     필요한 metadata -- 숫자 class index만으로는 실제 class 이름을 알 수
     없기 때문). 저장 형식은 history.py의 save_training_history()와 동일한
-    표준 json 패턴을 따른다."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    표준 json 패턴을 따른다.
+
+    직렬화 payload(``{"classes": [...], "class_to_idx": {...}}``의 결정론적
+    ``json.dumps(..., indent=2)`` UTF-8 텍스트)와 파일 이름/덮어쓰기
+    동작은 그대로다 -- 게시만 내부 원자적 primitive
+    (``training/artifact_io.py``의 ``atomic_write_text``)를 거친다: 목적지와
+    같은 디렉터리의 임시 파일에 쓴 뒤 ``os.replace()``로 교체하므로,
+    직렬화나 교체가 실패하면 기존 파일이 바이트 단위로 보존되고 원래
+    예외가 그대로 전파되며 helper 임시 파일도 남지 않는다."""
     payload = {"classes": list(classes), "class_to_idx": dict(class_to_idx)}
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    atomic_write_text(json.dumps(payload, indent=2), path)
 
 
 def _require_valid_class_mapping(data: object, path: Path) -> None:

@@ -27,11 +27,13 @@ import json
 import re
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from image_ai_studio.gui.main_window import MainWindow
-from image_ai_studio.model_definition.serialization import save_model_spec
+from image_ai_studio.model_definition.serialization import load_model_spec, save_model_spec
 from image_ai_studio.model_definition.specs import FlattenSpec, LinearSpec, ModelSpec, ReLUSpec
+from image_ai_studio.training.torchvision_dataset import load_class_mapping
 
 INPUT_SHAPE = (3, 8, 8)
 _CLASS_COLORS = {"cat": (250, 250, 250), "dog": (5, 5, 5)}
@@ -193,6 +195,72 @@ def test_phase7_cp3_output_dir_alone_drives_inference_without_model_json(tmp_pat
     # Model JSON field is deliberately left blank -- inference must derive
     # `output_dir/model_definition.json` on its own (Phase 7 CP2).
     assert inference_page._model_json_edit.text() == ""
+    inference_page._image_path_edit.setText(str(image_path))
+    inference_page._device_combo.setCurrentText("cpu")
+    inference_page._precision_combo.setCurrentText("fp32")
+
+    inference_page._on_run_clicked()
+    qtbot.waitUntil(lambda: inference_page._run_button.isEnabled(), timeout=30000)
+
+    class_mapping = json.loads(class_mapping_path.read_text(encoding="utf-8"))
+    _assert_valid_inference_result(inference_page, class_mapping)
+
+    qtbot.waitUntil(lambda: _thread_cleaned_up(inference_page), timeout=5000)
+
+
+@pytest.mark.phase8_cp3_atomic_bundle_workflow_graduation
+def test_phase8_cp3_atomic_publication_leaves_clean_output_dir(tmp_path: Path, qtbot) -> None:
+    """Phase 8 CP3: after a real CPU training run through the GUI, the three
+    portable artifacts (model_definition.json / class_mapping.json /
+    best_model_state_dict.pt) are individually published at their canonical
+    paths -- each loadable through its established loader -- and the
+    per-file atomic writers (Phase 8 CP2) leave no helper-owned temp file
+    (`.<name>.*.tmp`) behind in `output_dir`. Auto-discovery inference then
+    consumes exactly those published artifacts with the Model JSON field
+    left blank (Phase 7 CP2 path, unchanged by Phase 8)."""
+    _make_dataset(tmp_path)
+    model_json_path = tmp_path / "model.json"
+    _write_model_json(model_json_path, "phase8_cp3_gui_atomic")
+    output_dir = tmp_path / "out"
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+
+    training_page = window._training_page
+    inference_page = window._inference_page
+
+    _run_real_training(
+        training_page,
+        qtbot,
+        model_json_path=model_json_path,
+        dataset_root=tmp_path,
+        output_dir=output_dir,
+    )
+
+    model_definition_path = output_dir / "model_definition.json"
+    class_mapping_path = output_dir / "class_mapping.json"
+    best_state_dict_path = output_dir / "best_model_state_dict.pt"
+    assert model_definition_path.exists()
+    assert class_mapping_path.exists()
+    assert best_state_dict_path.exists()
+
+    # Each of the three is loadable through its established loader. The
+    # best_model_state_dict.pt torch.load path is exercised by the
+    # auto-discovery inference run below.
+    assert load_model_spec(model_definition_path).name == "phase8_cp3_gui_atomic"
+    assert load_class_mapping(class_mapping_path)["classes"] == ["cat", "dog"]
+
+    # No helper-owned temp file from the atomic writers is left in output_dir.
+    leftover_temp_files = sorted(
+        p.name for p in output_dir.iterdir() if p.name.startswith(".") and p.name.endswith(".tmp")
+    )
+    assert leftover_temp_files == []
+
+    window._tabs.setCurrentWidget(inference_page)
+
+    image_path = tmp_path / "test" / "cat" / "0.png"
+    inference_page._training_output_dir_edit.setText(str(output_dir))
+    assert inference_page._model_json_edit.text() == ""  # auto-discovery, blank end to end
     inference_page._image_path_edit.setText(str(image_path))
     inference_page._device_combo.setCurrentText("cpu")
     inference_page._precision_combo.setCurrentText("fp32")
