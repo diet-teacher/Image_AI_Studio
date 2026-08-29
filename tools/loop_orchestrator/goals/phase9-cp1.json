@@ -1,0 +1,22 @@
+{
+  "template": false,
+  "checkpoint_id": "phase9-cp1-pytest-marker-registry-hygiene",
+  "objective": "Register the existing Phase 6C, Phase 7, and Phase 8 pytest markers in the repository's canonical pytest configuration so strict marker validation succeeds without changing test selection, assertions, warning filters, or product behavior.",
+  "acceptance_criteria": [
+    "pyproject.toml remains the sole pytest configuration source and registers every custom Phase marker currently referenced by repository tests: phase6c_cp1_inference_page, phase6c_cp2_inference_page_lifecycle, phase6c_cp3_inference_results, phase6c_cp4_main_window_integration, phase7_cp2_inference_bundle_discovery, phase8_cp1_atomic_artifact_io_primitives, phase8_cp2_atomic_portable_artifact_writers, and phase8_cp3_atomic_bundle_workflow_graduation.",
+    "Each marker has a concise, accurate description that identifies its checkpoint scope, with no duplicate names or aliases for the same meaning.",
+    "The change does not rename markers, modify test bodies, add skip or xfail behavior, weaken assertions, alter test discovery or selection, or suppress warnings through filterwarnings or global ignore rules.",
+    "The fixed allowlisted pytest command runs all modules that currently use the registered Phase markers with --strict-markers and passes without PytestUnknownMarkWarning.",
+    "Built-in and plugin-provided markers such as parametrize and skipif are not redundantly registered by the project.",
+    "No product code, test source, dependency, README, documentation, goal, manifest, user setting, or runtime state is changed by the checkpoint implementation.",
+    "Python 3.11 future-annotation imports and TorchScript serialization APIs remain unchanged because investigation found no future-import defect and torch.export migration is outside this maintenance scope."
+  ],
+  "allowed_files": [
+    "pyproject.toml"
+  ],
+  "required_tests": [
+    "phase9_cp1_pytest_marker_registry_hygiene"
+  ],
+  "claude_prompt": "Implement only Phase 9 checkpoint 1 by minimally editing pyproject.toml. Add pytest marker registry entries for the eight existing Phase markers named in the acceptance criteria, each with a concise checkpoint-specific description. Preserve all existing project and pytest settings. Do not add filterwarnings, warning ignores, aliases, skip/xfail behavior, dependencies, or unrelated formatting. Do not rename markers or edit any test, product, documentation, goal, manifest, runtime, or user-settings file. Do not alter from __future__ imports or TorchScript APIs. Do not use Bash or Git, do not run tests, and do not implement later work.",
+  "estimated_scope": "Very small maintenance change: one pytest configuration table in pyproject.toml, approximately 8-15 added lines."
+}

@@ -1,0 +1,29 @@
+{
+  "phase_id": "phase9-pytest-marker-registry-hygiene",
+  "objective": "Eliminate verified PytestUnknownMarkWarning noise by registering the repository's existing Phase checkpoint markers without changing test semantics, product behavior, or unrelated annotation and TorchScript compatibility contracts.",
+  "checkpoints": [
+    {
+      "checkpoint_id": "phase9-cp1-pytest-marker-registry-hygiene",
+      "goal": "tools/loop_orchestrator/goals/phase9-cp1.json"
+    }
+  ],
+  "allowed_files": [
+    "pyproject.toml"
+  ],
+  "allowed_tests": [
+    "phase9_cp1_pytest_marker_registry_hygiene"
+  ],
+  "final_harness_profile": "full",
+  "max_checkpoints": 1,
+  "max_rework_rounds": 1,
+  "max_model_calls": 4,
+  "max_claude_cost_usd": 1.5,
+  "max_elapsed_seconds": 3600,
+  "completion_conditions": [
+    "The single checkpoint verifier returns PASS with no changes outside pyproject.toml and no verifier mutation.",
+    "All eight existing custom Phase markers are registered once with accurate descriptions and strict marker validation passes for every test module that uses them.",
+    "No marker is renamed, no warning is hidden, and test selection, assertions, skip/xfail behavior, product code, future imports, and TorchScript behavior remain unchanged.",
+    "The fixed full project harness runs exactly once after checkpoint acceptance and passes without HEAD, staged-index, protected-file, out-of-scope worktree, or harness mutation.",
+    "The Phase stops after this manifest without running another Phase or performing add, commit, push, or pull-request operations."
+  ]
+}
