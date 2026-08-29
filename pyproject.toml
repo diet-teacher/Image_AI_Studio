@@ -18,3 +18,13 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "phase6c_cp1_inference_page: Phase 6C CP1 inference page widget construction and static layout",
+    "phase6c_cp2_inference_page_lifecycle: Phase 6C CP2 inference page runtime lifecycle and state transitions",
+    "phase6c_cp3_inference_results: Phase 6C CP3 inference results rendering and presentation",
+    "phase6c_cp4_main_window_integration: Phase 6C CP4 inference page integration into the main window",
+    "phase7_cp2_inference_bundle_discovery: Phase 7 CP2 inference bundle discovery and selection",
+    "phase8_cp1_atomic_artifact_io_primitives: Phase 8 CP1 atomic artifact I/O primitives",
+    "phase8_cp2_atomic_portable_artifact_writers: Phase 8 CP2 atomic portable artifact writers",
+    "phase8_cp3_atomic_bundle_workflow_graduation: Phase 8 CP3 atomic bundle workflow graduation",
+]
