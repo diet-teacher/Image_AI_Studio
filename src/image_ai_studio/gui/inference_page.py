@@ -19,7 +19,21 @@ derives those two fixed paths. An explicit Model JSON value still wins --
 this keeps outputs produced before Phase 7 (no `model_definition.json`)
 working unchanged. No ModelSpec parsing happens here; a missing canonical
 file still surfaces only through the existing `build_inference_request` ->
-`InferenceController` -> worker `failed` path."""
+`InferenceController` -> worker `failed` path.
+
+Phase 10 CP3: the page grows an explicit single-image vs folder mode. In
+folder mode the visible shared artifact/device/precision inputs plus a
+dedicated folder chooser are snapshotted into a checkpoint-1
+`FolderInferenceRequest` and run through one injected
+`FolderInferenceController` + `QtFolderInferenceWorker` using the exact
+same canonical QThread lifecycle (bound-method slots, worker.deleteLater
+on the worker's own finished/failed, thread.deleteLater on thread.finished).
+Per-image outcomes are shown in discovered order, one row per image, with
+aggregate total/succeeded/failed counts. A folder run with per-image
+failures mixed in is a *completed* batch (worker `finished`), not a fatal
+failure; `failed` is reserved for a fatal folder error. Single-image mode
+is untouched -- same request, controller, worker, formatting, overlap
+prevention, rerun, cleanup, and close-defer behavior."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -27,6 +41,7 @@ from pathlib import Path
 import torch
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -35,12 +50,17 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
+from image_ai_studio.application.folder_inference_controller import FolderInferenceController
 from image_ai_studio.application.inference_controller import InferenceController, build_inference_request
+from image_ai_studio.gui.qt_folder_inference_worker import QtFolderInferenceWorker
 from image_ai_studio.gui.qt_inference_worker import QtInferenceWorker
+from image_ai_studio.inference.folder_inference import FolderInferenceRequest, FolderInferenceResult
 from image_ai_studio.inference.single_image_inference import InferenceRequest, InferenceResult
 from image_ai_studio.training.config import PRECISION_CHOICES
 
@@ -61,6 +81,17 @@ _MODEL_DEFINITION_FILENAME = "model_definition.json"
 ModelSpec 파일명 -- `best_model_state_dict.pt`/`class_mapping.json`과 동일하게
 고정된 이름으로 derive한다(Phase 7 CP2)."""
 
+_MODE_SINGLE = "Single Image"
+_MODE_FOLDER = "Folder"
+"""`_mode_combo`의 두 항목. 명시적으로 사용자가 고르는 값이며 folder
+run은 `_MODE_FOLDER`가 선택된 상태에서 Run을 눌렀을 때만 시작된다
+(Phase 10 CP3)."""
+
+_FOLDER_SUMMARY_PLACEHOLDER = "Total: --  Succeeded: --  Failed: --"
+_FOLDER_RESULT_HEADERS = ("Image", "Status", "Predicted Class", "Confidence", "Error")
+_FOLDER_STATUS_SUCCESS = "Success"
+_FOLDER_STATUS_FAILURE = "Failure"
+
 
 def _format_confidence(confidence: float) -> str:
     return f"{confidence:.2%}"
@@ -79,6 +110,14 @@ def _format_probabilities(probabilities: dict[str, float]) -> str:
     return "\n".join(lines)
 
 
+def _folder_summary_text(result: FolderInferenceResult) -> str:
+    return (
+        f"Total: {result.total}  "
+        f"Succeeded: {result.succeeded}  "
+        f"Failed: {result.failed}"
+    )
+
+
 class InferencePage(QWidget):
     """Single-image inference form. Accepts optional InferenceController
     injection for tests. Run Inference builds the request (CP1), then runs
@@ -90,7 +129,14 @@ class InferencePage(QWidget):
     contract where practical. Unlike TrainingPage there is no cooperative
     stop API for inference -- `request_close()` never cancels an active run,
     it only defers the `close_requested` emission until the run finishes
-    naturally and worker/thread cleanup (`_on_thread_finished`) has run."""
+    naturally and worker/thread cleanup (`_on_thread_finished`) has run.
+
+    Phase 10 CP3: also accepts an optional `FolderInferenceController`
+    injection and runs folder batches on a separate QThread +
+    `QtFolderInferenceWorker` pair. The single-image and folder lifecycles
+    are independent QThread/worker pairs but share one status label, one
+    control-enable helper, and one `_close_pending` flag -- only one of the
+    two can be active at a time (overlap prevention rejects the second)."""
 
     close_requested = Signal()
 
@@ -99,33 +145,41 @@ class InferencePage(QWidget):
         parent: QWidget | None = None,
         *,
         controller: InferenceController | None = None,
+        folder_controller: FolderInferenceController | None = None,
     ) -> None:
         super().__init__(parent)
         self._controller = controller if controller is not None else InferenceController()
+        self._folder_controller = (
+            folder_controller if folder_controller is not None else FolderInferenceController()
+        )
         self._thread: QThread | None = None
         self._worker: QtInferenceWorker | None = None
+        self._folder_thread: QThread | None = None
+        self._folder_worker: QtFolderInferenceWorker | None = None
+        self._active_folder_path: Path = Path(".")
         self._close_pending = False
         self._build_ui()
 
     # -- public: MainWindow.closeEvent()가 사용 ---------------------------------
 
     def is_inference_active(self) -> bool:
-        """`_thread`는 worker/thread cleanup(`_on_thread_finished`)이 끝날
-        때까지 `None`이 아니다 -- `finished`/`failed` 같은 terminal worker
-        signal을 받은 시점이 아니라 cleanup이 실제로 끝난 시점에만
-        idle이 된다."""
-        return self._thread is not None
+        """single-image `_thread`나 folder `_folder_thread` 중 하나라도
+        cleanup(`_on_thread_finished`/`_on_folder_thread_finished`)이 끝나지
+        않았으면 active다 -- `finished`/`failed` 같은 terminal worker signal을
+        받은 시점이 아니라 cleanup이 실제로 끝난 시점에만 idle이 된다."""
+        return self._thread is not None or self._folder_thread is not None
 
     def request_close(self) -> None:
         """Inference 중이 아니면 즉시 `close_requested`를 emit한다.
-        Inference 중이면 취소하지 않고 자연스럽게 끝나기를 기다렸다가
-        `_on_thread_finished()`에서 cleanup이 끝난 뒤에만 emit한다."""
+        Inference(단일 이미지 또는 폴더) 중이면 취소하지 않고 자연스럽게
+        끝나기를 기다렸다가 해당 thread cleanup 핸들러에서 cleanup이
+        끝난 뒤에만 emit한다."""
         if not self.is_inference_active():
             self.close_requested.emit()
             return
         self._close_pending = True
 
-    # -- public request builder (used by tests and future Run handler) ---------
+    # -- public request builders (used by tests and Run handlers) -------------
 
     def _build_request(self) -> InferenceRequest:
         """Convert widget values to InferenceRequest. Derives the two fixed
@@ -147,15 +201,39 @@ class InferencePage(QWidget):
             precision=self._precision_combo.currentText(),
         )
 
+    def _build_folder_request(self) -> FolderInferenceRequest:
+        """Snapshot the *visible* shared artifact/device/precision inputs and
+        the folder chooser into the checkpoint-1 `FolderInferenceRequest`.
+        Artifact-path derivation (fixed state-dict/class-mapping filenames,
+        optional-with-auto-derive Model JSON) is identical to
+        `_build_request()` -- the only difference is `folder_path` in place
+        of a single `image_path`."""
+        output_dir = self._training_output_dir_edit.text().strip()
+        output_path = Path(output_dir) if output_dir else Path("")
+        model_json_override = self._model_json_edit.text().strip()
+        model_json_path = model_json_override or str(output_path / _MODEL_DEFINITION_FILENAME)
+        return FolderInferenceRequest(
+            model_json_path=Path(model_json_path),
+            state_dict_path=output_path / "best_model_state_dict.pt",
+            class_mapping_path=output_path / "class_mapping.json",
+            folder_path=Path(self._folder_path_edit.text().strip()),
+            device=self._device_combo.currentText(),
+            precision=self._precision_combo.currentText(),
+        )
+
     # -- UI construction -------------------------------------------------------
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.addWidget(self._build_inputs_group())
+        layout.addLayout(self._build_mode_row())
+        layout.addWidget(self._build_folder_input_container())
         layout.addLayout(self._build_actions_row())
         layout.addWidget(self._build_status_label())
         layout.addWidget(self._build_result_group())
+        layout.addWidget(self._build_folder_result_group())
         layout.addStretch(1)
+        self._on_mode_changed()  # apply initial (single-image) visibility
 
     def _build_inputs_group(self) -> QGroupBox:
         group = QGroupBox("Inference Inputs")
@@ -201,6 +279,30 @@ class InferencePage(QWidget):
 
         return group
 
+    def _build_mode_row(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Mode:"))
+        self._mode_combo = QComboBox()
+        self._mode_combo.addItem(_MODE_SINGLE)
+        self._mode_combo.addItem(_MODE_FOLDER)
+        self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        row.addWidget(self._mode_combo)
+        row.addStretch(1)
+        return row
+
+    def _build_folder_input_container(self) -> QWidget:
+        container = QWidget()
+        row = QHBoxLayout(container)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(QLabel("Input Folder:"))
+        self._folder_path_edit = QLineEdit()
+        self._browse_folder_button = QPushButton("Browse...")
+        self._browse_folder_button.clicked.connect(self._browse_folder)
+        row.addWidget(self._folder_path_edit)
+        row.addWidget(self._browse_folder_button)
+        self._folder_input_container = container
+        return container
+
     def _build_actions_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
         self._run_button = QPushButton("Run Inference")
@@ -230,6 +332,24 @@ class InferencePage(QWidget):
         self._duration_value_label = QLabel(_RESULT_PLACEHOLDER)
         form.addRow("Duration:", self._duration_value_label)
 
+        self._result_group = group
+        return group
+
+    def _build_folder_result_group(self) -> QGroupBox:
+        group = QGroupBox("Folder Inference Results")
+        box = QVBoxLayout(group)
+
+        self._folder_summary_label = QLabel(_FOLDER_SUMMARY_PLACEHOLDER)
+        box.addWidget(self._folder_summary_label)
+
+        table = QTableWidget(0, len(_FOLDER_RESULT_HEADERS))
+        table.setHorizontalHeaderLabels(list(_FOLDER_RESULT_HEADERS))
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        self._folder_results_table = table
+        box.addWidget(table)
+
+        self._folder_result_group = group
         return group
 
     # -- slots -----------------------------------------------------------------
@@ -253,13 +373,40 @@ class InferencePage(QWidget):
         if path:
             self._image_path_edit.setText(path)
 
-    def _on_run_clicked(self) -> None:
-        if self._worker is not None or self._thread is not None:
-            # A run is already active -- overlap prevention even if this
-            # handler is invoked directly while a previous run has not
-            # finished cleaning up yet.
-            return
+    def _browse_folder(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select Input Folder")
+        if path:
+            self._folder_path_edit.setText(path)
 
+    def _on_mode_changed(self, *_args: object) -> None:
+        """single-image / folder 모드에 따라 folder 전용 입력과 두 결과
+        영역의 표시 여부만 토글한다. 공유되는 artifact/device/precision
+        입력은 두 모드 모두에서 그대로 보인다."""
+        folder_mode = self._is_folder_mode()
+        self._folder_input_container.setVisible(folder_mode)
+        self._folder_result_group.setVisible(folder_mode)
+        self._result_group.setVisible(not folder_mode)
+
+    def _is_folder_mode(self) -> bool:
+        return self._mode_combo.currentText() == _MODE_FOLDER
+
+    def _on_run_clicked(self) -> None:
+        if (
+            self._thread is not None
+            or self._worker is not None
+            or self._folder_thread is not None
+            or self._folder_worker is not None
+        ):
+            # A run (single-image or folder) is already active -- overlap
+            # prevention even if this handler is invoked directly while a
+            # previous run has not finished cleaning up yet.
+            return
+        if self._is_folder_mode():
+            self._start_folder_run()
+        else:
+            self._start_single_run()
+
+    def _start_single_run(self) -> None:
         try:
             request = self._build_request()
         except Exception as exc:  # noqa: BLE001 -- request 조립 실패는 controller를 건드리지 않는다
@@ -288,11 +435,43 @@ class InferencePage(QWidget):
         self._thread.finished.connect(self._on_thread_finished)
 
         self._clear_result_display()
+        self._clear_folder_display()
         self._set_controls_enabled(False)
         self._status_label.setText("Running")
         self._thread.start()
 
-    # -- worker signal handlers -------------------------------------------------
+    def _start_folder_run(self) -> None:
+        try:
+            request = self._build_folder_request()
+        except Exception as exc:  # noqa: BLE001 -- request 조립 실패는 controller를 건드리지 않는다
+            self._status_label.setText(f"Failed: {exc}")
+            return
+
+        self._active_folder_path = request.folder_path
+        self._folder_thread = QThread(self)
+        self._folder_worker = QtFolderInferenceWorker(self._folder_controller, request)
+        self._folder_worker.moveToThread(self._folder_thread)
+        self._folder_thread.started.connect(self._folder_worker.run)
+        # single-image 쪽과 동일한 계약: signal은 self의 bound method에만
+        # connect한다(plain 함수/lambda는 worker thread에서 직접 실행됨).
+        self._folder_worker.finished.connect(self._on_folder_finished)
+        self._folder_worker.failed.connect(self._on_folder_failed)
+        self._folder_worker.finished.connect(self._folder_thread.quit)
+        self._folder_worker.failed.connect(self._folder_thread.quit)
+        # worker.deleteLater()는 worker 자신의 finished/failed에 connect
+        # (QtFolderInferenceWorker docstring의 deleteLater ordering 계약).
+        self._folder_worker.finished.connect(self._folder_worker.deleteLater)
+        self._folder_worker.failed.connect(self._folder_worker.deleteLater)
+        self._folder_thread.finished.connect(self._folder_thread.deleteLater)
+        self._folder_thread.finished.connect(self._on_folder_thread_finished)
+
+        self._clear_result_display()
+        self._clear_folder_display()
+        self._set_controls_enabled(False)
+        self._status_label.setText("Running")
+        self._folder_thread.start()
+
+    # -- worker signal handlers -----------------------------------------------
 
     def _on_finished(self, result: InferenceResult) -> None:
         # 존재하는 InferenceResult 필드만 그대로 표시한다 -- 여기서
@@ -318,6 +497,32 @@ class InferencePage(QWidget):
             self._close_pending = False
             self.close_requested.emit()
 
+    # -- folder worker signal handlers --------------------------------------
+
+    def _on_folder_finished(self, result: FolderInferenceResult) -> None:
+        # per-image 실패가 섞여 있어도 이것은 *완료된 배치*다 -- backend가
+        # 정상 반환한 aggregate를 그대로 표시할 뿐 예측값을 재계산하지
+        # 않는다. stale single-image 결과가 남지 않도록 그쪽도 비운다.
+        self._clear_result_display()
+        self._populate_folder_rows(result)
+        self._folder_summary_label.setText(_folder_summary_text(result))
+        self._status_label.setText("Finished")
+
+    def _on_folder_failed(self, message: str) -> None:
+        # fatal folder 실패 -- 이전 성공 배치 표시가 남아 있으면 안 되므로
+        # folder 결과 영역을 초기화한다.
+        self._clear_folder_display()
+        first_line = message.splitlines()[0] if message else "Unknown error"
+        self._status_label.setText(f"Failed: {first_line}")
+
+    def _on_folder_thread_finished(self) -> None:
+        self._folder_thread = None
+        self._folder_worker = None
+        self._set_controls_enabled(True)
+        if self._close_pending:
+            self._close_pending = False
+            self.close_requested.emit()
+
     # -- helpers -----------------------------------------------------------------
 
     def _clear_result_display(self) -> None:
@@ -325,6 +530,49 @@ class InferencePage(QWidget):
         self._confidence_value_label.setText(_RESULT_PLACEHOLDER)
         self._probabilities_value_label.setText(_RESULT_PLACEHOLDER)
         self._duration_value_label.setText(_RESULT_PLACEHOLDER)
+
+    def _clear_folder_display(self) -> None:
+        self._folder_results_table.setRowCount(0)
+        self._folder_summary_label.setText(_FOLDER_SUMMARY_PLACEHOLDER)
+
+    def _populate_folder_rows(self, result: FolderInferenceResult) -> None:
+        """Rebuild every row from scratch -- `setRowCount(0)` first so a
+        rerun never leaves stale or duplicated rows. Row order follows the
+        aggregate's `items` order verbatim (discovery order, CP1 contract)."""
+        table = self._folder_results_table
+        table.setRowCount(0)
+        table.setRowCount(len(result.items))
+        for row, outcome in enumerate(result.items):
+            relative = self._folder_relative_display(outcome.image_path)
+            if outcome.succeeded:
+                cells = (
+                    relative,
+                    _FOLDER_STATUS_SUCCESS,
+                    outcome.result.predicted_class,
+                    _format_confidence(outcome.result.confidence),
+                    _RESULT_PLACEHOLDER,
+                )
+            else:
+                error_text = outcome.error or "Unknown error"
+                first_line = error_text.splitlines()[0] if error_text else "Unknown error"
+                cells = (
+                    relative,
+                    _FOLDER_STATUS_FAILURE,
+                    _RESULT_PLACEHOLDER,
+                    _RESULT_PLACEHOLDER,
+                    first_line,
+                )
+            for col, text in enumerate(cells):
+                table.setItem(row, col, QTableWidgetItem(text))
+
+    def _folder_relative_display(self, image_path: Path) -> str:
+        """Path relative to the folder that was run. Discovery is flat, so
+        this is normally just the filename; fall back to the bare name if
+        the outcome path is not under the recorded folder."""
+        try:
+            return str(image_path.relative_to(self._active_folder_path))
+        except (ValueError, TypeError):
+            return image_path.name
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         for widget in (
@@ -336,6 +584,9 @@ class InferencePage(QWidget):
             self._browse_image_button,
             self._device_combo,
             self._precision_combo,
+            self._mode_combo,
+            self._folder_path_edit,
+            self._browse_folder_button,
             self._run_button,
         ):
             widget.setEnabled(enabled)

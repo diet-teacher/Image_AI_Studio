@@ -1693,9 +1693,10 @@ Phase 5의 Training GUI 위에 단일 이미지 추론(single-image inference)
 Input Image 하나를 선택하고, Device(cpu/cuda/cuda:N)/Precision
 (fp32/fp16/bf16)을 고른 뒤 Run Inference를 누르면 QThread에서 비동기로
 실행되고, 완료되면 Predicted Class/Confidence/Class Probabilities/
-Duration을 표시합니다. **단일 이미지만 지원**하며(폴더/배치 추론,
-추론 취소, 이미지 미리보기는 미지원), 학습에서 방금 만든 모델을 같은
-세션에서 바로 이어서 추론할 수 있습니다.
+Duration을 표시합니다. Phase 6 시점에는 **단일 이미지만 지원**했고(추론
+취소, 이미지 미리보기는 미지원), 폴더 단위 추론은 이후 Phase 10에서
+추가됐습니다(아래 "Phase 10: 폴더 추론" 절 참고). 학습에서 방금 만든
+모델을 같은 세션에서 바로 이어서 추론할 수 있습니다.
 
 학습/추론이 진행 중인 상태에서 창을 닫으면 확인 다이얼로그가 뜨고,
 동의하면 학습에는 기존 cooperative stop을, 추론에는 취소 없이 자연
@@ -1744,6 +1745,34 @@ packaging/archive/manifest 포맷은 추가되지 않았습니다.
 파일 단위 보장의 정확한 계약과 경계(세 파일을 하나로 묶는 트랜잭션은
 아님), 실패 시 동작, CPU 검증 근거와 CUDA 조건부 범위, residual risk는
 [docs/phase8_atomic_training_artifacts.md](docs/phase8_atomic_training_artifacts.md)를 참고하세요.
+
+---
+
+## Phase 10: 폴더 추론 (Folder Inference)
+
+Inference tab에 **Single Image / Folder** 모드 선택을 추가했습니다. Folder
+모드에서는 Input Image 하나 대신 폴더 하나를 고르고 Run Inference를 누르면,
+그 폴더 **바로 아래**(하위 폴더 제외)에서 지원 확장자
+(`.bmp`, `.gif`, `.jpeg`, `.jpg`, `.png`, `.tif`, `.tiff`, `.webp`,
+대소문자 무시)를 가진 이미지를 파일 이름 오름차순으로 모아 **한 장씩
+순차적으로** 기존 단일 이미지 추론 backend로 처리합니다. 결과는 발견
+순서 그대로 이미지당 한 행(이미지 이름 / 성공·실패 / 예측 클래스 /
+confidence / 오류)으로 표시되고, 상단에 Total / Succeeded / Failed 집계가
+나옵니다.
+
+한 이미지의 실패(예: 깨진 파일)는 그 행에만 bounded 오류로 격리되고 이후
+이미지 처리는 계속됩니다 -- 폴더에 지원 이미지가 하나도 없을 때만 전체
+실행이 실패로 끝납니다. 아티팩트 경로 규칙(`model_definition.json` 자동
+탐색 + 명시적 Model JSON override), Device/Precision, 비동기 QThread
+실행, 취소 없는 창 닫기 조율, 단일 이미지 모드 동작은 Phase 6~7과 동일하게
+유지됩니다. 진행률 표시, 추론 취소, 이미지 미리보기, 병렬 처리, 폴더
+재귀 탐색, 결과 export, 패키징/설치 관리자는 지원하지 않습니다.
+
+정확한 계약(지원 확장자·정렬·per-image 격리·UI 상태 전이·기존 backend
+재사용), 공개 API / portable artifact 호환성, CPU 검증 근거, 잔여 성능·
+취소 한계, Phase 10 졸업 조건은
+[docs/phase10_folder_inference.md](docs/phase10_folder_inference.md)를
+참고하세요.
 
 ---
 

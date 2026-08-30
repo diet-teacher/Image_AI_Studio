@@ -23,8 +23,15 @@ from pathlib import Path
 import pytest
 from PySide6.QtWidgets import QFormLayout
 
+from image_ai_studio.application.folder_inference_controller import FolderInferenceController
 from image_ai_studio.application.inference_controller import InferenceController
 from image_ai_studio.gui.inference_page import InferencePage
+from image_ai_studio.inference.folder_inference import (
+    FolderInferenceError,
+    FolderInferenceRequest,
+    FolderInferenceResult,
+    ImageOutcome,
+)
 from image_ai_studio.inference.single_image_inference import InferenceResult
 
 pytestmark = pytest.mark.phase6c_cp1_inference_page
@@ -1075,3 +1082,752 @@ def test_failed_auto_discovery_run_clears_previous_successful_result(tmp_path, q
     assert page._confidence_value_label.text() == "--"
     assert page._probabilities_value_label.text() == "--"
     assert page._duration_value_label.text() == "--"
+
+
+# ===============================================================================
+# Phase 10 CP3: folder-mode inference
+# (FolderInferenceController + QtFolderInferenceWorker, deterministic per-image
+#  rows, aggregate counts, stale-state clearing, overlap prevention, rerun,
+#  nonblocking close-defer -- all with injected fakes, no real model/CUDA/FS job)
+# ===============================================================================
+
+
+_FOLDER_CLASSES = ("cat", "dog")
+
+
+def _folder_infer_result(predicted_class: str = "cat", confidence: float = 0.9) -> InferenceResult:
+    return InferenceResult(
+        predicted_index=0,
+        predicted_class=predicted_class,
+        confidence=confidence,
+        probabilities={predicted_class: confidence},
+        inference_duration_seconds=0.01,
+    )
+
+
+def _ok(name: str, predicted_class: str = "cat", confidence: float = 0.9) -> ImageOutcome:
+    return ImageOutcome(
+        image_path=Path(name),
+        result=_folder_infer_result(predicted_class, confidence),
+        error=None,
+    )
+
+
+def _fail(name: str, error: str = "RuntimeError: boom") -> ImageOutcome:
+    return ImageOutcome(image_path=Path(name), result=None, error=error)
+
+
+def _aggregate(*outcomes: ImageOutcome) -> FolderInferenceResult:
+    return FolderInferenceResult(items=tuple(outcomes))
+
+
+def _should_not_run_single(request):
+    raise AssertionError("single-image backend must not be called in folder-mode tests")
+
+
+def _should_not_run_folder(request):
+    raise AssertionError("folder backend must not be called in single-image tests")
+
+
+def _folder_page(qtbot, folder_backend, *, single_backend=None) -> InferencePage:
+    page = InferencePage(
+        controller=InferenceController(backend=single_backend or _should_not_run_single),
+        folder_controller=FolderInferenceController(backend=folder_backend),
+    )
+    qtbot.addWidget(page)
+    return page
+
+
+def _fill_folder_fields(page: InferencePage, tmp_path: Path, folder: Path | None = None) -> None:
+    page._training_output_dir_edit.setText(str(tmp_path))
+    page._model_json_edit.setText(str(tmp_path / "model.json"))
+    page._folder_path_edit.setText(str(folder if folder is not None else tmp_path / "images"))
+    page._mode_combo.setCurrentText("Folder")
+
+
+# -- mode control + static folder UI -------------------------------------------
+
+
+def test_mode_combo_defaults_to_single_image_and_lists_both_modes(qtbot) -> None:
+    page = _make_page(qtbot)
+    assert page._mode_combo.currentText() == "Single Image"
+    items = [page._mode_combo.itemText(i) for i in range(page._mode_combo.count())]
+    assert items == ["Single Image", "Folder"]
+
+
+def test_folder_input_and_result_visibility_follow_mode(qtbot) -> None:
+    page = _make_page(qtbot)
+    assert page._folder_input_container.isHidden() is True
+    assert page._folder_result_group.isHidden() is True
+    assert page._result_group.isHidden() is False
+
+    page._mode_combo.setCurrentText("Folder")
+    assert page._folder_input_container.isHidden() is False
+    assert page._folder_result_group.isHidden() is False
+    assert page._result_group.isHidden() is True
+
+    page._mode_combo.setCurrentText("Single Image")
+    assert page._folder_input_container.isHidden() is True
+    assert page._folder_result_group.isHidden() is True
+    assert page._result_group.isHidden() is False
+
+
+def test_folder_mode_retains_every_existing_single_image_control(qtbot) -> None:
+    page = _make_page(qtbot)
+    page._mode_combo.setCurrentText("Folder")
+    for widget in (
+        page._training_output_dir_edit,
+        page._browse_output_button,
+        page._model_json_edit,
+        page._browse_model_button,
+        page._image_path_edit,
+        page._browse_image_button,
+        page._device_combo,
+        page._precision_combo,
+        page._run_button,
+        page._status_label,
+        page._predicted_class_value_label,
+    ):
+        assert widget is not None
+    assert page._run_button.text() == "Run Inference"
+
+
+def test_folder_path_field_empty_initially(qtbot) -> None:
+    page = _make_page(qtbot)
+    assert page._folder_path_edit.text() == ""
+
+
+def test_folder_results_table_headers_and_empty_start(qtbot) -> None:
+    page = _make_page(qtbot)
+    table = page._folder_results_table
+    headers = [table.horizontalHeaderItem(i).text() for i in range(table.columnCount())]
+    assert headers == ["Image", "Status", "Predicted Class", "Confidence", "Error"]
+    assert table.rowCount() == 0
+
+
+def test_folder_summary_shows_placeholder_initially(qtbot) -> None:
+    page = _make_page(qtbot)
+    assert page._folder_summary_label.text() == "Total: --  Succeeded: --  Failed: --"
+
+
+# -- construction stays side-effect free --------------------------------------
+
+
+def test_construction_does_not_create_folder_thread_or_worker(qtbot) -> None:
+    page = _folder_page(qtbot, lambda request: _aggregate(_ok("a.png")))
+    assert page._folder_thread is None
+    assert page._folder_worker is None
+    assert page._folder_controller.state == "idle"
+
+
+def test_default_folder_controller_created_when_none_injected(qtbot) -> None:
+    page = InferencePage()
+    qtbot.addWidget(page)
+    assert isinstance(page._folder_controller, FolderInferenceController)
+
+
+def test_injected_folder_controller_is_used(qtbot) -> None:
+    folder_controller = FolderInferenceController(backend=lambda request: _aggregate(_ok("a.png")))
+    page = InferencePage(folder_controller=folder_controller)
+    qtbot.addWidget(page)
+    assert page._folder_controller is folder_controller
+
+
+# -- folder request building (snapshot of visible inputs) ---------------------
+
+
+def test_build_folder_request_snapshots_visible_inputs(tmp_path, qtbot) -> None:
+    page = _make_page(qtbot)
+    folder = tmp_path / "batch"
+    page._training_output_dir_edit.setText(str(tmp_path))
+    page._model_json_edit.setText(str(tmp_path / "arch.json"))
+    page._folder_path_edit.setText(str(folder))
+    page._device_combo.setCurrentText("cpu")
+    page._precision_combo.setCurrentText("fp32")
+    page._mode_combo.setCurrentText("Folder")
+
+    request = page._build_folder_request()
+
+    assert isinstance(request, FolderInferenceRequest)
+    assert request.model_json_path == tmp_path / "arch.json"
+    assert request.state_dict_path == tmp_path / "best_model_state_dict.pt"
+    assert request.class_mapping_path == tmp_path / "class_mapping.json"
+    assert request.folder_path == folder
+    assert request.device == "cpu"
+    assert request.precision == "fp32"
+
+
+def test_build_folder_request_auto_derives_model_json_when_blank(tmp_path, qtbot) -> None:
+    page = _make_page(qtbot)
+    page._training_output_dir_edit.setText(str(tmp_path))
+    page._folder_path_edit.setText(str(tmp_path / "batch"))
+    page._mode_combo.setCurrentText("Folder")
+
+    request = page._build_folder_request()
+
+    assert request.model_json_path == tmp_path / "model_definition.json"
+
+
+# -- all-success batch --------------------------------------------------------
+
+
+def test_folder_run_all_success_populates_rows_and_counts(tmp_path, qtbot) -> None:
+    aggregate = _aggregate(
+        _ok("a.png", predicted_class="cat", confidence=0.9),
+        _ok("b.png", predicted_class="dog", confidence=0.5),
+    )
+    page = _folder_page(qtbot, lambda request: aggregate)
+    _fill_folder_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+
+    assert page._status_label.text() == "Finished"
+    table = page._folder_results_table
+    assert table.rowCount() == 2
+    assert table.item(0, 0).text() == "a.png"
+    assert table.item(0, 1).text() == "Success"
+    assert table.item(0, 2).text() == "cat"
+    assert table.item(0, 3).text() == "90.00%"
+    assert table.item(0, 4).text() == "--"
+    assert table.item(1, 0).text() == "b.png"
+    assert table.item(1, 2).text() == "dog"
+    assert table.item(1, 3).text() == "50.00%"
+    assert page._folder_summary_label.text() == "Total: 2  Succeeded: 2  Failed: 0"
+    assert page._folder_controller.state == "finished"
+    assert page._folder_thread is None
+    assert page._folder_worker is None
+
+
+def test_folder_rows_follow_discovered_aggregate_order(tmp_path, qtbot) -> None:
+    aggregate = _aggregate(_ok("z_first.png"), _ok("a_second.png"), _ok("m_third.png"))
+    page = _folder_page(qtbot, lambda request: aggregate)
+    _fill_folder_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+
+    names = [page._folder_results_table.item(i, 0).text() for i in range(3)]
+    assert names == ["z_first.png", "a_second.png", "m_third.png"]
+
+
+def test_folder_row_shows_path_relative_to_chosen_folder(tmp_path, qtbot) -> None:
+    folder = tmp_path / "images"
+    aggregate = _aggregate(
+        ImageOutcome(image_path=folder / "a.png", result=_folder_infer_result("cat", 0.9), error=None),
+        ImageOutcome(image_path=folder / "b.png", result=None, error="RuntimeError: x"),
+    )
+    page = _folder_page(qtbot, lambda request: aggregate)
+    _fill_folder_fields(page, tmp_path, folder=folder)
+
+    _start_and_wait(page, qtbot)
+
+    assert page._folder_results_table.item(0, 0).text() == "a.png"
+    assert page._folder_results_table.item(1, 0).text() == "b.png"
+
+
+# -- mixed per-image outcomes = completed batch, not a fatal failure ----------
+
+
+def test_folder_run_with_mixed_outcomes_is_a_completed_batch(tmp_path, qtbot) -> None:
+    aggregate = _aggregate(
+        _ok("a.png", predicted_class="cat", confidence=0.8),
+        _fail("b.png", error="RuntimeError: decode failed: b.png"),
+        _ok("c.png", predicted_class="dog", confidence=0.7),
+    )
+    page = _folder_page(qtbot, lambda request: aggregate)
+    _fill_folder_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+
+    assert page._status_label.text() == "Finished"  # NOT "Failed: ..."
+    table = page._folder_results_table
+    assert table.rowCount() == 3
+    assert table.item(0, 1).text() == "Success"
+    assert table.item(0, 4).text() == "--"
+    assert table.item(1, 1).text() == "Failure"
+    assert table.item(1, 2).text() == "--"
+    assert table.item(1, 3).text() == "--"
+    assert table.item(1, 4).text() == "RuntimeError: decode failed: b.png"
+    assert page._folder_summary_label.text() == "Total: 3  Succeeded: 2  Failed: 1"
+
+
+def test_folder_failure_row_shows_concise_first_line_of_error(tmp_path, qtbot) -> None:
+    aggregate = _aggregate(_fail("x.png", error="ValueError: bad\nstack line 1\nstack line 2"))
+    page = _folder_page(qtbot, lambda request: aggregate)
+    _fill_folder_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+
+    assert page._folder_results_table.item(0, 4).text() == "ValueError: bad"
+
+
+def test_on_folder_finished_presents_aggregate_verbatim(qtbot) -> None:
+    page = _make_page(qtbot)
+    aggregate = _aggregate(
+        _ok("only.png", predicted_class="direct", confidence=0.4242),
+        _fail("bad.png", error="KeyError: 'missing'"),
+    )
+
+    page._on_folder_finished(aggregate)
+
+    table = page._folder_results_table
+    assert table.rowCount() == 2
+    assert table.item(0, 2).text() == "direct"
+    assert table.item(0, 3).text() == "42.42%"
+    assert table.item(1, 4).text() == "KeyError: 'missing'"
+    assert page._folder_summary_label.text() == "Total: 2  Succeeded: 1  Failed: 1"
+    assert page._status_label.text() == "Finished"
+
+
+# -- fatal folder failure ----------------------------------------------------
+
+
+def test_folder_fatal_failure_shows_error_and_no_stale_batch(tmp_path, qtbot) -> None:
+    def fatal(request):
+        raise FolderInferenceError("no supported images in folder: batch")
+
+    page = _folder_page(qtbot, fatal)
+    _fill_folder_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+
+    assert page._status_label.text().startswith("Failed")
+    assert "no supported images" in page._status_label.text()
+    assert "Traceback" not in page._status_label.text()
+    assert page._folder_results_table.rowCount() == 0
+    assert page._folder_summary_label.text() == "Total: --  Succeeded: --  Failed: --"
+    assert page._run_button.isEnabled() is True
+    assert page._folder_thread is None
+    assert page._folder_worker is None
+    assert page._folder_controller.state == "failed"
+
+
+def test_folder_fatal_failure_clears_prior_batch_then_later_run_succeeds(tmp_path, qtbot) -> None:
+    calls = {"n": 0}
+
+    def flaky(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _aggregate(_ok("a.png"), _ok("b.png"))
+        if calls["n"] == 2:
+            raise FolderInferenceError("folder vanished")
+        return _aggregate(_ok("only.png"))
+
+    page = _folder_page(qtbot, flaky)
+    _fill_folder_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+    assert page._folder_results_table.rowCount() == 2
+
+    _start_and_wait(page, qtbot)
+    assert page._status_label.text().startswith("Failed")
+    assert page._folder_results_table.rowCount() == 0  # no stale successful batch
+    assert page._folder_summary_label.text() == "Total: --  Succeeded: --  Failed: --"
+
+    _start_and_wait(page, qtbot)
+    assert page._status_label.text() == "Finished"
+    assert page._folder_results_table.rowCount() == 1
+    assert page._folder_summary_label.text() == "Total: 1  Succeeded: 1  Failed: 0"
+
+
+# -- stale-state clearing before a new run ----------------------------------
+
+
+def test_new_folder_run_clears_stale_rows_before_showing_running(tmp_path, qtbot) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    calls = {"n": 0}
+
+    def backend(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _aggregate(_ok("a.png"), _ok("b.png"), _ok("c.png"))
+        started.set()
+        assert release.wait(timeout=5)
+        return _aggregate(_ok("x.png"))
+
+    page = _folder_page(qtbot, backend)
+    _fill_folder_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+    assert page._folder_results_table.rowCount() == 3
+
+    started.clear()
+    release.clear()
+    page._on_run_clicked()
+    assert started.wait(timeout=5)
+
+    assert page._status_label.text() == "Running"
+    assert page._folder_results_table.rowCount() == 0
+    assert page._folder_summary_label.text() == "Total: --  Succeeded: --  Failed: --"
+
+    release.set()
+    qtbot.waitUntil(lambda: page._run_button.isEnabled(), timeout=5000)
+    assert page._folder_results_table.rowCount() == 1
+
+
+def test_folder_run_clears_stale_single_image_result(tmp_path, qtbot) -> None:
+    page = InferencePage(
+        controller=InferenceController(backend=lambda request: _fake_inference_result()),
+        folder_controller=FolderInferenceController(backend=lambda request: _aggregate(_ok("a.png"))),
+    )
+    qtbot.addWidget(page)
+
+    _fill_minimum_valid_fields(page, tmp_path)
+    _start_and_wait(page, qtbot)
+    assert page._predicted_class_value_label.text() == "cat"
+
+    page._folder_path_edit.setText(str(tmp_path / "images"))
+    page._mode_combo.setCurrentText("Folder")
+    _start_and_wait(page, qtbot)
+
+    assert page._status_label.text() == "Finished"
+    assert page._predicted_class_value_label.text() == "--"
+    assert page._confidence_value_label.text() == "--"
+    assert page._probabilities_value_label.text() == "--"
+    assert page._duration_value_label.text() == "--"
+    assert page._folder_results_table.rowCount() == 1
+
+
+def test_single_image_run_clears_stale_folder_rows(tmp_path, qtbot) -> None:
+    page = InferencePage(
+        controller=InferenceController(backend=lambda request: _fake_inference_result()),
+        folder_controller=FolderInferenceController(
+            backend=lambda request: _aggregate(_ok("a.png"), _ok("b.png"))
+        ),
+    )
+    qtbot.addWidget(page)
+
+    page._folder_path_edit.setText(str(tmp_path / "images"))
+    page._mode_combo.setCurrentText("Folder")
+    _start_and_wait(page, qtbot)
+    assert page._folder_results_table.rowCount() == 2
+
+    page._mode_combo.setCurrentText("Single Image")
+    _fill_minimum_valid_fields(page, tmp_path)
+    _start_and_wait(page, qtbot)
+
+    assert page._status_label.text() == "Finished"
+    assert page._folder_results_table.rowCount() == 0
+    assert page._folder_summary_label.text() == "Total: --  Succeeded: --  Failed: --"
+    assert page._predicted_class_value_label.text() == "cat"
+
+
+# -- control disable/restore + overlap prevention --------------------------
+
+
+def test_controls_disabled_during_folder_run_and_restored_after_cleanup(tmp_path, qtbot) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def backend(request):
+        started.set()
+        assert release.wait(timeout=5)
+        return _aggregate(_ok("a.png"))
+
+    page = _folder_page(qtbot, backend)
+    _fill_folder_fields(page, tmp_path)
+
+    page._on_run_clicked()
+    assert started.wait(timeout=5)
+
+    assert page._status_label.text() == "Running"
+    assert page._run_button.isEnabled() is False
+    assert page._mode_combo.isEnabled() is False
+    assert page._folder_path_edit.isEnabled() is False
+    assert page._browse_folder_button.isEnabled() is False
+    assert page._training_output_dir_edit.isEnabled() is False
+    assert page._model_json_edit.isEnabled() is False
+    assert page._browse_model_button.isEnabled() is False
+    assert page._image_path_edit.isEnabled() is False
+    assert page._browse_image_button.isEnabled() is False
+    assert page._device_combo.isEnabled() is False
+    assert page._precision_combo.isEnabled() is False
+
+    release.set()
+    qtbot.waitUntil(lambda: page._run_button.isEnabled(), timeout=5000)
+    assert page._mode_combo.isEnabled() is True
+    assert page._folder_path_edit.isEnabled() is True
+    assert page._browse_folder_button.isEnabled() is True
+    assert page._device_combo.isEnabled() is True
+
+
+def test_overlap_rejected_while_folder_run_active(tmp_path, qtbot) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    count = {"n": 0}
+
+    def backend(request):
+        count["n"] += 1
+        started.set()
+        assert release.wait(timeout=5)
+        return _aggregate(_ok("a.png"))
+
+    page = _folder_page(qtbot, backend)
+    _fill_folder_fields(page, tmp_path)
+
+    page._on_run_clicked()
+    assert started.wait(timeout=5)
+    page._on_run_clicked()
+    page._on_run_clicked()
+
+    release.set()
+    qtbot.waitUntil(lambda: page._run_button.isEnabled(), timeout=5000)
+
+    assert count["n"] == 1
+    assert page._status_label.text() == "Finished"
+
+
+# -- reference cleanup + rerun without duplication -----------------------
+
+
+def test_folder_worker_thread_refs_cleared_after_success(tmp_path, qtbot) -> None:
+    page = _folder_page(qtbot, lambda request: _aggregate(_ok("a.png")))
+    _fill_folder_fields(page, tmp_path)
+
+    page._on_run_clicked()
+    assert page._folder_thread is not None
+    assert page._folder_worker is not None
+
+    qtbot.waitUntil(lambda: page._folder_thread is None, timeout=5000)
+    assert page._folder_worker is None
+
+
+def test_folder_worker_thread_refs_cleared_after_fatal_failure(tmp_path, qtbot) -> None:
+    def fatal(request):
+        raise FolderInferenceError("boom")
+
+    page = _folder_page(qtbot, fatal)
+    _fill_folder_fields(page, tmp_path)
+
+    page._on_run_clicked()
+    assert page._folder_thread is not None
+
+    qtbot.waitUntil(lambda: page._folder_thread is None, timeout=5000)
+    assert page._folder_worker is None
+
+
+def test_repeated_folder_reruns_do_not_duplicate_rows(tmp_path, qtbot) -> None:
+    seq: list = [
+        _aggregate(_ok("a.png"), _ok("b.png")),
+        _aggregate(_ok("a.png"), _fail("b.png"), _ok("c.png")),
+        FolderInferenceError("fatal run"),
+        _aggregate(_ok("only.png")),
+    ]
+    calls = {"n": 0}
+
+    def backend(request):
+        item = seq[calls["n"]]
+        calls["n"] += 1
+        if isinstance(item, FolderInferenceError):
+            raise item
+        return item
+
+    page = _folder_page(qtbot, backend)
+    _fill_folder_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+    assert page._folder_results_table.rowCount() == 2
+    assert page._status_label.text() == "Finished"
+
+    _start_and_wait(page, qtbot)
+    assert page._folder_results_table.rowCount() == 3  # not 5
+    assert page._folder_summary_label.text() == "Total: 3  Succeeded: 2  Failed: 1"
+
+    _start_and_wait(page, qtbot)
+    assert page._status_label.text().startswith("Failed")
+    assert page._folder_results_table.rowCount() == 0
+
+    _start_and_wait(page, qtbot)
+    assert page._folder_results_table.rowCount() == 1  # not accumulated
+    assert page._status_label.text() == "Finished"
+    assert calls["n"] == 4
+
+
+class _FolderFinishRecordingPage(InferencePage):
+    """Records each `_on_folder_finished` delivery so tests can assert a
+    rerun triggers exactly one page-slot invocation -- a stale signal
+    connection from a previous worker would show up as an extra call."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.folder_finished_thread_ids: list[int] = []
+        self.folder_finished_results: list = []
+        super().__init__(*args, **kwargs)
+
+    def _on_folder_finished(self, result) -> None:
+        self.folder_finished_thread_ids.append(threading.get_ident())
+        self.folder_finished_results.append(result)
+        super()._on_folder_finished(result)
+
+
+def test_each_folder_rerun_invokes_finished_handler_exactly_once(tmp_path, qtbot) -> None:
+    aggregate = _aggregate(_ok("a.png"))
+    page = _FolderFinishRecordingPage(
+        controller=InferenceController(backend=_should_not_run_single),
+        folder_controller=FolderInferenceController(backend=lambda request: aggregate),
+    )
+    qtbot.addWidget(page)
+    _fill_folder_fields(page, tmp_path)
+
+    for expected in (1, 2, 3):
+        _start_and_wait(page, qtbot)
+        assert len(page.folder_finished_results) == expected
+
+
+# -- thread affinity ----------------------------------------------------
+
+
+def test_folder_backend_runs_off_gui_thread(tmp_path, qtbot) -> None:
+    main_thread_id = threading.get_ident()
+    observed = {}
+
+    def backend(request):
+        observed["thread_id"] = threading.get_ident()
+        return _aggregate(_ok("a.png"))
+
+    page = _folder_page(qtbot, backend)
+    _fill_folder_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+
+    assert observed["thread_id"] != main_thread_id
+
+
+def test_folder_finished_handler_runs_on_main_qt_thread(tmp_path, qtbot) -> None:
+    main_thread_id = threading.get_ident()
+
+    def backend(request):
+        assert threading.get_ident() != main_thread_id
+        return _aggregate(_ok("a.png"))
+
+    page = _FolderFinishRecordingPage(
+        controller=InferenceController(backend=_should_not_run_single),
+        folder_controller=FolderInferenceController(backend=backend),
+    )
+    qtbot.addWidget(page)
+    _fill_folder_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+
+    assert page.folder_finished_thread_ids == [main_thread_id]
+
+
+# -- close coordination -----------------------------------------------
+
+
+def test_is_inference_active_true_during_folder_run(tmp_path, qtbot) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def backend(request):
+        started.set()
+        assert release.wait(timeout=5)
+        return _aggregate(_ok("a.png"))
+
+    page = _folder_page(qtbot, backend)
+    _fill_folder_fields(page, tmp_path)
+
+    assert page.is_inference_active() is False
+    page._on_run_clicked()
+    assert started.wait(timeout=5)
+    assert page.is_inference_active() is True
+
+    release.set()
+    qtbot.waitUntil(lambda: page.is_inference_active() is False, timeout=5000)
+
+
+def test_request_close_defers_until_folder_run_completes(tmp_path, qtbot) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def backend(request):
+        started.set()
+        assert release.wait(timeout=5)
+        return _aggregate(_ok("a.png"))
+
+    page = _folder_page(qtbot, backend)
+    _fill_folder_fields(page, tmp_path)
+    received = []
+    page.close_requested.connect(lambda: received.append(True))
+
+    page._on_run_clicked()
+    assert started.wait(timeout=5)
+    page.request_close()
+    assert received == []  # not cancelled -- must finish naturally
+
+    release.set()
+    qtbot.waitUntil(lambda: received == [True], timeout=5000)
+    assert page._folder_thread is None
+    assert page._folder_worker is None
+
+
+def test_request_close_completes_after_fatal_folder_failure(tmp_path, qtbot) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def backend(request):
+        started.set()
+        assert release.wait(timeout=5)
+        raise FolderInferenceError("boom")
+
+    page = _folder_page(qtbot, backend)
+    _fill_folder_fields(page, tmp_path)
+    received = []
+    page.close_requested.connect(lambda: received.append(True))
+
+    page._on_run_clicked()
+    assert started.wait(timeout=5)
+    page.request_close()
+
+    release.set()
+    qtbot.waitUntil(lambda: received == [True], timeout=5000)
+    assert page._folder_thread is None
+    assert page._folder_worker is None
+
+
+def test_repeated_request_close_during_folder_run_emits_once(tmp_path, qtbot) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def backend(request):
+        started.set()
+        assert release.wait(timeout=5)
+        return _aggregate(_ok("a.png"))
+
+    page = _folder_page(qtbot, backend)
+    _fill_folder_fields(page, tmp_path)
+    received = []
+    page.close_requested.connect(lambda: received.append(True))
+
+    page._on_run_clicked()
+    assert started.wait(timeout=5)
+    page.request_close()
+    page.request_close()
+    page.request_close()
+
+    release.set()
+    qtbot.waitUntil(lambda: received == [True], timeout=5000)
+    qtbot.wait(50)
+    assert received == [True]
+
+
+# -- single-image regression -------------------------------------------
+
+
+def test_single_image_mode_unaffected_by_folder_additions(tmp_path, qtbot) -> None:
+    page = InferencePage(
+        controller=InferenceController(backend=lambda request: _fake_inference_result()),
+        folder_controller=FolderInferenceController(backend=_should_not_run_folder),
+    )
+    qtbot.addWidget(page)
+    assert page._mode_combo.currentText() == "Single Image"
+
+    _fill_minimum_valid_fields(page, tmp_path)
+    _start_and_wait(page, qtbot)
+
+    assert page._status_label.text() == "Finished"
+    assert page._predicted_class_value_label.text() == "cat"
+    assert page._confidence_value_label.text() == "90.00%"
+    assert page._folder_results_table.rowCount() == 0
+    assert page._folder_thread is None
+    assert page._folder_worker is None
+    assert page._folder_controller.state == "idle"

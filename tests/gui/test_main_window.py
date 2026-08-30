@@ -5,15 +5,22 @@ CP4는 `TrainingPage` + `InferencePage`를 담은 `QTabWidget`과, 학습/추론
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
 import pytest
 from PySide6.QtWidgets import QMessageBox, QTabWidget
 
+from image_ai_studio.application.folder_inference_controller import FolderInferenceController
 from image_ai_studio.application.inference_controller import InferenceController
 from image_ai_studio.application.training_controller import TrainingController
 from image_ai_studio.gui.inference_page import InferencePage
 from image_ai_studio.gui.main_window import MainWindow
 from image_ai_studio.gui.training_page import TrainingPage
+from image_ai_studio.inference.folder_inference import (
+    FolderInferenceError,
+    FolderInferenceResult,
+    ImageOutcome,
+)
 from image_ai_studio.inference.single_image_inference import InferenceResult
 from image_ai_studio.training.imagefolder_workflow import ImageFolderWorkflowResult
 from image_ai_studio.training.loop import TrainingHistory
@@ -256,6 +263,105 @@ def test_close_while_inference_failing_still_completes(tmp_path, monkeypatch, qt
 
     let_backend_finish.set()
     qtbot.waitUntil(lambda: window.isVisible() is False, timeout=5000)
+
+
+# -- close while folder inference active -----------------------------------------
+
+
+def _folder_aggregate() -> FolderInferenceResult:
+    return FolderInferenceResult(
+        items=(
+            ImageOutcome(
+                image_path=Path("a.png"),
+                result=_fake_inference_result(),
+                error=None,
+            ),
+        )
+    )
+
+
+def _fill_minimum_valid_folder_fields(page: InferencePage, tmp_path) -> None:
+    page._training_output_dir_edit.setText(str(tmp_path))
+    page._model_json_edit.setText(str(tmp_path / "model.json"))
+    page._folder_path_edit.setText(str(tmp_path / "images"))
+    page._mode_combo.setCurrentText("Folder")
+
+
+def test_close_while_folder_inference_active_defers_until_natural_completion(
+    tmp_path, monkeypatch, qtbot
+) -> None:
+    """폴더 추론도 취소 API가 없다 -- close 확인 후에도 folder worker는
+    끝까지 실행되고, 실제 close는 그 뒤 cleanup이 끝난 다음에만 일어난다.
+    MainWindow는 여전히 InferencePage를 정확히 하나만 갖고, 기존 비동기
+    close 조정 경로(request_close -> close_requested)를 그대로 쓴다."""
+    backend_started = threading.Event()
+    let_backend_finish = threading.Event()
+
+    def blocking_backend(request):
+        backend_started.set()
+        assert let_backend_finish.wait(timeout=5)
+        return _folder_aggregate()
+
+    monkeypatch.setattr(
+        QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+    )
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+
+    pages = [window._tabs.widget(i) for i in range(window._tabs.count())]
+    assert pages.count(window._inference_page) == 1
+
+    inference_page = window._inference_page
+    inference_page._folder_controller = FolderInferenceController(backend=blocking_backend)
+    _fill_minimum_valid_folder_fields(inference_page, tmp_path)
+
+    inference_page._on_run_clicked()
+    assert backend_started.wait(timeout=5)
+
+    window.close()
+    assert window.isVisible() is True
+    assert inference_page.is_inference_active() is True  # not cancelled
+
+    let_backend_finish.set()
+    qtbot.waitUntil(lambda: window.isVisible() is False, timeout=5000)
+    assert inference_page._folder_thread is None
+    assert inference_page._folder_worker is None
+    assert inference_page._folder_results_table.rowCount() == 1
+
+
+def test_close_while_folder_inference_failing_still_completes(tmp_path, monkeypatch, qtbot) -> None:
+    backend_started = threading.Event()
+    let_backend_finish = threading.Event()
+
+    def failing_blocking_backend(request):
+        backend_started.set()
+        assert let_backend_finish.wait(timeout=5)
+        raise FolderInferenceError("no supported images in folder")
+
+    monkeypatch.setattr(
+        QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+    )
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    inference_page = window._inference_page
+    inference_page._folder_controller = FolderInferenceController(backend=failing_blocking_backend)
+    _fill_minimum_valid_folder_fields(inference_page, tmp_path)
+
+    inference_page._on_run_clicked()
+    assert backend_started.wait(timeout=5)
+
+    window.close()
+    assert window.isVisible() is True
+
+    let_backend_finish.set()
+    qtbot.waitUntil(lambda: window.isVisible() is False, timeout=5000)
+    assert window._close_pending is False
+    assert inference_page._folder_thread is None
+    assert inference_page._folder_worker is None
 
 
 # -- duplicate close requests while pending ----------------------------------------
