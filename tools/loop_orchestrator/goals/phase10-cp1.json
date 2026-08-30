@@ -1,0 +1,24 @@
+{
+  "template": false,
+  "checkpoint_id": "phase10-cp1-folder-inference-contract",
+  "objective": "Add a deterministic, framework-independent folder-inference contract that discovers supported images and reuses the existing single-image inference backend while isolating per-image failures and preserving all existing single-image and artifact APIs.",
+  "acceptance_criteria": [
+    "A new inference module defines immutable folder request, per-image outcome, and aggregate result types without changing InferenceRequest, InferenceResult, run_single_image_inference, or any existing artifact format.",
+    "Folder discovery accepts one existing directory, includes only documented supported image extensions, excludes directories and unsupported files, and produces a deterministic path order independent of filesystem enumeration order.",
+    "An empty folder or a folder containing no supported images fails before backend invocation with a concise deterministic validation error.",
+    "Each discovered image is converted to the existing InferenceRequest with the same shared model JSON, state_dict, class mapping, device, and precision values, then passed to an injectable single-image backend.",
+    "A failure for one image is captured as a bounded per-image error and does not prevent later images from running; successful outcomes preserve the exact existing InferenceResult returned by the backend without recomputing prediction values.",
+    "The aggregate result preserves deterministic item order and exposes observable total, succeeded, and failed counts derived from its item outcomes.",
+    "Focused CPU-only tests use temporary image files and fake backends to cover discovery order, extension handling, request mapping, all-success, mixed success/failure, all-failure, empty input, and repeatability without loading a real model or requiring CUDA.",
+    "This checkpoint adds no Qt, GUI, controller, worker, progress, cancellation, parallel execution, recursive job manager, database, new dependency, documentation, or later-checkpoint behavior."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/inference/folder_inference.py",
+    "tests/inference/test_folder_inference.py"
+  ],
+  "required_tests": [
+    "phase10_cp1_folder_inference_contract"
+  ],
+  "claude_prompt": "Implement only Phase 10 checkpoint 1 in the two allowed files: src/image_ai_studio/inference/folder_inference.py and tests/inference/test_folder_inference.py. Add a small immutable folder-inference request/outcome/result contract, deterministic supported-image discovery, and sequential per-image orchestration by constructing the existing InferenceRequest and calling an injectable backend compatible with run_single_image_inference. Preserve each exact InferenceResult, isolate bounded per-image errors, continue after failures, and expose deterministic aggregate counts. Keep the existing single-image public API and portable artifact formats unchanged. Use CPU-only temporary files and fake backends in tests; do not load a real model. Do not add Qt, GUI, application controller, worker, cancellation, parallelism, recursion beyond the explicitly tested discovery contract, generic frameworks, dependencies, markers, docs, or later checkpoints. Do not modify assertions to hide failures. Do not use Bash or Git, do not run tests, and do not commit or push.",
+  "estimated_scope": "Small core vertical slice: one new framework-independent inference module and one focused test module, approximately 220-340 changed lines combined."
+}

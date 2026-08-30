@@ -1,0 +1,26 @@
+{
+  "template": false,
+  "checkpoint_id": "phase10-cp4-folder-inference-cpu-graduation",
+  "objective": "Prove the complete folder-inference user flow with a real portable training bundle on CPU and document its exact behavior, compatibility guarantees, limitations, and Phase 10 graduation conditions.",
+  "acceptance_criteria": [
+    "A real CPU integration test creates or trains a tiny portable bundle through established repository APIs, drives folder inference through the actual MainWindow and InferencePage asynchronous path, and observes one deterministic row for every supported input image without fake inference results.",
+    "The integration test includes at least two valid images and one isolated invalid-image failure, proves later valid images still complete, and verifies exact total, succeeded, and failed summary counts and deterministic displayed ordering.",
+    "The real flow uses canonical model_definition.json, best_model_state_dict.pt, and class_mapping.json paths and preserves the legacy explicit Model JSON override and all existing single-image integration behavior.",
+    "The integration test verifies Run/input restoration and worker/thread cleanup after mixed completion, then performs a subsequent successful run in the same window without duplicate rows, signal delivery, or stale errors.",
+    "The test runs on CPU with tiny local images and models only, requires no CUDA, external service, network, packaging tool, or screenshot comparison, and does not alter repository artifacts outside pytest temporary directories.",
+    "docs/phase10_folder_inference.md documents supported extensions, discovery and ordering, per-image error isolation, UI state transitions, use of the existing single-image backend, public/API and portable-artifact compatibility, CPU evidence requirements, and residual performance and cancellation limitations without fabricating test results.",
+    "README.md receives only a concise user-facing folder-inference usage summary and link, without unrelated restructuring or claims of preview, cancellation, parallelism, packaging, installer, TorchScript migration, CUDA validation, or future work completion.",
+    "No production source, public API, artifact format, test assertion outside the focused integration module, dependency, launcher, goal, manifest, or local configuration is changed in this graduation checkpoint.",
+    "Phase 10 completion remains conditional on all four fixed required-test allowlists, verifier PASS decisions, and exactly one final full project harness passing without worktree mutation."
+  ],
+  "allowed_files": [
+    "tests/gui/test_folder_inference_integration.py",
+    "README.md",
+    "docs/phase10_folder_inference.md"
+  ],
+  "required_tests": [
+    "phase10_cp4_folder_inference_cpu_graduation"
+  ],
+  "claude_prompt": "Implement only Phase 10 checkpoint 4 in the three allowed files; do not modify production source. Add a real CPU qtbot integration test that builds or trains a tiny canonical portable bundle using existing APIs, drives the actual MainWindow/InferencePage folder mode with at least two valid images plus one corrupt supported-extension image, verifies deterministic rows, isolated failure, exact aggregate counts, cleanup, and a successful rerun in the same window, while retaining existing single-image integration coverage in the fixed allowlist. Write docs/phase10_folder_inference.md and a minimal README summary/link describing exact supported extensions, ordering, lifecycle, compatibility, and limitations. Do not fabricate test counts or runs. Do not change APIs, artifacts, dependencies, launcher, other tests, goals, config, or production code. Do not add preview, cancellation, progress, parallelism, packaging, installer, TorchScript migration, CUDA requirements, external network, screenshots, or later-Phase work. Do not weaken assertions. Do not use Bash or Git, do not run tests, and do not commit or push.",
+  "estimated_scope": "Integration and documentation graduation slice: one new real-CPU GUI integration test, one new focused document, and a concise README update, approximately 300-460 changed lines combined."
+}

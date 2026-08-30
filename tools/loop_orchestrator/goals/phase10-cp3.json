@@ -1,0 +1,27 @@
+{
+  "template": false,
+  "checkpoint_id": "phase10-cp3-folder-inference-page",
+  "objective": "Extend the existing InferencePage with a folder mode that runs the checkpoint 2 asynchronous lifecycle and presents deterministic per-image outcomes while preserving the complete single-image workflow and MainWindow close coordination.",
+  "acceptance_criteria": [
+    "InferencePage exposes an explicit single-image versus folder mode and a folder chooser while retaining all existing artifact, device, precision, single-image input, Run, result, and status controls.",
+    "Single-image mode continues to build the existing InferenceRequest and use the existing InferenceController and QtInferenceWorker with unchanged result formatting, overlap prevention, rerun, failure, cleanup, and close-defer behavior.",
+    "Folder mode snapshots the visible shared artifact, folder, device, and precision inputs into the checkpoint 1 request and starts one injected FolderInferenceController with one QtFolderInferenceWorker only after Run is requested; construction remains side-effect free.",
+    "During either run mode every request input, browse control, mode control, and Run button is disabled, overlapping execution is rejected, and controls are restored only after terminal thread cleanup on the GUI thread.",
+    "Folder results are displayed in deterministic discovered-image order with an observable row per image containing its relative path, success or failure status, predicted class and confidence for success, and a concise per-image error for failure, plus total, succeeded, and failed summary counts.",
+    "A new run clears stale single-image results, stale folder rows, aggregate counts, and prior fatal errors before work starts; a fatal folder failure leaves no stale successful batch presentation, and a later run can succeed.",
+    "Folder completion with mixed per-image outcomes is shown as a completed batch rather than a fatal worker failure, and repeated all-success, mixed, and fatal-failure reruns do not duplicate rows or signal connections.",
+    "MainWindow still contains exactly one InferencePage and its existing asynchronous close coordination waits for the active single-image or folder worker to clean up without blocking, cancellation, terminate, or duplicate close retries.",
+    "qtbot tests use fake controllers/workers/results and programmatic widget assertions rather than screenshots, real models, filesystem-scale jobs, or CUDA.",
+    "No single-image core/controller/worker, MainWindow source, training source, artifact API, dependency, launcher, preview, cancellation, parallel execution, export, or documentation behavior is changed."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/gui/inference_page.py",
+    "tests/gui/test_inference_page.py",
+    "tests/gui/test_main_window.py"
+  ],
+  "required_tests": [
+    "phase10_cp3_folder_inference_page"
+  ],
+  "claude_prompt": "Implement only Phase 10 checkpoint 3 in the three allowed files. Extend the existing InferencePage with an explicit folder mode, folder browse input, asynchronous FolderInferenceController/QtFolderInferenceWorker wiring, deterministic per-image result presentation, aggregate counts, stale-state clearing, overlap prevention, control disable/restore, rerun support, and the existing nonblocking close-defer contract. Preserve single-image mode exactly and reuse the established bound QObject slot and deleteLater ordering; do not modify MainWindow source. Add focused qtbot tests using injected fakes and widget text/state assertions, including all-success, mixed per-image failures, fatal failure, repeat runs, mode switching, overlap, cleanup, and MainWindow close coordination. Do not modify core, application, worker, training, artifacts, dependencies, launcher, pyproject, docs, or other tests. Do not add image preview, cancellation, progress, parallel execution, generic UI abstractions, blocking wait, busy loops, terminate, screenshots, real model inference, or CUDA. Do not weaken assertions. Do not use Bash or Git, do not run tests, and do not commit or push.",
+  "estimated_scope": "Medium GUI vertical slice: one existing page and two focused GUI test modules, approximately 360-560 changed lines combined."
+}

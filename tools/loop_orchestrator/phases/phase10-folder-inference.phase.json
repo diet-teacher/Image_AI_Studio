@@ -1,0 +1,58 @@
+{
+  "phase_id": "phase10-folder-inference",
+  "objective": "Deliver deterministic folder inference as an end-to-end CPU-verifiable user workflow by reusing the established single-image inference and portable artifact contracts, isolating per-image errors, and extending the existing asynchronous GUI without cancellation, parallelism, preview, or artifact migration.",
+  "checkpoints": [
+    {
+      "checkpoint_id": "phase10-cp1-folder-inference-contract",
+      "goal": "tools/loop_orchestrator/goals/phase10-cp1.json"
+    },
+    {
+      "checkpoint_id": "phase10-cp2-folder-inference-controller-worker",
+      "goal": "tools/loop_orchestrator/goals/phase10-cp2.json"
+    },
+    {
+      "checkpoint_id": "phase10-cp3-folder-inference-page",
+      "goal": "tools/loop_orchestrator/goals/phase10-cp3.json"
+    },
+    {
+      "checkpoint_id": "phase10-cp4-folder-inference-cpu-graduation",
+      "goal": "tools/loop_orchestrator/goals/phase10-cp4.json"
+    }
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/inference/folder_inference.py",
+    "tests/inference/test_folder_inference.py",
+    "src/image_ai_studio/application/folder_inference_controller.py",
+    "src/image_ai_studio/gui/qt_folder_inference_worker.py",
+    "tests/application/test_folder_inference_controller.py",
+    "tests/gui/test_qt_folder_inference_worker.py",
+    "src/image_ai_studio/gui/inference_page.py",
+    "tests/gui/test_inference_page.py",
+    "tests/gui/test_main_window.py",
+    "tests/gui/test_folder_inference_integration.py",
+    "README.md",
+    "docs/phase10_folder_inference.md"
+  ],
+  "allowed_tests": [
+    "phase10_cp1_folder_inference_contract",
+    "phase10_cp2_folder_inference_controller_worker",
+    "phase10_cp3_folder_inference_page",
+    "phase10_cp4_folder_inference_cpu_graduation"
+  ],
+  "final_harness_profile": "full",
+  "max_checkpoints": 4,
+  "max_rework_rounds": 1,
+  "max_model_calls": 16,
+  "max_claude_cost_usd": 8.0,
+  "max_elapsed_seconds": 14400,
+  "completion_conditions": [
+    "All four checkpoint verifiers return PASS with no changes outside each checkpoint's allowed files and no verifier mutation, and no checkpoint exceeds one rework round, one maker continuation, or one transient API retry.",
+    "Folder discovery, per-image outcomes, aggregate counts, fatal-error boundaries, controller lifecycle, and Qt worker thread-affinity are deterministic and covered by fixed CPU/fake tests.",
+    "InferencePage supports one asynchronous folder run with deterministic per-image presentation, mixed-error isolation, reruns, overlap prevention, control restoration, and existing nonblocking MainWindow close coordination while preserving the complete single-image workflow.",
+    "A real CPU MainWindow integration test consumes the established portable bundle, processes valid and corrupt supported-extension images with isolated outcomes, and reruns successfully without actual CUDA, external services, or network.",
+    "Existing single-image APIs and behavior, Phase 7 portable artifact paths and formats, training workflow, launcher, dependencies, and pytest strict-marker policy remain compatible and unchanged except for the explicitly allowed GUI extension.",
+    "Phase 10 documentation states exact behavior and limitations without claiming cancellation, progress, parallel execution, model-load optimization, preview, packaging, installer, TorchScript modernization, CUDA validation, or multi-run job management.",
+    "The fixed full project harness runs exactly once after all checkpoint approvals and passes without protected-file, HEAD, staged-index, out-of-scope worktree, or harness mutation.",
+    "The Phase stops after this manifest; no later Phase is executed and no add, commit, push, or pull-request operation is performed."
+  ]
+}

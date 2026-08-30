@@ -1,0 +1,26 @@
+{
+  "template": false,
+  "checkpoint_id": "phase10-cp2-folder-inference-controller-worker",
+  "objective": "Add an application lifecycle controller and Qt worker for one asynchronous folder-inference run, preserving the established single-image controller and QThread contracts while treating per-image errors as completed batch outcomes.",
+  "acceptance_criteria": [
+    "A new framework-independent FolderInferenceController owns idle, running, finished, and failed lifecycle state for one folder request and accepts an injectable folder backend using the checkpoint 1 contract.",
+    "The controller rejects overlapping runs, requires begin_run before run, transitions to finished when the folder backend returns an aggregate result even if that result contains per-image failures, and transitions to failed only when the folder operation raises a fatal exception.",
+    "A new QtFolderInferenceWorker runs the controller on its assigned worker thread and emits exactly one finished aggregate result or one concise failed traceback string for each invocation.",
+    "The worker uses the existing canonical QThread ownership contract: thread.started invokes its bound run method, terminal signals can quit the thread and deleteLater the worker, and thread.finished can deleteLater the thread without blocking wait, busy loops, or terminate.",
+    "Signals delivered to real QObject bound-method receivers execute on the receiver's GUI thread, and repeated success and fatal-failure runs clean up without stale controller or worker state.",
+    "Per-image failures carried inside a completed aggregate do not emit the worker failed signal; a discovery or other fatal exception does emit failed and leaves the controller failed.",
+    "Focused tests use fake folder backends and qtbot only, verify overlap prevention, success, mixed-result completion, fatal failure, thread affinity, and repeated lifecycle cleanup, and do not perform real image inference or CUDA work.",
+    "Existing InferenceController, QtInferenceWorker, single-image request/result APIs, MainWindow, InferencePage, training code, artifact formats, dependencies, and cancellation semantics remain unchanged in this checkpoint."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/application/folder_inference_controller.py",
+    "src/image_ai_studio/gui/qt_folder_inference_worker.py",
+    "tests/application/test_folder_inference_controller.py",
+    "tests/gui/test_qt_folder_inference_worker.py"
+  ],
+  "required_tests": [
+    "phase10_cp2_folder_inference_controller_worker"
+  ],
+  "claude_prompt": "Implement only Phase 10 checkpoint 2 in the four allowed files. Build a separate framework-independent FolderInferenceController around the checkpoint 1 folder backend and a QtFolderInferenceWorker that follows the repository's proven InferenceController/QtInferenceWorker lifecycle without modifying those existing classes. Preserve per-image failures as a successful aggregate completion; reserve failed state/signal for fatal exceptions. Add focused fake-backend and qtbot tests for state transitions, overlap rejection, mixed outcomes, fatal errors, QObject receiver thread affinity, terminal signal ordering, and repeated deleteLater cleanup. Do not modify InferencePage, MainWindow, single-image APIs, training, artifact formats, dependencies, markers, docs, or later checkpoints. Do not add cancellation, progress, parallelism, blocking wait, busy loops, terminate, generic base controllers, or assertion weakening. Do not use real inference, CUDA, Bash, or Git; do not run tests; do not commit or push.",
+  "estimated_scope": "Medium application/Qt lifecycle slice: two new implementation modules and two focused test modules, approximately 300-460 changed lines combined."
+}
