@@ -1,0 +1,28 @@
+{
+  "template": false,
+  "checkpoint_id": "phase11-cp1-folder-result-export-contract",
+  "objective": "Add a deterministic, framework-independent CSV and JSON export contract for an existing FolderInferenceResult without changing inference execution, public inference result types, or portable training artifacts.",
+  "acceptance_criteria": [
+    "A dedicated framework-independent export module accepts an existing FolderInferenceResult and never reruns inference, recalculates predictions, or imports Qt.",
+    "The JSON representation has an explicit versioned top-level schema containing format_version, total, succeeded, failed, and items, and every item contains image_path, status, predicted_class, confidence, probabilities, inference_duration_seconds, and error with success-only values represented as null on failure.",
+    "The CSV representation uses one fixed header in the exact order image_path,status,predicted_class,confidence,probabilities,inference_duration_seconds,error and emits exactly one row per aggregate item.",
+    "Items preserve the exact deterministic FolderInferenceResult.items ordering and image_path is serialized as the supplied path string rather than reduced to only a display name.",
+    "Success rows preserve the existing InferenceResult fields without recomputation; probabilities use class-name-sorted deterministic JSON text, and confidence and duration use documented locale-independent numeric serialization.",
+    "Failure rows preserve the bounded per-image error and contain no fabricated prediction, confidence, probability, or duration values; mixed and all-failure aggregates retain exact counts and rows.",
+    "CSV quoting and UTF-8 JSON output correctly preserve commas, quotes, Unicode paths/classes, newlines, and errors, with JSON emitted using deterministic key ordering and a trailing newline.",
+    "Writing CSV or JSON publishes through an existing repository-compatible atomic replacement pattern or an equally focused same-directory temporary-file replacement, leaves an existing destination intact on pre-replace failure, and does not leave temporary files after success.",
+    "Unsupported export formats, non-file destinations, and filesystem errors fail explicitly without fallback paths or mutation of the input result.",
+    "Focused CPU-only tests use constructed FolderInferenceResult values and temporary paths, cover success, partial failure, all failure, deterministic repeat output, escaping, atomic replacement, and write failure, and require no model, CUDA, Qt, network, or new dependency.",
+    "Existing FolderInferenceRequest, ImageOutcome, FolderInferenceResult, InferenceResult, single-image inference APIs, portable artifact formats, controller, worker, and GUI behavior remain unchanged.",
+    "CSV/JSON import, progress, cancellation, preview, drag-and-drop, packaging, database/history storage, spreadsheet formatting, and generic serializer abstractions are outside this checkpoint."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/inference/folder_result_export.py",
+    "tests/inference/test_folder_result_export.py"
+  ],
+  "required_tests": [
+    "phase11_cp1_folder_result_export_contract"
+  ],
+  "claude_prompt": "Implement only Phase 11 checkpoint 1 in exactly these allowed files: src/image_ai_studio/inference/folder_result_export.py and tests/inference/test_folder_result_export.py. Build a small framework-independent export layer over the existing immutable FolderInferenceResult/ImageOutcome/InferenceResult objects. Define and test an explicit versioned JSON schema and the exact CSV columns image_path,status,predicted_class,confidence,probabilities,inference_duration_seconds,error. Preserve aggregate item ordering and existing values verbatim, serialize probabilities deterministically by class name, handle Unicode and CSV escaping, and write UTF-8 results with safe same-directory atomic replacement without changing existing artifact formats. Use only the standard library and existing repository primitives; add no dependency or generic serialization framework. Do not change folder inference, single-image inference, controller, worker, GUI, MainWindow, artifacts, public result types, pyproject, config, goals, or documentation. Do not implement import, progress, cancellation, preview, drag-and-drop, packaging, or later-Phase features. Do not weaken assertions. Do not use Bash or Git, do not run tests, and do not commit or push.",
+  "estimated_scope": "Small core export slice: one new standard-library module and one focused unit-test module, approximately 250-420 changed lines combined."
+}

@@ -1,0 +1,48 @@
+{
+  "phase_id": "phase11-folder-inference-export",
+  "objective": "Complete the Phase 10 folder-inference workflow by letting users deterministically save the exact mixed per-image results they see as versioned JSON or fixed-schema CSV, with safe writes, GUI lifecycle preservation, and real CPU end-to-end verification.",
+  "checkpoints": [
+    {
+      "checkpoint_id": "phase11-cp1-folder-result-export-contract",
+      "goal": "tools/loop_orchestrator/goals/phase11-cp1.json"
+    },
+    {
+      "checkpoint_id": "phase11-cp2-folder-result-export-gui",
+      "goal": "tools/loop_orchestrator/goals/phase11-cp2.json"
+    },
+    {
+      "checkpoint_id": "phase11-cp3-folder-result-export-cpu-graduation",
+      "goal": "tools/loop_orchestrator/goals/phase11-cp3.json"
+    }
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/inference/folder_result_export.py",
+    "tests/inference/test_folder_result_export.py",
+    "src/image_ai_studio/gui/inference_page.py",
+    "tests/gui/test_inference_page.py",
+    "tests/gui/test_folder_result_export_integration.py",
+    "README.md",
+    "docs/phase11_folder_result_export.md"
+  ],
+  "allowed_tests": [
+    "phase11_cp1_folder_result_export_contract",
+    "phase11_cp2_folder_result_export_gui",
+    "phase11_cp3_folder_result_export_cpu_graduation"
+  ],
+  "final_harness_profile": "full",
+  "max_checkpoints": 3,
+  "max_rework_rounds": 1,
+  "max_model_calls": 12,
+  "max_claude_cost_usd": 6.0,
+  "max_elapsed_seconds": 14400,
+  "completion_conditions": [
+    "All three checkpoint required-test allowlists and Codex verifiers PASS with no checkpoint exceeding one rework, one maker continuation, or one transient API retry, and no verifier mutation or checkpoint-scope violation.",
+    "The exact existing FolderInferenceResult is serialized without inference reruns or prediction recomputation into versioned deterministic JSON and fixed-header CSV, preserving item order, Unicode, partial failures, aggregate counts, and documented numeric/probability formats.",
+    "CSV and JSON destinations use safe same-directory replacement semantics, reject invalid formats and destinations explicitly, and preserve an existing destination on pre-replace failure without fallback paths or leftover successful-run temporary files.",
+    "InferencePage exports only its current completed folder aggregate, disables or clears export across initial, Running, fatal-failure, stale, and mode-transition states, handles dialog cancellation and bounded write errors on the GUI thread, and preserves Phase 10 async lifecycle and MainWindow close coordination.",
+    "A real CPU MainWindow integration processes valid and corrupt supported images through the established portable bundle, exports both formats, proves displayed/exported equivalence and partial-failure retention, and reruns without stale or duplicate output.",
+    "Existing single-image and folder inference APIs, result types, controller/worker contracts, portable training artifact paths and formats, launcher, dependencies, strict-marker registry, and non-export behavior remain compatible and unchanged outside the seven allowed files.",
+    "Phase 11 documentation and README accurately describe schemas, ordering, failure and write behavior, compatibility, and limitations without claiming import, progress, cancellation, preview, drag-and-drop, parallel execution, packaging, installer, TorchScript migration, CUDA validation, or later-Phase work.",
+    "The full project harness runs exactly once after all checkpoint approvals and passes without HEAD, staged-index, protected-file, allowed-scope, worktree, or harness mutation; the Phase then stops without planner, later Phase, add, commit, push, or pull-request operations."
+  ]
+}

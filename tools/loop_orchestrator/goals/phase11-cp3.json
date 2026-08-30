@@ -1,0 +1,27 @@
+{
+  "template": false,
+  "checkpoint_id": "phase11-cp3-folder-result-export-cpu-graduation",
+  "objective": "Prove the complete real-CPU folder-inference-to-CSV-and-JSON user workflow through MainWindow and document the exact export schemas, error behavior, compatibility, and limitations.",
+  "acceptance_criteria": [
+    "A real CPU qtbot integration test creates an established portable bundle, drives the actual MainWindow and InferencePage folder workflow over at least two valid images and one corrupt supported-extension image, and exports the delivered mixed FolderInferenceResult to both CSV and JSON through the real GUI actions and exporter.",
+    "The integration test verifies that both files contain exactly one item or row per displayed folder result in the same deterministic order, with identical path, status, prediction, confidence, probability, duration, and error semantics and exact total/succeeded/failed JSON counts.",
+    "The test proves partial failures remain present in both exports, valid images after a corrupt image remain successful, and no displayed or exported result is silently dropped or fabricated.",
+    "The same MainWindow performs a subsequent successful folder run, proves stale export data is cleared before completion, and exports only the new run without duplicate rows, stale errors, or duplicate exporter invocation.",
+    "The real flow uses canonical model_definition.json, best_model_state_dict.pt, and class_mapping.json paths on CPU with tiny local deterministic fixtures and preserves legacy explicit Model JSON and existing single-image integration behavior.",
+    "The integration test requires no CUDA, external model download, network, new dependency, screenshot comparison, cancellation, progress, preview, drag-and-drop, packaging, or repository output outside pytest temporary directories.",
+    "docs/phase11_folder_result_export.md documents the exact versioned JSON fields, exact CSV header, deterministic ordering and formatting, UTF-8 behavior, partial-failure representation, atomic destination behavior, GUI enablement and error behavior, compatibility guarantees, and explicit limitations without fabricated test counts.",
+    "README.md receives only a concise user-facing export workflow and link to the detailed document, without unrelated restructuring or claims of import, cancellation, progress, preview, parallelism, packaging, installer, or TorchScript migration.",
+    "No production source is changed in this checkpoint; no public inference/controller/worker API, portable artifact format, dependency, launcher, goal, manifest, local config, or unrelated test assertion changes.",
+    "Phase 11 completion remains conditional on all three fixed required-test allowlists, verifier PASS decisions, and exactly one mutation-free full project harness PASS."
+  ],
+  "allowed_files": [
+    "tests/gui/test_folder_result_export_integration.py",
+    "README.md",
+    "docs/phase11_folder_result_export.md"
+  ],
+  "required_tests": [
+    "phase11_cp3_folder_result_export_cpu_graduation"
+  ],
+  "claude_prompt": "Implement only Phase 11 checkpoint 3 in exactly these allowed files: tests/gui/test_folder_result_export_integration.py, README.md, and docs/phase11_folder_result_export.md. Do not modify production code. Add one real-CPU qtbot integration that creates a tiny canonical portable bundle through existing APIs, drives actual MainWindow/InferencePage folder inference with valid and corrupt supported images, exports the resulting aggregate through the real CSV and JSON GUI actions, compares exported content with displayed and delivered outcomes, then reruns in the same window and proves only the new result is exported with no stale or duplicate rows/calls. Use deterministic tiny local fixtures, CPU/fp32, and pytest temporary paths only. Document the exact schemas, ordering, partial failures, UTF-8 and atomic-write behavior, GUI state, compatibility, and limitations; add only a concise README workflow/link. Do not fabricate test counts. Do not change source, public APIs, artifacts, dependencies, launcher, pyproject, config, other tests, goals, or manifest. Do not add import, progress, cancellation, preview, drag-and-drop, packaging, CUDA, external downloads, screenshots, or later-Phase features. Do not weaken assertions. Do not use Bash or Git, do not run tests, and do not commit or push.",
+  "estimated_scope": "Integration and documentation graduation slice: one new real-CPU GUI integration test, one focused document, and a concise README update, approximately 300-480 changed lines combined."
+}

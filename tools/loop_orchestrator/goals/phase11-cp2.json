@@ -1,0 +1,26 @@
+{
+  "template": false,
+  "checkpoint_id": "phase11-cp2-folder-result-export-gui",
+  "objective": "Integrate explicit CSV and JSON export actions into the existing InferencePage folder-results workflow while preserving the Phase 10 asynchronous lifecycle and all single-image behavior.",
+  "acceptance_criteria": [
+    "The folder-result area exposes clear CSV and JSON export actions without changing MainWindow construction, tabs, controller/worker public APIs, or the single-image result area.",
+    "Export actions are disabled before a completed folder result exists, during a new run, after a fatal folder failure, after switching away from a stale folder result, and whenever no current aggregate is retained.",
+    "After successful or partial-success folder completion, the page retains exactly the FolderInferenceResult delivered to _on_folder_finished and enables both export actions without reconstructing values from table text.",
+    "Starting another single-image or folder run clears the retained export source before asynchronous work begins, so stale results cannot be exported while Running or after a fatal failure.",
+    "Each action opens an appropriate save-file dialog with a deterministic suggested filename and extension, treats cancellation as a no-op, and passes the retained aggregate and selected path to the CP1 exporter exactly once.",
+    "A successful export presents concise non-modal or existing-style status feedback without altering the displayed result rows; a write error is caught on the GUI thread, leaves the current result exportable for retry, and presents a concise bounded error without crashing or starting inference.",
+    "Export UI state is restored consistently after success, partial failure, fatal failure, rerun, mode changes, and close coordination, with no QThread, worker, progress, cancellation, or signal ownership changes.",
+    "qtbot tests patch the save dialog and exporter boundary, verify exact path/result identity/call count for both formats, cancellation, error handling, stale-result clearing, partial-failure export, and rerun behavior without writing outside pytest temporary directories.",
+    "Existing Phase 6C/7/10 request mapping, portable bundle discovery, deterministic folder table, overlap prevention, thread cleanup, MainWindow close deferral, and single-image tests remain valid.",
+    "No actual model, CUDA, network, screenshot comparison, new dependency, export import, automatic export, progress, cancellation, preview, drag-and-drop, packaging, or unrelated refactor is introduced."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/gui/inference_page.py",
+    "tests/gui/test_inference_page.py"
+  ],
+  "required_tests": [
+    "phase11_cp2_folder_result_export_gui"
+  ],
+  "claude_prompt": "Implement only Phase 11 checkpoint 2 in exactly these allowed files: src/image_ai_studio/gui/inference_page.py and tests/gui/test_inference_page.py. Add explicit CSV and JSON save actions to the existing folder-result area and call the CP1 exporter using the exact FolderInferenceResult received by _on_folder_finished, never table text. Keep export disabled without a current completed aggregate, clear the retained aggregate at every new run and fatal failure, support partial-failure aggregates, make dialog cancellation a no-op, and report bounded write errors on the GUI thread while allowing retry. Preserve every Phase 6C/7/10 request, worker/QThread, overlap, cleanup, rerun, result presentation, and MainWindow close-coordination pattern. Use qtbot with patched dialogs/export boundaries; do not run actual inference. Do not modify controller, worker, MainWindow, core result types, artifacts, dependencies, pyproject, other tests, docs, goals, or config. Do not add automatic export, import, progress, cancellation, preview, drag-and-drop, packaging, abstractions, or unrelated refactoring. Do not weaken existing assertions. Do not use Bash or Git, do not run tests, and do not commit or push.",
+  "estimated_scope": "Focused GUI slice in one existing page and its existing test module, approximately 180-320 changed lines combined."
+}
