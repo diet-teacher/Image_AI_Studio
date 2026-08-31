@@ -1,0 +1,27 @@
+{
+  "template": false,
+  "checkpoint_id": "phase12-cp4-folder-cancellation-cpu-graduation",
+  "objective": "Prove the complete real-CPU folder progress, cooperative cancellation, partial export, close cleanup, and rerun workflow and document its exact contracts and limitations.",
+  "acceptance_criteria": [
+    "A real CPU qtbot integration creates an established portable bundle, drives actual MainWindow and InferencePage folder inference over multiple local images, observes initial and per-image progress, requests cancellation after at least one real completed image, and proves no later image backend starts after cancellation is observed.",
+    "The current single-image forward completes normally before cancellation takes effect; the terminal signal is exactly cancelled once, never finished or failed, and the partial displayed rows preserve every completed success or isolated error in deterministic order.",
+    "The cancelled partial FolderInferenceResult exports through the real Phase 11 CSV and JSON actions without schema-version change, with processed-item counts and rows matching the displayed partial result; documentation states that discovered-total/unprocessed cancellation metadata is not embedded in export format_version 1.",
+    "The same window performs a subsequent full successful folder run with monotonic fresh progress, no stale cancel flag/results/errors/export data, exactly one normal terminal signal, and canonical thread/worker cleanup.",
+    "A close-during-folder-run integration path requests cooperative cancellation, keeps the window alive during the current forward, and closes exactly once only after terminal cleanup, while idle and single-image close behavior remain covered by existing tests.",
+    "The integration uses tiny deterministic CPU fixtures, local images and existing portable artifacts only, writes exports only under pytest temporary paths, and requires no CUDA, network, model download, screenshot comparison, sleep-based race, or new dependency.",
+    "docs/phase12_folder_progress_cancellation.md documents callback/signal ordering, cancellation checkpoints, current-forward behavior, partial-result and export semantics, counts, state transitions, cleanup/rerun/close behavior, compatibility guarantees, CPU evidence, and explicit non-goals without fabricated test results.",
+    "README.md receives only a concise user workflow and detailed-document link, without unrelated restructuring or claims of mid-forward abort, parallelism, preview, drag-and-drop, packaging, installer, or TorchScript migration.",
+    "No production source is changed in this checkpoint, and no public single-image API, FolderInferenceResult field, Phase 11 export schema, portable artifact format, dependency, launcher, pyproject marker registry, goal, manifest, or local config is modified.",
+    "The checkpoint verifier evaluates the implementation, accumulated Phase diff, compatibility, and this fixed required-test result only; it must not require or claim a future final harness PASS. The orchestrator runs the full harness exactly once only after every implementation verifier has passed, and no model verifier runs after that harness."
+  ],
+  "allowed_files": [
+    "tests/gui/test_folder_cancellation_integration.py",
+    "README.md",
+    "docs/phase12_folder_progress_cancellation.md"
+  ],
+  "required_tests": [
+    "phase12_cp4_folder_cancellation_cpu_graduation"
+  ],
+  "claude_prompt": "Implement only Phase 12 checkpoint 4 in exactly these allowed files: tests/gui/test_folder_cancellation_integration.py, README.md, and docs/phase12_folder_progress_cancellation.md. Do not modify production code. Add deterministic real-CPU qtbot integration using the canonical portable bundle and actual MainWindow/InferencePage: observe progress, request cancel only after a real completed image, prove the current forward completes and later images do not start, verify exactly one cancelled terminal, partial rows and real Phase 11 CSV/JSON exports, cleanup, then a clean full rerun. Also cover close-triggered cooperative cancellation and exactly-once close after cleanup without sleep races. Document exact callback/signal ordering, processed versus discovered/unprocessed counts, export format_version 1 compatibility, rerun/close behavior, CPU evidence and limitations; add only a concise README workflow/link and do not fabricate counts. Do not change source, APIs, result/export/artifact schemas, dependencies, launcher, pyproject, config, other tests, goals, or manifest. Do not add mid-forward abort, wait/terminate, parallelism, preview, drag-and-drop, packaging, CUDA, network, screenshots, or later-Phase work. Do not weaken assertions. The implementation verifier must not require the future final harness; it should approve based on code/diff/required tests, after which the orchestrator alone runs one final full harness with no post-harness model verifier. Do not use Bash or Git, do not run tests, and do not commit or push.",
+  "estimated_scope": "Real-CPU integration and documentation graduation slice: one new GUI integration test, one focused document, and a concise README update, approximately 380-600 changed lines combined."
+}

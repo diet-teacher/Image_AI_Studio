@@ -1,0 +1,28 @@
+{
+  "template": false,
+  "checkpoint_id": "phase12-cp3-folder-progress-cancellation-page",
+  "objective": "Add observable folder progress and safe user cancellation to InferencePage, including partial-result export and nonblocking MainWindow close coordination, while preserving single-image behavior.",
+  "acceptance_criteria": [
+    "Folder mode presents an accessible progress indicator and Cancel action; initial state is zero/idle, Cancel is enabled only while a folder run can accept cancellation, and single-image mode retains its existing controls and semantics.",
+    "The page connects worker progress and cancelled signals to real bound QObject handlers before thread start and wires cancelled to thread.quit and worker.deleteLater alongside finished and failed without duplicate connections.",
+    "Progress displays discovered total and monotonically increasing completed/succeeded/failed counts from the delivered CP1 snapshots without estimating, polling, or reading worker-thread state directly.",
+    "Cancel requests are nonblocking and idempotent, update status to a concise cancelling state, disable further cancel clicks, and do not restore Run or inputs until the worker thread has fully cleaned up.",
+    "A cancelled terminal event displays the exact completed partial outcomes in deterministic order, reports processed and unprocessed counts distinctly from fatal failure, and retains that exact FolderInferenceResult for Phase 11 CSV/JSON export after cleanup.",
+    "Starting a new run clears stale progress, partial rows, cancellation status, and export source before work begins; rerun after cancellation can finish normally without a stale cancel flag, duplicate signals, rows, or exporter calls.",
+    "Fatal failure still clears results/export source, normal mixed completion remains Finished and exportable, and normal completion after all images is never displayed as Cancelled.",
+    "When MainWindow close is accepted during active folder inference, InferencePage requests cooperative cancellation and defers close until cancelled/finished/failed thread cleanup; active single-image inference retains natural-completion close behavior.",
+    "No GUI-thread wait, busy loop, QThread.terminate, mid-forward interruption, direct cross-thread widget mutation, or cancellation of CSV/JSON writes is introduced.",
+    "qtbot tests cover progress order and text/value state, cancel before/after progress, repeated cancel, partial export enablement, fatal/finished distinction, cleanup, rerun, close-triggered cancel, and unchanged single-image lifecycle using fake deterministic backends only.",
+    "MainWindow still owns exactly one InferencePage and its existing close orchestration API; no new tab, dialog workflow, public single-image API, artifact/schema, dependency, preview, drag-and-drop, or packaging feature is added."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/gui/inference_page.py",
+    "tests/gui/test_inference_page.py",
+    "tests/gui/test_main_window.py"
+  ],
+  "required_tests": [
+    "phase12_cp3_folder_progress_cancellation_page"
+  ],
+  "claude_prompt": "Implement only Phase 12 checkpoint 3 in exactly these allowed files: src/image_ai_studio/gui/inference_page.py, tests/gui/test_inference_page.py, and tests/gui/test_main_window.py. Add folder-only progress UI and a nonblocking idempotent Cancel action using CP2 signals/controller request. Connect bound handlers before thread start; wire cancelled through the same quit/deleteLater/cleanup lifecycle as finished/failed. Display exact progress, preserve the cancellation terminal's exact partial FolderInferenceResult for existing Phase 11 CSV/JSON export, distinguish processed/unprocessed cancellation from fatal failure, and clear stale state before rerun. On accepted MainWindow close during a folder run, request cooperative cancellation and wait only through existing asynchronous close coordination; do not change active single-image natural completion. Test with qtbot, deterministic events/fakes, and widget properties rather than screenshots or sleeps. Do not modify MainWindow production code unless the existing public coordination contract cannot support this; because main_window.py is not allowed, report a blocker instead of expanding scope. Do not modify core/controller/worker/exporter, artifacts, dependencies, pyproject, docs, other tests, goals, or config. Do not add wait/terminate/busy loops, automatic export, preview, drag-and-drop, packaging, or unrelated refactors. Do not weaken assertions. The implementation verifier must judge implementation and required tests only, not a future final harness result. Do not use Bash or Git, do not run tests, and do not commit or push.",
+  "estimated_scope": "Focused folder UX and close-coordination slice in one page plus two existing GUI test modules, approximately 320-520 changed lines combined."
+}

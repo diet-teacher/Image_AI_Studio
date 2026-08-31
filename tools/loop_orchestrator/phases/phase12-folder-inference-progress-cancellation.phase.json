@@ -1,0 +1,46 @@
+{
+  "phase_id": "phase12-folder-inference-progress-cancellation",
+  "objective": "Make sequential folder inference observable and safely cancellable between images, preserving completed outcomes for existing CSV/JSON export and retaining all single-image, portable-artifact, Qt cleanup, and compatibility contracts.",
+  "checkpoints": [
+    {"checkpoint_id": "phase12-cp1-folder-progress-cancellation-contract", "goal": "tools/loop_orchestrator/goals/phase12-cp1.json"},
+    {"checkpoint_id": "phase12-cp2-folder-cancellation-controller-worker", "goal": "tools/loop_orchestrator/goals/phase12-cp2.json"},
+    {"checkpoint_id": "phase12-cp3-folder-progress-cancellation-page", "goal": "tools/loop_orchestrator/goals/phase12-cp3.json"},
+    {"checkpoint_id": "phase12-cp4-folder-cancellation-cpu-graduation", "goal": "tools/loop_orchestrator/goals/phase12-cp4.json"}
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/inference/folder_inference.py",
+    "tests/inference/test_folder_inference.py",
+    "src/image_ai_studio/application/folder_inference_controller.py",
+    "src/image_ai_studio/gui/qt_folder_inference_worker.py",
+    "tests/application/test_folder_inference_controller.py",
+    "tests/gui/test_qt_folder_inference_worker.py",
+    "src/image_ai_studio/gui/inference_page.py",
+    "tests/gui/test_inference_page.py",
+    "tests/gui/test_main_window.py",
+    "tests/gui/test_folder_cancellation_integration.py",
+    "README.md",
+    "docs/phase12_folder_progress_cancellation.md"
+  ],
+  "allowed_tests": [
+    "phase12_cp1_folder_progress_cancellation_contract",
+    "phase12_cp2_folder_cancellation_controller_worker",
+    "phase12_cp3_folder_progress_cancellation_page",
+    "phase12_cp4_folder_cancellation_cpu_graduation"
+  ],
+  "final_harness_profile": "full",
+  "max_checkpoints": 4,
+  "max_rework_rounds": 1,
+  "max_model_calls": 16,
+  "max_claude_cost_usd": 8.0,
+  "max_elapsed_seconds": 14400,
+  "completion_conditions": [
+    "Each checkpoint runs its fixed required tests first and then receives a read-only verifier PASS based only on implementation, accumulated Phase diff, compatibility, and observed required-test results; no verifier requires the not-yet-run final harness.",
+    "Folder inference emits deterministic initial and per-completed-image progress, observes cancellation only before an image boundary, never interrupts a running single-image forward, and preserves exact completed outcomes plus discovered/unprocessed metadata in a distinct cancelled terminal contract.",
+    "Existing callers with no hooks behave unchanged, existing one-argument injected backends remain usable, and FolderInferenceResult plus Phase 11 JSON/CSV format_version 1 remain unchanged; partial export contains processed items only and cancellation metadata remains explicitly external.",
+    "Controller cancellation is thread-safe, idempotent and reset for rerun; Qt worker emits ordered progress and exactly one of finished/cancelled/failed with canonical quit/deleteLater/thread cleanup and no wait, terminate, polling, or cross-thread widget mutation.",
+    "InferencePage presents progress and Cancel only for active folder work, preserves partial cancelled results for export, distinguishes cancellation from fatal failure and normal completion, clears stale state on rerun, and requests cooperative folder cancellation during existing asynchronous MainWindow close coordination while preserving single-image behavior.",
+    "A real CPU MainWindow integration proves progress, boundary cancellation, partial CSV/JSON export, cleanup, full rerun, and close-triggered cancellation using canonical portable artifacts and local deterministic fixtures without CUDA, network, external downloads, screenshots, or new dependencies.",
+    "No change occurs outside the twelve allowed files, and public single-image APIs, portable artifacts, export schemas, launcher, dependencies, pytest marker registry, and prior Phase behavior remain compatible; docs accurately state limitations and do not claim future verification.",
+    "Only after all four implementation verifiers PASS, the orchestrator runs the full project harness exactly once; harness PASS is the final READY_TO_COMMIT gate, no model verifier runs after it, and the Phase stops without planner, later Phase, add, commit, push, or pull-request operations."
+  ]
+}

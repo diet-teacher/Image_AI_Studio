@@ -1,0 +1,28 @@
+{
+  "template": false,
+  "checkpoint_id": "phase12-cp2-folder-cancellation-controller-worker",
+  "objective": "Propagate folder progress and cooperative cancellation through the application controller and Qt worker with thread-safe idempotent requests and exactly one terminal signal.",
+  "acceptance_criteria": [
+    "FolderInferenceController adds a cancelled terminal state and an idempotent request_cancel operation backed by thread-safe state that is cleared at each accepted begin_run, without changing existing no-cancel begin/run behavior.",
+    "Controller run forwards progress to the CP1 callback contract, observes cancellation through its thread-safe request flag, distinguishes cooperative cancellation from fatal exceptions, and preserves the exact partial FolderInferenceResult and discovered-total metadata.",
+    "Existing one-argument injected folder backends and existing controller callers remain supported without requiring progress/cancellation parameters; new cooperative-capable backends receive the optional hooks through an explicit backward-compatible boundary rather than error-string parsing.",
+    "QtFolderInferenceWorker exposes progress and cancelled signals in addition to existing finished and failed, and one run emits exactly one terminal signal among finished, cancelled, and failed.",
+    "The worker performs inference only on its worker thread, emits ordered progress snapshots before its terminal signal, and treats per-image errors as progress plus normal/cancelled aggregate data rather than failed.",
+    "request_cancel may be invoked repeatedly from the GUI thread without blocking, waiting, busy loops, terminate, or direct worker-thread mutation, and cancellation is observed only at the core image boundary.",
+    "finished, failed, and cancelled all support the canonical thread.quit and worker.deleteLater wiring, with thread.finished owning thread.deleteLater and reference cleanup in the page checkpoint.",
+    "A controller or worker can run again after cancelled, finished, or failed by begin_run clearing only the cancellation flag for the new run; a stale cancel request cannot cancel the rerun.",
+    "Focused tests prove progress ordering, cancel-before-first, cancel-after-progress, duplicate cancel idempotency, exactly-one terminal signal, fatal failure separation, rerun, thread affinity, and direct worker QObject destruction observation where reliable.",
+    "Existing single-image controller/worker APIs, folder result/export schemas, artifacts, GUI, MainWindow, dependencies, and actual model/CUDA execution remain unchanged."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/application/folder_inference_controller.py",
+    "src/image_ai_studio/gui/qt_folder_inference_worker.py",
+    "tests/application/test_folder_inference_controller.py",
+    "tests/gui/test_qt_folder_inference_worker.py"
+  ],
+  "required_tests": [
+    "phase12_cp2_folder_cancellation_controller_worker"
+  ],
+  "claude_prompt": "Implement only Phase 12 checkpoint 2 in exactly these allowed files: src/image_ai_studio/application/folder_inference_controller.py, src/image_ai_studio/gui/qt_folder_inference_worker.py, tests/application/test_folder_inference_controller.py, and tests/gui/test_qt_folder_inference_worker.py. Add controller progress forwarding, a thread-safe idempotent cancel request cleared on begin_run, a distinct cancelled state carrying CP1 partial-result metadata, and Qt progress/cancelled signals. Guarantee exactly one terminal signal, worker-thread execution, ordered progress, canonical quit/deleteLater compatibility, and rerun after cancel. Preserve existing one-argument injected backend and no-cancel caller compatibility through a focused explicit adapter boundary; do not parse error strings. Test with fake CPU backends, Qt events, deterministic synchronization, and direct destruction observation where reliable. Do not modify core, InferencePage, MainWindow, exporter, artifacts, dependencies, pyproject, docs, other tests, goals, or config. Do not add terminate/wait/busy loops, parallelism, mid-forward interruption, generic frameworks, or unrelated refactors. Do not weaken assertions. The implementation verifier must evaluate this checkpoint and required tests without requiring the future final harness. Do not use Bash or Git, do not run tests, and do not commit or push.",
+  "estimated_scope": "Application and Qt lifecycle slice across two existing modules and focused tests, approximately 300-500 changed lines combined."
+}

@@ -1,0 +1,28 @@
+{
+  "template": false,
+  "checkpoint_id": "phase12-cp1-folder-progress-cancellation-contract",
+  "objective": "Add a framework-independent, backward-compatible folder-inference progress and cooperative-cancellation contract that observes cancellation only between images and preserves completed outcomes for export.",
+  "acceptance_criteria": [
+    "run_folder_inference keeps its existing request and backend calling behavior when new optional progress and cancellation hooks are omitted, so every existing caller and result remains unchanged.",
+    "A frozen progress value reports discovered total, completed, succeeded, and failed counts with invariants 0 <= succeeded + failed == completed <= total and contains no Qt or mutable inference state.",
+    "After deterministic discovery, progress emits an initial 0-of-total snapshot and then exactly one snapshot after each completed success or isolated per-image failure, in item order, with monotonically increasing completed counts.",
+    "A thread-safe-compatible should_cancel callback is observed before the first image and only after a completed image before another image starts; an already-running single-image backend call is never interrupted, terminated, or discarded.",
+    "Cancellation before the first image or between images raises or returns one explicit folder-cancel terminal value that is distinct from fatal failure and carries the exact completed FolderInferenceResult, discovered total, and a derived unprocessed count.",
+    "The partial FolderInferenceResult contains only images whose backend calls completed, preserves their deterministic order and success/error values, and remains directly compatible with the existing Phase 11 CSV/JSON exporter.",
+    "FolderInferenceResult and Phase 11 export format_version 1 are not changed: exported partial-result total/succeeded/failed counts describe processed items only, while cancellation and unprocessed metadata remain outside the export schema and are documented for backward compatibility.",
+    "A cancellation request observed after the final image does not turn a fully completed run into cancelled; the normal full FolderInferenceResult is returned.",
+    "Exceptions from discovery or the progress callback preserve the existing fatal-error behavior, while per-image backend exceptions remain isolated outcomes and are followed by progress emission.",
+    "Focused CPU-only tests cover no-hook compatibility, initial and per-item ordering, mixed failures, cancel-before-first, cancel-after-one, repeated true cancellation, cancel-after-last, callback errors, partial export compatibility, and immutable inputs without Qt, CUDA, network, sleep races, or new dependencies.",
+    "Existing single-image inference APIs, artifact paths/formats, controller/worker/page behavior, and result export schemas remain unchanged in this checkpoint.",
+    "Parallel execution, mid-forward interruption, QThread termination, timeout cancellation, recursive discovery, preview, packaging, and generic task/cancellation frameworks are outside scope."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/inference/folder_inference.py",
+    "tests/inference/test_folder_inference.py"
+  ],
+  "required_tests": [
+    "phase12_cp1_folder_progress_cancellation_contract"
+  ],
+  "claude_prompt": "Implement only Phase 12 checkpoint 1 in exactly these allowed files: src/image_ai_studio/inference/folder_inference.py and tests/inference/test_folder_inference.py. Add small immutable progress and explicit cancellation-terminal contracts plus optional progress_callback/should_cancel hooks to run_folder_inference. Emit 0-of-total after discovery and one monotonic snapshot after every completed image. Check cancellation before the first image and only between completed images; never interrupt a running single-image backend call. Preserve completed ImageOutcome objects in an ordinary FolderInferenceResult and carry discovered-total/unprocessed metadata separately so Phase 11 export format_version 1 and FolderInferenceResult stay unchanged. Default hooks must preserve every existing caller. Use deterministic fake backends and no timing sleeps. Add no dependency or generic task framework. Do not modify controller, worker, GUI, MainWindow, exporter, artifacts, public single-image APIs, pyproject, docs, config, goals, or manifest. Do not implement parallelism, timeout cancellation, preview, packaging, or later-Phase work. Do not weaken assertions. The implementation verifier must judge this checkpoint code, diff, compatibility, and required-test result only; it must not require the future final harness to have run. Do not use Bash or Git, do not run tests, and do not commit or push.",
+  "estimated_scope": "Focused core contract extension in one module and its existing tests, approximately 220-380 changed lines combined."
+}
