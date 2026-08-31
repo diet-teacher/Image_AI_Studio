@@ -21,7 +21,7 @@ import threading
 from pathlib import Path
 
 import pytest
-from PySide6.QtWidgets import QFormLayout
+from PySide6.QtWidgets import QFileDialog, QFormLayout
 
 from image_ai_studio.application.folder_inference_controller import FolderInferenceController
 from image_ai_studio.application.inference_controller import InferenceController
@@ -32,6 +32,7 @@ from image_ai_studio.inference.folder_inference import (
     FolderInferenceResult,
     ImageOutcome,
 )
+from image_ai_studio.inference.folder_result_export import FolderResultExportError
 from image_ai_studio.inference.single_image_inference import InferenceResult
 
 pytestmark = pytest.mark.phase6c_cp1_inference_page
@@ -1831,3 +1832,491 @@ def test_single_image_mode_unaffected_by_folder_additions(tmp_path, qtbot) -> No
     assert page._folder_thread is None
     assert page._folder_worker is None
     assert page._folder_controller.state == "idle"
+
+
+# ===============================================================================
+# Phase 11 CP2: explicit CSV/JSON export of the retained folder aggregate
+# (QFileDialog + folder_result_export.write_folder_result_export patched at the
+#  inference_page boundary; deterministic suggested filename, cancellation no-op,
+#  bounded GUI-thread write-error handling with retry, stale-source clearing on
+#  new run / fatal failure / mode switch, partial-failure export, rerun tracking.
+#  No real inference; no writes outside pytest tmp_path.)
+# ===============================================================================
+
+
+_EXPORT_BOUNDARY = "image_ai_studio.gui.inference_page.write_folder_result_export"
+
+
+def _patch_export_recorder(monkeypatch) -> list:
+    """Replace the CP1 exporter at the inference_page boundary with a recorder
+    that performs no filesystem writes. Returns the list of captured
+    (result, path, format) tuples."""
+    calls: list = []
+
+    def _record(result, path, *, format):
+        calls.append((result, path, format))
+
+    monkeypatch.setattr(_EXPORT_BOUNDARY, _record)
+    return calls
+
+
+def _patch_save_dialog(monkeypatch, returned_path) -> dict:
+    """Patch QFileDialog.getSaveFileName to return a fixed path (or "" for a
+    cancelled dialog) and record what it was offered."""
+    seen: dict = {}
+
+    def _fake_get_save_file_name(parent, caption, directory="", filter="", *args, **kwargs):
+        seen["caption"] = caption
+        seen["suggested"] = directory
+        seen["filter"] = filter
+        return (str(returned_path), filter)
+
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName", staticmethod(_fake_get_save_file_name)
+    )
+    return seen
+
+
+def _completed_folder_page(qtbot, tmp_path, aggregate) -> InferencePage:
+    page = _folder_page(qtbot, lambda request: aggregate)
+    _fill_folder_fields(page, tmp_path)
+    _start_and_wait(page, qtbot)
+    return page
+
+
+# -- export actions exist in the folder-result area --------------------------
+
+
+def test_export_actions_present_in_folder_result_area_and_disabled_initially(qtbot) -> None:
+    page = _make_page(qtbot)
+    assert page._export_csv_button.text() == "Export CSV"
+    assert page._export_json_button.text() == "Export JSON"
+    assert page._folder_result_group.isAncestorOf(page._export_csv_button)
+    assert page._folder_result_group.isAncestorOf(page._export_json_button)
+    assert page._export_csv_button.isEnabled() is False
+    assert page._export_json_button.isEnabled() is False
+    assert page._folder_export_source is None
+
+
+def test_single_image_result_area_unchanged_by_export_actions(qtbot) -> None:
+    page = _make_page(qtbot)
+    # The single-image result area gains nothing -- still just the four labels.
+    assert page._result_group.isAncestorOf(page._predicted_class_value_label)
+    assert not page._result_group.isAncestorOf(page._export_csv_button)
+
+
+# -- retention + enablement after a completed batch --------------------------
+
+
+def test_folder_success_retains_exact_aggregate_and_enables_both_actions(tmp_path, qtbot) -> None:
+    aggregate = _aggregate(_ok("a.png"), _ok("b.png"))
+    page = _completed_folder_page(qtbot, tmp_path, aggregate)
+
+    assert page._status_label.text() == "Finished"
+    assert page._folder_export_source is aggregate
+    assert page._export_csv_button.isEnabled() is True
+    assert page._export_json_button.isEnabled() is True
+
+
+def test_on_folder_finished_retains_the_delivered_instance_directly(qtbot) -> None:
+    page = _make_page(qtbot)
+    aggregate = _aggregate(_ok("only.png"), _fail("bad.png", error="KeyError: x"))
+
+    page._on_folder_finished(aggregate)
+
+    assert page._folder_export_source is aggregate
+    assert page._export_csv_button.isEnabled() is True
+    assert page._export_json_button.isEnabled() is True
+
+
+# -- each action calls the CP1 exporter exactly once with identity + path -----
+
+
+def test_export_csv_action_calls_cp1_exporter_once_with_identity_and_path(
+    tmp_path, qtbot, monkeypatch
+) -> None:
+    aggregate = _aggregate(_ok("a.png"), _fail("b.png"))
+    page = _completed_folder_page(qtbot, tmp_path, aggregate)
+
+    calls = _patch_export_recorder(monkeypatch)
+    dest = tmp_path / "chosen_name.csv"
+    seen = _patch_save_dialog(monkeypatch, dest)
+
+    page._export_csv_button.click()
+
+    assert len(calls) == 1
+    result, path, fmt = calls[0]
+    assert result is aggregate
+    assert result is page._folder_export_source
+    assert Path(path) == dest
+    assert fmt == "csv"
+    assert Path(seen["suggested"]).name == "folder_inference_results.csv"
+    assert page._folder_results_table.rowCount() == 2  # rows untouched
+    assert page._status_label.text().startswith("Exported CSV")
+
+
+def test_export_json_action_calls_cp1_exporter_once_with_identity_and_path(
+    tmp_path, qtbot, monkeypatch
+) -> None:
+    aggregate = _aggregate(_ok("a.png"), _ok("b.png"), _ok("c.png"))
+    page = _completed_folder_page(qtbot, tmp_path, aggregate)
+
+    calls = _patch_export_recorder(monkeypatch)
+    dest = tmp_path / "chosen_name.json"
+    seen = _patch_save_dialog(monkeypatch, dest)
+
+    page._export_json_button.click()
+
+    assert len(calls) == 1
+    result, path, fmt = calls[0]
+    assert result is aggregate
+    assert Path(path) == dest
+    assert fmt == "json"
+    assert Path(seen["suggested"]).name == "folder_inference_results.json"
+    assert page._status_label.text().startswith("Exported JSON")
+
+
+def test_export_uses_real_cp1_writer_into_tmp_path(tmp_path, qtbot, monkeypatch) -> None:
+    """End-to-end: with only the save dialog patched, the real CP1 exporter
+    writes the retained aggregate verbatim to the chosen tmp_path file."""
+    from image_ai_studio.inference.folder_result_export import folder_result_to_json_text
+
+    aggregate = _aggregate(_ok("a.png"), _fail("b.png", error="ValueError: bad"))
+    page = _completed_folder_page(qtbot, tmp_path, aggregate)
+
+    dest = tmp_path / "results.json"
+    _patch_save_dialog(monkeypatch, dest)
+
+    page._export_json_button.click()
+
+    assert dest.read_text(encoding="utf-8") == folder_result_to_json_text(aggregate)
+    assert page._status_label.text().startswith("Exported JSON")
+
+
+# -- cancellation is a no-op -------------------------------------------------
+
+
+def test_export_dialog_cancellation_is_a_noop(tmp_path, qtbot, monkeypatch) -> None:
+    aggregate = _aggregate(_ok("a.png"))
+    page = _completed_folder_page(qtbot, tmp_path, aggregate)
+    status_before = page._status_label.text()
+    rows_before = page._folder_results_table.rowCount()
+
+    calls = _patch_export_recorder(monkeypatch)
+    _patch_save_dialog(monkeypatch, "")  # empty path == cancelled dialog
+
+    page._export_csv_button.click()
+    page._export_json_button.click()
+
+    assert calls == []
+    assert page._status_label.text() == status_before
+    assert page._folder_results_table.rowCount() == rows_before
+    assert page._folder_export_source is aggregate  # still retained / exportable
+    assert page._export_csv_button.isEnabled() is True
+    assert page._export_json_button.isEnabled() is True
+
+
+# -- bounded GUI-thread write error, current result stays exportable ---------
+
+
+def test_export_write_error_is_bounded_on_gui_thread_and_allows_retry(
+    tmp_path, qtbot, monkeypatch
+) -> None:
+    aggregate = _aggregate(_ok("a.png"))
+    page = _completed_folder_page(qtbot, tmp_path, aggregate)
+
+    attempts = {"n": 0}
+
+    def flaky_export(result, path, *, format):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise OSError("simulated replace failure\nsecond line\nthird line")
+
+    monkeypatch.setattr(_EXPORT_BOUNDARY, flaky_export)
+    _patch_save_dialog(monkeypatch, tmp_path / "out.csv")
+
+    rows_before = page._folder_results_table.rowCount()
+    page._export_csv_button.click()
+
+    assert attempts["n"] == 1
+    assert page._status_label.text().startswith("Export failed:")
+    assert "second line" not in page._status_label.text()  # bounded to first line
+    assert "Traceback" not in page._status_label.text()
+    assert len(page._status_label.text()) <= 16 + 200
+    assert page._folder_results_table.rowCount() == rows_before  # rows unchanged
+    assert page._folder_export_source is aggregate  # left exportable for retry
+    assert page._export_csv_button.isEnabled() is True
+    assert page._folder_thread is None and page._folder_worker is None  # no inference
+    assert page._thread is None and page._worker is None
+
+    # Retry now succeeds against the same retained aggregate.
+    page._export_csv_button.click()
+    assert attempts["n"] == 2
+    assert page._status_label.text().startswith("Exported CSV")
+
+
+def test_export_precondition_error_is_reported_without_crashing(
+    tmp_path, qtbot, monkeypatch
+) -> None:
+    aggregate = _aggregate(_ok("a.png"))
+    page = _completed_folder_page(qtbot, tmp_path, aggregate)
+
+    def bad_dest_export(result, path, *, format):
+        raise FolderResultExportError("destination is not a file path: x")
+
+    monkeypatch.setattr(_EXPORT_BOUNDARY, bad_dest_export)
+    _patch_save_dialog(monkeypatch, tmp_path / "already_dir")
+
+    page._export_json_button.click()
+
+    assert page._status_label.text().startswith("Export failed:")
+    assert page._folder_export_source is aggregate
+    assert page._export_json_button.isEnabled() is True
+
+
+# -- stale-source clearing: fatal failure ----------------------------------
+
+
+def test_fatal_folder_failure_clears_export_source_and_disables_actions(
+    tmp_path, qtbot, monkeypatch
+) -> None:
+    def fatal(request):
+        raise FolderInferenceError("no supported images in folder: batch")
+
+    page = _folder_page(qtbot, fatal)
+    _fill_folder_fields(page, tmp_path)
+    _start_and_wait(page, qtbot)
+
+    assert page._status_label.text().startswith("Failed")
+    assert page._folder_export_source is None
+    assert page._export_csv_button.isEnabled() is False
+    assert page._export_json_button.isEnabled() is False
+
+    calls = _patch_export_recorder(monkeypatch)
+    seen = _patch_save_dialog(monkeypatch, tmp_path / "x.csv")
+    page._on_export_csv_clicked()  # direct call -- handler must still no-op
+    page._on_export_json_clicked()
+
+    assert calls == []
+    assert seen == {}  # save dialog never opened
+
+
+def test_partial_success_batch_after_fatal_failure_becomes_exportable_again(
+    tmp_path, qtbot
+) -> None:
+    calls = {"n": 0}
+
+    def flaky(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise FolderInferenceError("folder vanished")
+        return _aggregate(_ok("a.png"), _fail("b.png"), _ok("c.png"))
+
+    page = _folder_page(qtbot, flaky)
+    _fill_folder_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+    assert page._folder_export_source is None
+    assert page._export_csv_button.isEnabled() is False
+
+    _start_and_wait(page, qtbot)
+    assert page._status_label.text() == "Finished"
+    assert page._folder_export_source is not None
+    assert page._folder_export_source.failed == 1  # partial failure, still exportable
+    assert page._export_csv_button.isEnabled() is True
+    assert page._export_json_button.isEnabled() is True
+
+
+# -- stale-source clearing: a new run before async work begins ------------
+
+
+def test_new_folder_run_clears_export_source_before_showing_running(tmp_path, qtbot) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    calls = {"n": 0}
+
+    def backend(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _aggregate(_ok("a.png"))
+        started.set()
+        assert release.wait(timeout=5)
+        return _aggregate(_ok("b.png"))
+
+    page = _folder_page(qtbot, backend)
+    _fill_folder_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+    assert page._folder_export_source is not None
+
+    started.clear()
+    release.clear()
+    page._on_run_clicked()
+    assert started.wait(timeout=5)
+
+    assert page._status_label.text() == "Running"
+    assert page._folder_export_source is None
+    assert page._export_csv_button.isEnabled() is False
+    assert page._export_json_button.isEnabled() is False
+
+    release.set()
+    qtbot.waitUntil(lambda: page._run_button.isEnabled(), timeout=5000)
+    assert page._folder_export_source is not None  # fresh aggregate retained
+    assert page._export_csv_button.isEnabled() is True
+
+
+def test_export_disabled_during_active_folder_run_and_restored_after_cleanup(
+    tmp_path, qtbot
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def backend(request):
+        started.set()
+        assert release.wait(timeout=5)
+        return _aggregate(_ok("a.png"))
+
+    page = _folder_page(qtbot, backend)
+    _fill_folder_fields(page, tmp_path)
+
+    page._on_run_clicked()
+    assert started.wait(timeout=5)
+    assert page._export_csv_button.isEnabled() is False
+    assert page._export_json_button.isEnabled() is False
+
+    release.set()
+    qtbot.waitUntil(lambda: page._run_button.isEnabled(), timeout=5000)
+    assert page._export_csv_button.isEnabled() is True
+    assert page._export_json_button.isEnabled() is True
+
+
+def test_new_single_image_run_clears_retained_folder_export_source(tmp_path, qtbot) -> None:
+    page = InferencePage(
+        controller=InferenceController(backend=lambda request: _fake_inference_result()),
+        folder_controller=FolderInferenceController(
+            backend=lambda request: _aggregate(_ok("a.png"))
+        ),
+    )
+    qtbot.addWidget(page)
+
+    page._folder_path_edit.setText(str(tmp_path / "images"))
+    page._mode_combo.setCurrentText("Folder")
+    _start_and_wait(page, qtbot)
+    assert page._folder_export_source is not None
+
+    page._mode_combo.setCurrentText("Single Image")
+    # Switching away from the folder result already drops the retained source.
+    assert page._folder_export_source is None
+    assert page._export_csv_button.isEnabled() is False
+
+    _fill_minimum_valid_fields(page, tmp_path)
+    _start_and_wait(page, qtbot)
+    assert page._folder_export_source is None
+    assert page._export_json_button.isEnabled() is False
+
+
+def test_switching_away_from_stale_folder_result_disables_export(tmp_path, qtbot, monkeypatch) -> None:
+    aggregate = _aggregate(_ok("a.png"), _ok("b.png"))
+    page = _completed_folder_page(qtbot, tmp_path, aggregate)
+    assert page._export_csv_button.isEnabled() is True
+
+    page._mode_combo.setCurrentText("Single Image")
+    assert page._folder_export_source is None
+    assert page._export_csv_button.isEnabled() is False
+    assert page._export_json_button.isEnabled() is False
+
+    calls = _patch_export_recorder(monkeypatch)
+    seen = _patch_save_dialog(monkeypatch, tmp_path / "x.json")
+    page._on_export_json_clicked()  # direct call still a no-op
+    assert calls == []
+    assert seen == {}
+
+    # Returning to Folder mode does not resurrect the stale aggregate.
+    page._mode_combo.setCurrentText("Folder")
+    assert page._folder_export_source is None
+    assert page._export_csv_button.isEnabled() is False
+
+
+# -- rerun tracking -------------------------------------------------------
+
+
+def test_export_source_tracks_latest_aggregate_across_reruns(tmp_path, qtbot) -> None:
+    seq = [
+        _aggregate(_ok("a.png"), _ok("b.png")),
+        _aggregate(_fail("x.png")),
+        _aggregate(_ok("only.png")),
+    ]
+    calls = {"n": 0}
+
+    def backend(request):
+        item = seq[calls["n"]]
+        calls["n"] += 1
+        return item
+
+    page = _folder_page(qtbot, backend)
+    _fill_folder_fields(page, tmp_path)
+
+    for expected in seq:
+        _start_and_wait(page, qtbot)
+        assert page._folder_export_source is expected
+        assert page._export_csv_button.isEnabled() is True
+        assert page._export_json_button.isEnabled() is True
+
+
+def test_rerun_exports_only_the_current_aggregate(tmp_path, qtbot, monkeypatch) -> None:
+    first = _aggregate(_ok("a.png"), _ok("b.png"))
+    second = _aggregate(_ok("only.png"))
+    seq = [first, second]
+    calls = {"n": 0}
+
+    def backend(request):
+        item = seq[calls["n"]]
+        calls["n"] += 1
+        return item
+
+    page = _folder_page(qtbot, backend)
+    _fill_folder_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+    _start_and_wait(page, qtbot)
+    assert page._folder_export_source is second
+
+    recorded = _patch_export_recorder(monkeypatch)
+    _patch_save_dialog(monkeypatch, tmp_path / "cur.csv")
+    page._export_csv_button.click()
+
+    assert len(recorded) == 1
+    assert recorded[0][0] is second
+    assert recorded[0][0] is not first
+
+
+# -- close coordination leaves export state consistent -------------------
+
+
+def test_export_state_consistent_after_close_coordination(tmp_path, qtbot) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def backend(request):
+        started.set()
+        assert release.wait(timeout=5)
+        return _aggregate(_ok("a.png"))
+
+    page = _folder_page(qtbot, backend)
+    _fill_folder_fields(page, tmp_path)
+    received = []
+    page.close_requested.connect(lambda: received.append(True))
+
+    page._on_run_clicked()
+    assert started.wait(timeout=5)
+    assert page._export_csv_button.isEnabled() is False
+    page.request_close()
+    assert received == []  # inference finishes naturally, not cancelled
+
+    release.set()
+    qtbot.waitUntil(lambda: received == [True], timeout=5000)
+    assert page._folder_thread is None
+    assert page._folder_worker is None
+    assert page._folder_export_source is not None
+    assert page._export_csv_button.isEnabled() is True
+    assert page._export_json_button.isEnabled() is True

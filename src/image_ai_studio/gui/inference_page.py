@@ -33,7 +33,21 @@ aggregate total/succeeded/failed counts. A folder run with per-image
 failures mixed in is a *completed* batch (worker `finished`), not a fatal
 failure; `failed` is reserved for a fatal folder error. Single-image mode
 is untouched -- same request, controller, worker, formatting, overlap
-prevention, rerun, cleanup, and close-defer behavior."""
+prevention, rerun, cleanup, and close-defer behavior.
+
+Phase 11 CP2: the folder-result area gains two explicit export actions
+(CSV / JSON). They serialize the *exact* `FolderInferenceResult` object
+delivered to `_on_folder_finished` -- never text scraped back out of the
+table -- through the checkpoint-1 `write_folder_result_export` boundary.
+The retained aggregate is dropped (and both actions disabled) before every
+new single-image or folder run and on a fatal folder failure or a mode
+switch, so a stale or in-progress result can never be exported; a completed
+batch with per-image failures mixed in is still fully exportable. Each
+action opens a save dialog with a deterministic suggested filename,
+treats cancellation as a no-op, calls the exporter exactly once, and
+reports a bounded write error on the GUI thread while leaving the current
+result exportable for retry. No automatic export, import, progress, or
+cancellation is added, and no QThread / worker / signal ownership changes."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -61,6 +75,10 @@ from image_ai_studio.application.inference_controller import InferenceController
 from image_ai_studio.gui.qt_folder_inference_worker import QtFolderInferenceWorker
 from image_ai_studio.gui.qt_inference_worker import QtInferenceWorker
 from image_ai_studio.inference.folder_inference import FolderInferenceRequest, FolderInferenceResult
+from image_ai_studio.inference.folder_result_export import (
+    FolderResultExportError,
+    write_folder_result_export,
+)
 from image_ai_studio.inference.single_image_inference import InferenceRequest, InferenceResult
 from image_ai_studio.training.config import PRECISION_CHOICES
 
@@ -91,6 +109,13 @@ _FOLDER_SUMMARY_PLACEHOLDER = "Total: --  Succeeded: --  Failed: --"
 _FOLDER_RESULT_HEADERS = ("Image", "Status", "Predicted Class", "Confidence", "Error")
 _FOLDER_STATUS_SUCCESS = "Success"
 _FOLDER_STATUS_FAILURE = "Failure"
+
+_EXPORT_SUGGESTED_STEM = "folder_inference_results"
+"""save 다이얼로그가 제시하는 결정론적 파일명 stem -- 포맷별 확장자
+(`.csv`/`.json`)만 붙는다(Phase 11 CP2)."""
+_EXPORT_ERROR_MAX_CHARS = 200
+"""GUI thread에서 잡은 export 쓰기 오류를 상태 라벨에 보여줄 때의
+길이 상한(bounded error)."""
 
 
 def _format_confidence(confidence: float) -> str:
@@ -158,6 +183,11 @@ class InferencePage(QWidget):
         self._folder_worker: QtFolderInferenceWorker | None = None
         self._active_folder_path: Path = Path(".")
         self._close_pending = False
+        # Phase 11 CP2: the exact FolderInferenceResult last delivered to
+        # `_on_folder_finished`, or None when no completed aggregate is
+        # retained. Never rebuilt from table text; the two export actions
+        # are enabled iff this is not None and no run is active.
+        self._folder_export_source: FolderInferenceResult | None = None
         self._build_ui()
 
     # -- public: MainWindow.closeEvent()가 사용 ---------------------------------
@@ -349,6 +379,20 @@ class InferencePage(QWidget):
         self._folder_results_table = table
         box.addWidget(table)
 
+        # Phase 11 CP2: explicit CSV/JSON export actions for the retained
+        # aggregate. Disabled until a completed batch is delivered.
+        export_row = QHBoxLayout()
+        self._export_csv_button = QPushButton("Export CSV")
+        self._export_csv_button.clicked.connect(self._on_export_csv_clicked)
+        self._export_json_button = QPushButton("Export JSON")
+        self._export_json_button.clicked.connect(self._on_export_json_clicked)
+        self._export_csv_button.setEnabled(False)
+        self._export_json_button.setEnabled(False)
+        export_row.addWidget(self._export_csv_button)
+        export_row.addWidget(self._export_json_button)
+        export_row.addStretch(1)
+        box.addLayout(export_row)
+
         self._folder_result_group = group
         return group
 
@@ -386,6 +430,10 @@ class InferencePage(QWidget):
         self._folder_input_container.setVisible(folder_mode)
         self._folder_result_group.setVisible(folder_mode)
         self._result_group.setVisible(not folder_mode)
+        # Switching modes leaves any previously shown folder batch behind as
+        # a stale result -- drop the retained aggregate so export cannot act
+        # on it (Phase 11 CP2).
+        self._set_folder_export_source(None)
 
     def _is_folder_mode(self) -> bool:
         return self._mode_combo.currentText() == _MODE_FOLDER
@@ -436,6 +484,10 @@ class InferencePage(QWidget):
 
         self._clear_result_display()
         self._clear_folder_display()
+        # Drop any retained folder aggregate before async work begins so a
+        # stale result can't be exported while this run is in flight
+        # (Phase 11 CP2).
+        self._set_folder_export_source(None)
         self._set_controls_enabled(False)
         self._status_label.setText("Running")
         self._thread.start()
@@ -467,6 +519,10 @@ class InferencePage(QWidget):
 
         self._clear_result_display()
         self._clear_folder_display()
+        # Drop any retained folder aggregate before async work begins so a
+        # stale result can't be exported while this run is in flight
+        # (Phase 11 CP2).
+        self._set_folder_export_source(None)
         self._set_controls_enabled(False)
         self._status_label.setText("Running")
         self._folder_thread.start()
@@ -493,6 +549,7 @@ class InferencePage(QWidget):
         self._thread = None
         self._worker = None
         self._set_controls_enabled(True)
+        self._update_folder_export_enabled()
         if self._close_pending:
             self._close_pending = False
             self.close_requested.emit()
@@ -506,12 +563,17 @@ class InferencePage(QWidget):
         self._clear_result_display()
         self._populate_folder_rows(result)
         self._folder_summary_label.setText(_folder_summary_text(result))
+        # Retain the exact aggregate object (per-image failures included) so
+        # the CSV/JSON export actions serialize it verbatim, never table text
+        # (Phase 11 CP2).
+        self._set_folder_export_source(result)
         self._status_label.setText("Finished")
 
     def _on_folder_failed(self, message: str) -> None:
         # fatal folder 실패 -- 이전 성공 배치 표시가 남아 있으면 안 되므로
-        # folder 결과 영역을 초기화한다.
+        # folder 결과 영역을 초기화하고 export source도 버린다.
         self._clear_folder_display()
+        self._set_folder_export_source(None)
         first_line = message.splitlines()[0] if message else "Unknown error"
         self._status_label.setText(f"Failed: {first_line}")
 
@@ -519,6 +581,7 @@ class InferencePage(QWidget):
         self._folder_thread = None
         self._folder_worker = None
         self._set_controls_enabled(True)
+        self._update_folder_export_enabled()
         if self._close_pending:
             self._close_pending = False
             self.close_requested.emit()
@@ -590,3 +653,58 @@ class InferencePage(QWidget):
             self._run_button,
         ):
             widget.setEnabled(enabled)
+
+    # -- Phase 11 CP2: folder-result export ----------------------------------
+
+    def _set_folder_export_source(self, result: FolderInferenceResult | None) -> None:
+        """Record (or drop, with ``None``) the retained aggregate and
+        re-sync the two export actions' enabled state. This is the only
+        place `_folder_export_source` is assigned."""
+        self._folder_export_source = result
+        self._update_folder_export_enabled()
+
+    def _update_folder_export_enabled(self) -> None:
+        """Both export actions are enabled iff a completed aggregate is
+        retained and no run (single-image or folder) is active."""
+        enabled = self._folder_export_source is not None and not self.is_inference_active()
+        self._export_csv_button.setEnabled(enabled)
+        self._export_json_button.setEnabled(enabled)
+
+    def _on_export_csv_clicked(self) -> None:
+        self._export_folder_result("csv", "CSV Files (*.csv)")
+
+    def _on_export_json_clicked(self) -> None:
+        self._export_folder_result("json", "JSON Files (*.json)")
+
+    def _export_folder_result(self, fmt: str, file_filter: str) -> None:
+        """Serialize the retained `FolderInferenceResult` through the
+        checkpoint-1 `write_folder_result_export` boundary.
+
+        No-op when no aggregate is retained (guards a directly invoked
+        handler even though the button is disabled then) or when the save
+        dialog is cancelled. The retained aggregate and the selected path
+        are passed to the exporter exactly once; a write error is caught
+        here on the GUI thread, reported as a concise bounded status
+        message, and leaves the current result exportable for retry
+        without touching the displayed rows or starting inference."""
+        result = self._folder_export_source
+        if result is None:
+            return
+        suggested = f"{_EXPORT_SUGGESTED_STEM}.{fmt}"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            f"Export Folder Results as {fmt.upper()}",
+            suggested,
+            file_filter,
+        )
+        if not path:
+            return
+        try:
+            write_folder_result_export(result, path, format=fmt)
+        except (FolderResultExportError, OSError) as exc:
+            detail = str(exc).splitlines()[0] if str(exc).strip() else exc.__class__.__name__
+            self._status_label.setText(
+                f"Export failed: {detail[:_EXPORT_ERROR_MAX_CHARS]}"
+            )
+            return
+        self._status_label.setText(f"Exported {fmt.upper()}: {Path(path).name}")

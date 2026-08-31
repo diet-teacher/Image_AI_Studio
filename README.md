@@ -1776,6 +1776,35 @@ confidence / 오류)으로 표시되고, 상단에 Total / Succeeded / Failed �
 
 ---
 
+## Phase 11: 폴더 추론 결과 내보내기 (Folder Result Export)
+
+Folder 모드에서 폴더 추론이 끝나면 `Folder Inference Results` 영역에
+**Export CSV** / **Export JSON** 버튼이 활성화됩니다. 버튼을 누르면 저장
+위치를 묻는 다이얼로그(제안 파일명 `folder_inference_results.csv` /
+`folder_inference_results.json`)가 열리고, 화면 테이블에 보이는 바로 그
+혼합 결과가 파일로 저장됩니다.
+
+* JSON은 버전 필드(`format_version`)와 `total`/`succeeded`/`failed` 집계,
+  그리고 이미지당 `image_path`/`status`/`predicted_class`/`confidence`/
+  `probabilities`/`inference_duration_seconds`/`error` 항목을 담습니다.
+  CSV는 같은 순서의 고정 헤더 한 줄과 이미지당 한 행을 씁니다.
+* 항목/행 순서는 화면에 표시된 발견 순서와 동일하고, 성공 항목의
+  예측값은 재계산 없이 그대로 직렬화되며, 격리된 per-image 실패도
+  오류 문자열과 함께 그대로 남습니다. 파일은 UTF-8로, 임시 파일에 다
+  쓴 뒤 교체하는 방식으로 안전하게 저장됩니다.
+* 실행 중이거나 완료된 결과가 없을 때, 폴더 실행이 전체 실패했을 때,
+  다른 모드로 전환했을 때는 두 버튼이 비활성화됩니다. 다이얼로그를
+  취소하면 아무 일도 일어나지 않고, 쓰기 오류는 상태 라벨에 짧게
+  표시되며 결과는 다시 내보낼 수 있게 유지됩니다.
+
+정확한 JSON/CSV 스키마, 순서·숫자·UTF-8 형식, partial 실패 표현, 원자적
+저장 동작, GUI 활성화/오류 규칙, 공개 API·portable artifact 호환성,
+한계와 Phase 11 졸업 조건은
+[docs/phase11_folder_result_export.md](docs/phase11_folder_result_export.md)를
+참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
