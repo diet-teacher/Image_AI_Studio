@@ -17,7 +17,9 @@ from image_ai_studio.gui.inference_page import InferencePage
 from image_ai_studio.gui.main_window import MainWindow
 from image_ai_studio.gui.training_page import TrainingPage
 from image_ai_studio.inference.folder_inference import (
+    FolderInferenceCancelled,
     FolderInferenceError,
+    FolderInferenceProgress,
     FolderInferenceResult,
     ImageOutcome,
 )
@@ -362,6 +364,73 @@ def test_close_while_folder_inference_failing_still_completes(tmp_path, monkeypa
     assert window._close_pending is False
     assert inference_page._folder_thread is None
     assert inference_page._folder_worker is None
+
+
+def test_close_while_folder_inference_active_requests_cooperative_cancel(
+    tmp_path, monkeypatch, qtbot
+) -> None:
+    """Phase 12 CP3: an accepted close during an active folder run asks the
+    page for a *cooperative* cancel (CP1 `should_cancel` at the next image
+    boundary) and then defers the real close through the existing async
+    `request_close -> close_requested` coordination -- no forced stop, no
+    blocking wait. Single-image close behavior is untouched."""
+    paused, resume = threading.Event(), threading.Event()
+
+    def gated_cooperative_backend(request, *, progress_callback=None, should_cancel=None):
+        names = ("a.png", "b.png", "c.png")
+        outcomes: list = []
+        if progress_callback is not None:
+            progress_callback(FolderInferenceProgress(total=len(names), completed=0, succeeded=0, failed=0))
+        for index, name in enumerate(names):
+            if index == 1:
+                paused.set()
+                assert resume.wait(timeout=5)
+            if should_cancel is not None and should_cancel():
+                raise FolderInferenceCancelled(FolderInferenceResult(items=tuple(outcomes)), len(names))
+            outcomes.append(
+                ImageOutcome(image_path=Path(name), result=_fake_inference_result(), error=None)
+            )
+            if progress_callback is not None:
+                progress_callback(
+                    FolderInferenceProgress(
+                        total=len(names), completed=len(outcomes), succeeded=len(outcomes), failed=0
+                    )
+                )
+        return FolderInferenceResult(items=tuple(outcomes))
+
+    monkeypatch.setattr(
+        QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+    )
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+
+    pages = [window._tabs.widget(i) for i in range(window._tabs.count())]
+    assert pages.count(window._inference_page) == 1
+
+    inference_page = window._inference_page
+    inference_page._folder_controller = FolderInferenceController(backend=gated_cooperative_backend)
+    _fill_minimum_valid_folder_fields(inference_page, tmp_path)
+
+    inference_page._on_run_clicked()
+    qtbot.waitUntil(paused.is_set, timeout=5000)
+
+    window.close()
+    assert window.isVisible() is True
+    assert inference_page._folder_cancelling is True  # cooperative cancel requested
+    assert inference_page.is_inference_active() is True  # deferred, not forced
+
+    resume.set()
+    qtbot.waitUntil(lambda: window.isVisible() is False, timeout=5000)
+    assert window._close_pending is False
+    assert inference_page._folder_thread is None
+    assert inference_page._folder_worker is None
+    # cooperative cancel took effect at the image boundary -- partial batch,
+    # still exportable, and never shown as a fatal failure.
+    assert inference_page._status_label.text().startswith("Cancelled: processed 1 of 3")
+    assert inference_page._folder_export_source is not None
+    assert inference_page._folder_results_table.rowCount() == 1
 
 
 # -- duplicate close requests while pending ----------------------------------------

@@ -1805,6 +1805,24 @@ Folder 모드에서 폴더 추론이 끝나면 `Folder Inference Results` 영역
 
 ---
 
+## Phase 12: 폴더 추론 진행률과 협조적 취소
+
+Folder 모드로 추론을 시작하면 발견한 이미지 수와 완료한 이미지 수가
+진행률로 표시됩니다. **Cancel**은 현재 처리 중인 한 장을 강제로 끊지 않고,
+그 이미지의 추론이 끝난 다음 이미지 경계에서 나머지 처리를 멈춥니다.
+취소 시 이미 완료된 성공·실패 행은 화면에 유지되며 기존 **Export CSV** /
+**Export JSON**으로 partial 결과를 저장할 수 있습니다. 이후 다시 실행하면
+이전 진행률·취소 상태·결과가 초기화되고 새 폴더 실행이 정상적으로
+시작됩니다. 실행 중 창을 닫을 때도 같은 협조적 취소와 스레드 정리가 끝난
+뒤 종료됩니다.
+
+정확한 진행 이벤트 순서, 처리된 항목과 미처리 항목의 구분, partial export
+호환성, 재실행·창 닫기 동작과 현재 한계는
+[Phase 12 폴더 추론 진행률 및 취소](docs/phase12_folder_progress_cancellation.md)를
+참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON

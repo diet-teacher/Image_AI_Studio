@@ -47,7 +47,28 @@ action opens a save dialog with a deterministic suggested filename,
 treats cancellation as a no-op, calls the exporter exactly once, and
 reports a bounded write error on the GUI thread while leaving the current
 result exportable for retry. No automatic export, import, progress, or
-cancellation is added, and no QThread / worker / signal ownership changes."""
+cancellation is added, and no QThread / worker / signal ownership changes.
+
+Phase 12 CP3: folder mode gains an accessible ``QProgressBar`` + a concise
+``Cancel`` button (both inside the folder-result group, so single-image mode
+still hides them). ``progress``/``cancelled`` from ``QtFolderInferenceWorker``
+are connected to bound handlers *before* ``thread.start()``, and ``cancelled``
+rides the same ``thread.quit`` + ``worker.deleteLater`` +
+``_on_folder_thread_finished`` cleanup path as ``finished``/``failed``.
+Progress text/value come straight from the delivered CP1 snapshots -- no
+polling, estimating, or worker-thread reads. Cancel is nonblocking and
+idempotent (one ``Event.set()`` via ``worker.request_cancel()``), shows a
+concise ``Cancelling...`` status, disables further cancel clicks, and does
+not restore Run/inputs until the folder thread has fully cleaned up. A
+``cancelled`` terminal shows the exact completed partial outcomes in
+discovery order, reports processed vs unprocessed counts (worded distinctly
+from a fatal ``Failed:``), and retains that exact ``FolderInferenceResult``
+for the Phase 11 CSV/JSON export. Starting a new run clears stale progress,
+rows, cancel status, and export source first; a normal completion after all
+images is never shown as ``Cancelled``. On an accepted ``MainWindow`` close
+during an active folder run, ``request_close()`` also asks for cooperative
+cancellation while still deferring ``close_requested`` to the cleanup
+handler; single-image close behavior is unchanged."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -63,6 +84,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QProgressBar,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -74,7 +96,11 @@ from image_ai_studio.application.folder_inference_controller import FolderInfere
 from image_ai_studio.application.inference_controller import InferenceController, build_inference_request
 from image_ai_studio.gui.qt_folder_inference_worker import QtFolderInferenceWorker
 from image_ai_studio.gui.qt_inference_worker import QtInferenceWorker
-from image_ai_studio.inference.folder_inference import FolderInferenceRequest, FolderInferenceResult
+from image_ai_studio.inference.folder_inference import (
+    FolderInferenceProgress,
+    FolderInferenceRequest,
+    FolderInferenceResult,
+)
 from image_ai_studio.inference.folder_result_export import (
     FolderResultExportError,
     write_folder_result_export,
@@ -110,6 +136,14 @@ _FOLDER_RESULT_HEADERS = ("Image", "Status", "Predicted Class", "Confidence", "E
 _FOLDER_STATUS_SUCCESS = "Success"
 _FOLDER_STATUS_FAILURE = "Failure"
 
+_FOLDER_PROGRESS_PLACEHOLDER = "Progress: 0 / 0"
+"""folder 진행률 라벨의 초기(=idle) 텍스트. 새 folder run이 시작되거나
+mode를 바꾸거나 fatal 실패가 나면 이 값으로 되돌린다(Phase 12 CP3)."""
+_FOLDER_CANCELLING_STATUS = "Cancelling..."
+"""Cancel을 누른 직후(또는 close가 협조적 취소를 요청한 직후) 상태
+라벨에 보여줄 간결한 문구. terminal(`cancelled`/`finished`/`failed`)이
+도착하면 덮어쓴다."""
+
 _EXPORT_SUGGESTED_STEM = "folder_inference_results"
 """save 다이얼로그가 제시하는 결정론적 파일명 stem -- 포맷별 확장자
 (`.csv`/`.json`)만 붙는다(Phase 11 CP2)."""
@@ -135,6 +169,10 @@ def _format_probabilities(probabilities: dict[str, float]) -> str:
     return "\n".join(lines)
 
 
+def _folder_progress_text(total: int, completed: int, succeeded: int, failed: int) -> str:
+    return f"Processed {completed} / {total}  (Succeeded: {succeeded}  Failed: {failed})"
+
+
 def _folder_summary_text(result: FolderInferenceResult) -> str:
     return (
         f"Total: {result.total}  "
@@ -151,10 +189,9 @@ class InferencePage(QWidget):
 
     CP4: exposes the minimal read-only activity query and close-coordination
     interface MainWindow needs, following TrainingPage's `close_requested`
-    contract where practical. Unlike TrainingPage there is no cooperative
-    stop API for inference -- `request_close()` never cancels an active run,
-    it only defers the `close_requested` emission until the run finishes
-    naturally and worker/thread cleanup (`_on_thread_finished`) has run.
+    contract where practical. Single-image inference finishes naturally;
+    folder inference requests cooperative cancellation on close. Both defer
+    `close_requested` until worker/thread cleanup has completed.
 
     Phase 10 CP3: also accepts an optional `FolderInferenceController`
     injection and runs folder batches on a separate QThread +
@@ -188,6 +225,14 @@ class InferencePage(QWidget):
         # retained. Never rebuilt from table text; the two export actions
         # are enabled iff this is not None and no run is active.
         self._folder_export_source: FolderInferenceResult | None = None
+        # Phase 12 CP3: cooperative folder-cancellation state. `_folder_cancelling`
+        # goes True the moment Cancel is clicked (or MainWindow close asks for a
+        # cooperative stop) and back to False only once the folder thread has
+        # fully cleaned up. `_folder_last_progress` is the most recent CP1
+        # snapshot delivered to `_on_folder_progress` (None when idle) -- it is
+        # only ever read for display, never polled for.
+        self._folder_cancelling = False
+        self._folder_last_progress: FolderInferenceProgress | None = None
         self._build_ui()
 
     # -- public: MainWindow.closeEvent()가 사용 ---------------------------------
@@ -201,13 +246,22 @@ class InferencePage(QWidget):
 
     def request_close(self) -> None:
         """Inference 중이 아니면 즉시 `close_requested`를 emit한다.
-        Inference(단일 이미지 또는 폴더) 중이면 취소하지 않고 자연스럽게
-        끝나기를 기다렸다가 해당 thread cleanup 핸들러에서 cleanup이
-        끝난 뒤에만 emit한다."""
+        단일 이미지 inference 중이면 취소 없이 자연 종료를 기다린다.
+        폴더 inference 중이면 협조적 취소(`request_cancel`)만 요청하고
+        (강제 종료·blocking wait 없음), 두 경우 모두 실제 emit은 해당
+        thread cleanup 핸들러가 cleanup을 끝낸 뒤에만 일어난다
+        (Phase 12 CP3)."""
         if not self.is_inference_active():
             self.close_requested.emit()
             return
         self._close_pending = True
+        # Phase 12 CP3: an active *folder* run is asked to stop cooperatively so
+        # close doesn't have to wait for the whole batch. Single-image inference
+        # has no cancellation path and still finishes naturally; either way the
+        # actual `close_requested` emit is deferred to the thread-cleanup
+        # handler.
+        if self._folder_thread is not None and self._folder_worker is not None:
+            self._request_folder_cancellation()
 
     # -- public request builders (used by tests and Run handlers) -------------
 
@@ -372,6 +426,27 @@ class InferencePage(QWidget):
         self._folder_summary_label = QLabel(_FOLDER_SUMMARY_PLACEHOLDER)
         box.addWidget(self._folder_summary_label)
 
+        # Phase 12 CP3: folder-only progress indicator + cooperative Cancel.
+        # Both live inside this group box, so `_on_mode_changed` hiding the
+        # group in single-image mode hides them too. The bar starts at zero and
+        # the Cancel button starts disabled (no folder run can accept a cancel
+        # yet).
+        progress_row = QHBoxLayout()
+        self._folder_progress_bar = QProgressBar()
+        self._folder_progress_bar.setAccessibleName("Folder inference progress")
+        self._folder_progress_bar.setRange(0, 100)
+        self._folder_progress_bar.setValue(0)
+        self._folder_cancel_button = QPushButton("Cancel")
+        self._folder_cancel_button.setAccessibleName("Cancel folder inference")
+        self._folder_cancel_button.setEnabled(False)
+        self._folder_cancel_button.clicked.connect(self._on_folder_cancel_clicked)
+        progress_row.addWidget(self._folder_progress_bar)
+        progress_row.addWidget(self._folder_cancel_button)
+        box.addLayout(progress_row)
+
+        self._folder_progress_label = QLabel(_FOLDER_PROGRESS_PLACEHOLDER)
+        box.addWidget(self._folder_progress_label)
+
         table = QTableWidget(0, len(_FOLDER_RESULT_HEADERS))
         table.setHorizontalHeaderLabels(list(_FOLDER_RESULT_HEADERS))
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -432,8 +507,11 @@ class InferencePage(QWidget):
         self._result_group.setVisible(not folder_mode)
         # Switching modes leaves any previously shown folder batch behind as
         # a stale result -- drop the retained aggregate so export cannot act
-        # on it (Phase 11 CP2).
+        # on it (Phase 11 CP2) and reset the stale progress readout (Phase 12
+        # CP3). Mode can't be switched while a run is active (controls are
+        # disabled then), so this never races a live folder worker.
         self._set_folder_export_source(None)
+        self._clear_folder_progress()
 
     def _is_folder_mode(self) -> bool:
         return self._mode_combo.currentText() == _MODE_FOLDER
@@ -484,6 +562,7 @@ class InferencePage(QWidget):
 
         self._clear_result_display()
         self._clear_folder_display()
+        self._clear_folder_progress()
         # Drop any retained folder aggregate before async work begins so a
         # stale result can't be exported while this run is in flight
         # (Phase 11 CP2).
@@ -502,23 +581,45 @@ class InferencePage(QWidget):
         self._active_folder_path = request.folder_path
         self._folder_thread = QThread(self)
         self._folder_worker = QtFolderInferenceWorker(self._folder_controller, request)
+        try:
+            # Establish this run's cancellation token synchronously before
+            # the page exposes an active worker/thread.  An immediate Cancel
+            # or close therefore cannot be overwritten by worker startup.
+            self._folder_worker.prepare_run()
+        except Exception as exc:  # noqa: BLE001 -- startup failure stays a bounded GUI failure
+            self._folder_worker.deleteLater()
+            self._folder_thread.deleteLater()
+            self._folder_worker = None
+            self._folder_thread = None
+            self._status_label.setText(f"Failed: {type(exc).__name__}: {exc}")
+            return
         self._folder_worker.moveToThread(self._folder_thread)
         self._folder_thread.started.connect(self._folder_worker.run)
         # single-image 쪽과 동일한 계약: signal은 self의 bound method에만
         # connect한다(plain 함수/lambda는 worker thread에서 직접 실행됨).
+        # Phase 12 CP3: progress/cancelled도 여기서, thread.start() 전에,
+        # 실제 bound QObject 핸들러에 딱 한 번씩 연결한다. cancelled는
+        # finished/failed와 똑같이 thread.quit + worker.deleteLater 로 이어져
+        # 동일한 cleanup lifecycle을 탄다(중복 연결 없음).
+        self._folder_worker.progress.connect(self._on_folder_progress)
         self._folder_worker.finished.connect(self._on_folder_finished)
+        self._folder_worker.cancelled.connect(self._on_folder_cancelled)
         self._folder_worker.failed.connect(self._on_folder_failed)
         self._folder_worker.finished.connect(self._folder_thread.quit)
+        self._folder_worker.cancelled.connect(self._folder_thread.quit)
         self._folder_worker.failed.connect(self._folder_thread.quit)
-        # worker.deleteLater()는 worker 자신의 finished/failed에 connect
-        # (QtFolderInferenceWorker docstring의 deleteLater ordering 계약).
+        # worker.deleteLater()는 worker 자신의 finished/cancelled/failed에
+        # connect (QtFolderInferenceWorker docstring의 deleteLater ordering 계약).
         self._folder_worker.finished.connect(self._folder_worker.deleteLater)
+        self._folder_worker.cancelled.connect(self._folder_worker.deleteLater)
         self._folder_worker.failed.connect(self._folder_worker.deleteLater)
         self._folder_thread.finished.connect(self._folder_thread.deleteLater)
         self._folder_thread.finished.connect(self._on_folder_thread_finished)
 
+        self._folder_cancelling = False
         self._clear_result_display()
         self._clear_folder_display()
+        self._clear_folder_progress()
         # Drop any retained folder aggregate before async work begins so a
         # stale result can't be exported while this run is in flight
         # (Phase 11 CP2).
@@ -526,6 +627,8 @@ class InferencePage(QWidget):
         self._set_controls_enabled(False)
         self._status_label.setText("Running")
         self._folder_thread.start()
+        # The run is now live and can accept a cooperative cancel.
+        self._update_folder_cancel_enabled()
 
     # -- worker signal handlers -----------------------------------------------
 
@@ -560,9 +663,20 @@ class InferencePage(QWidget):
         # per-image 실패가 섞여 있어도 이것은 *완료된 배치*다 -- backend가
         # 정상 반환한 aggregate를 그대로 표시할 뿐 예측값을 재계산하지
         # 않는다. stale single-image 결과가 남지 않도록 그쪽도 비운다.
+        # `finished`는 모든 이미지가 처리된 뒤에만 온다 -- 취소가 뒤늦게
+        # 걸려 있었더라도(마지막 이미지 경계 이후엔 관측 안 함) 정상
+        # 완료이므로 절대 "Cancelled"로 표시하지 않는다(Phase 12 CP3).
+        self._folder_cancel_button.setEnabled(False)
         self._clear_result_display()
         self._populate_folder_rows(result)
         self._folder_summary_label.setText(_folder_summary_text(result))
+        self._folder_progress_bar.setRange(0, max(result.total, 1))
+        self._folder_progress_bar.setValue(result.total)
+        self._folder_progress_label.setText(
+            _folder_progress_text(
+                result.total, result.total, result.succeeded, result.failed
+            )
+        )
         # Retain the exact aggregate object (per-image failures included) so
         # the CSV/JSON export actions serialize it verbatim, never table text
         # (Phase 11 CP2).
@@ -570,16 +684,99 @@ class InferencePage(QWidget):
         self._status_label.setText("Finished")
 
     def _on_folder_failed(self, message: str) -> None:
-        # fatal folder 실패 -- 이전 성공 배치 표시가 남아 있으면 안 되므로
-        # folder 결과 영역을 초기화하고 export source도 버린다.
+        # fatal folder 실패 -- 이전 성공/부분 배치 표시가 남아 있으면 안
+        # 되므로 folder 결과 영역과 진행률을 초기화하고 export source도
+        # 버린다. 협조적 취소(`cancelled`)와 달리 이건 치명적 실패이므로
+        # "Failed:" 로만 표시한다(이 구분은 Phase 12 CP3에서도 유지된다).
+        self._folder_cancel_button.setEnabled(False)
         self._clear_folder_display()
+        self._clear_folder_progress()
         self._set_folder_export_source(None)
         first_line = message.splitlines()[0] if message else "Unknown error"
         self._status_label.setText(f"Failed: {first_line}")
 
+    def _on_folder_progress(self, snapshot: FolderInferenceProgress) -> None:
+        """Render one CP1 progress snapshot exactly as delivered. Snapshots
+        arrive on the GUI thread (bound-method slot, queued from the worker
+        thread) in monotonically non-decreasing `completed` order; this
+        handler never estimates, polls, or reads worker-thread state -- it
+        just mirrors the numbers it is handed."""
+        self._folder_last_progress = snapshot
+        self._folder_progress_bar.setRange(0, max(snapshot.total, 1))
+        self._folder_progress_bar.setValue(snapshot.completed)
+        self._folder_progress_label.setText(
+            _folder_progress_text(
+                snapshot.total,
+                snapshot.completed,
+                snapshot.succeeded,
+                snapshot.failed,
+            )
+        )
+
+    def _on_folder_cancelled(
+        self, result: FolderInferenceResult, discovered_total: int
+    ) -> None:
+        """Cooperative-cancellation terminal. Shows the exact completed
+        partial outcomes (discovery order, verbatim) and reports processed
+        vs unprocessed counts -- distinct wording from a fatal ``Failed:``.
+        The exact partial `FolderInferenceResult` is retained for Phase 11
+        CSV/JSON export, the same way a completed batch is."""
+        self._folder_cancel_button.setEnabled(False)
+        self._clear_result_display()
+        self._populate_folder_rows(result)
+        self._folder_summary_label.setText(_folder_summary_text(result))
+        processed = result.total
+        unprocessed = discovered_total - processed
+        self._folder_progress_bar.setRange(0, max(discovered_total, 1))
+        self._folder_progress_bar.setValue(processed)
+        self._folder_progress_label.setText(
+            _folder_progress_text(
+                discovered_total, processed, result.succeeded, result.failed
+            )
+        )
+        self._set_folder_export_source(result)
+        self._status_label.setText(
+            f"Cancelled: processed {processed} of {discovered_total} "
+            f"({unprocessed} unprocessed)"
+        )
+
+    def _on_folder_cancel_clicked(self) -> None:
+        self._request_folder_cancellation()
+
+    def _request_folder_cancellation(self) -> None:
+        """Ask the running folder worker to stop at the next image boundary.
+        Nonblocking and idempotent: it only forwards to the worker's
+        thread-safe `request_cancel()` (a single `Event.set()`), flips a
+        concise cancelling status, and disables further cancel clicks. It
+        never waits, never touches Run/inputs, and is a no-op when no folder
+        run is active or a cancel is already in flight."""
+        if self._folder_worker is None or self._folder_cancelling:
+            return
+        self._folder_cancelling = True
+        self._folder_worker.request_cancel()
+        self._update_folder_cancel_enabled()
+        self._status_label.setText(_FOLDER_CANCELLING_STATUS)
+
+    def _update_folder_cancel_enabled(self) -> None:
+        """Cancel is offered only while a folder run is genuinely in flight
+        and has not already been asked to stop."""
+        self._folder_cancel_button.setEnabled(
+            self._folder_thread is not None and not self._folder_cancelling
+        )
+
+    def _clear_folder_progress(self) -> None:
+        self._folder_last_progress = None
+        self._folder_progress_bar.setRange(0, 100)
+        self._folder_progress_bar.setValue(0)
+        self._folder_progress_label.setText(_FOLDER_PROGRESS_PLACEHOLDER)
+
     def _on_folder_thread_finished(self) -> None:
         self._folder_thread = None
         self._folder_worker = None
+        # The worker thread has fully cleaned up -- only now is it safe to
+        # drop the cancelling flag and restore Run/inputs (Phase 12 CP3).
+        self._folder_cancelling = False
+        self._update_folder_cancel_enabled()
         self._set_controls_enabled(True)
         self._update_folder_export_enabled()
         if self._close_pending:

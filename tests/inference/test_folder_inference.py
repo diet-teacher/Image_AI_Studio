@@ -14,7 +14,9 @@ from PIL import Image
 
 from image_ai_studio.inference.folder_inference import (
     SUPPORTED_IMAGE_EXTENSIONS,
+    FolderInferenceCancelled,
     FolderInferenceError,
+    FolderInferenceProgress,
     FolderInferenceRequest,
     FolderInferenceResult,
     ImageOutcome,
@@ -94,6 +96,23 @@ class FailingBackend:
         if request.image_path.name in self._fail_names:
             raise self._exc or RuntimeError(f"boom: {request.image_path.name}")
         return _result()
+
+
+class CancelAfter:
+    """`should_cancel` 콜백 스텁. 이미지 경계에서 관측될 때마다 호출
+    횟수를 세고, `trigger_on_check`번째(0-indexed) 관측부터 True를
+    돌려준다. 예: trigger_on_check=0 이면 첫 이미지 전에 곧바로 취소,
+    trigger_on_check=2 이면 이미지 두 장이 끝난 뒤(세 번째 이미지 전)
+    취소된다. 타이머/sleep 없이 순수 카운터로만 동작한다."""
+
+    def __init__(self, trigger_on_check: int) -> None:
+        self.checks = 0
+        self._trigger = trigger_on_check
+
+    def __call__(self) -> bool:
+        fire = self.checks >= self._trigger
+        self.checks += 1
+        return fire
 
 
 # -- discovery: order -------------------------------------------------------
@@ -398,3 +417,427 @@ def test_existing_single_image_dataclasses_are_unchanged() -> None:
         "probabilities",
         "inference_duration_seconds",
     }
+
+
+# ======================================================================
+# Phase 12 CP1: folder progress + cooperative-cancellation contract
+# ======================================================================
+
+
+def _folder(tmp_path: Path, names: tuple[str, ...]) -> Path:
+    folder = tmp_path / "images"
+    for name in names:
+        _write_image(folder / name)
+    return folder
+
+
+# -- no-hook backward compatibility ------------------------------------
+
+
+def test_hooks_omitted_preserves_existing_caller_behavior(tmp_path: Path) -> None:
+    folder = _folder(tmp_path, ("a.png", "b.png", "c.png"))
+    sentinel = _result(index=1)
+    backend = RecordingBackend(result=sentinel)
+
+    aggregate = run_folder_inference(_request(folder, tmp_path), backend=backend)
+
+    assert isinstance(aggregate, FolderInferenceResult)
+    assert type(aggregate) is FolderInferenceResult
+    assert [i.image_path.name for i in aggregate.items] == ["a.png", "b.png", "c.png"]
+    assert all(i.result is sentinel for i in aggregate.items)
+    assert (aggregate.total, aggregate.succeeded, aggregate.failed) == (3, 3, 0)
+    assert len(backend.calls) == 3
+
+
+def test_new_hook_parameters_are_keyword_only_with_none_defaults() -> None:
+    params = inspect.signature(run_folder_inference).parameters
+    for name in ("progress_callback", "should_cancel"):
+        assert name in params
+        assert params[name].kind is inspect.Parameter.KEYWORD_ONLY
+        assert params[name].default is None
+    # existing positional contract is untouched
+    assert params["backend"].default is run_single_image_inference
+
+
+def test_should_cancel_always_false_matches_no_hook_run(tmp_path: Path) -> None:
+    folder = _folder(tmp_path, ("c.png", "a.jpg", "b.png", "d.jpeg"))
+    request = _request(folder, tmp_path)
+
+    baseline = run_folder_inference(request, backend=RecordingBackend())
+    with_hook = run_folder_inference(
+        request, backend=RecordingBackend(), should_cancel=lambda: False
+    )
+
+    assert [i.image_path for i in baseline.items] == [i.image_path for i in with_hook.items]
+    assert (baseline.total, baseline.succeeded, baseline.failed) == (
+        with_hook.total,
+        with_hook.succeeded,
+        with_hook.failed,
+    )
+
+
+# -- progress: initial snapshot + one monotonic snapshot per image ----
+
+
+def test_progress_emits_initial_zero_then_one_snapshot_per_completed_image(
+    tmp_path: Path,
+) -> None:
+    folder = _folder(tmp_path, ("a.png", "b.png", "c.png"))
+    backend = RecordingBackend()
+    snaps: list[FolderInferenceProgress] = []
+
+    run_folder_inference(
+        _request(folder, tmp_path), backend=backend, progress_callback=snaps.append
+    )
+
+    assert len(snaps) == 4  # 1 initial + 3 images
+    assert all(isinstance(s, FolderInferenceProgress) for s in snaps)
+    assert all(s.total == 3 for s in snaps)
+    assert (snaps[0].completed, snaps[0].succeeded, snaps[0].failed) == (0, 0, 0)
+    assert [s.completed for s in snaps] == [0, 1, 2, 3]
+    assert [s.succeeded for s in snaps] == [0, 1, 2, 3]
+    assert [s.failed for s in snaps] == [0, 0, 0, 0]
+    for prev, cur in zip(snaps, snaps[1:]):
+        assert cur.completed == prev.completed + 1  # strictly monotonic, step 1
+
+
+def test_progress_snapshots_track_mixed_success_and_isolated_failures(
+    tmp_path: Path,
+) -> None:
+    folder = _folder(tmp_path, ("a.png", "b.png", "c.png", "d.png"))
+    backend = FailingBackend(fail_names={"b.png", "c.png"})
+    snaps: list[FolderInferenceProgress] = []
+
+    aggregate = run_folder_inference(
+        _request(folder, tmp_path), backend=backend, progress_callback=snaps.append
+    )
+
+    assert len(snaps) == 5
+    assert [s.completed for s in snaps] == [0, 1, 2, 3, 4]
+    assert [s.succeeded for s in snaps] == [0, 1, 1, 1, 2]
+    assert [s.failed for s in snaps] == [0, 0, 1, 2, 2]
+    for s in snaps:
+        assert 0 <= s.succeeded + s.failed == s.completed <= s.total
+    # the aggregate is still the ordinary, unchanged result type
+    assert (aggregate.total, aggregate.succeeded, aggregate.failed) == (4, 2, 2)
+
+
+def test_progress_snapshot_holds_no_qt_or_mutable_inference_state() -> None:
+    field_names = {f.name for f in fields(FolderInferenceProgress)}
+    assert field_names == {"total", "completed", "succeeded", "failed"}
+    progress = FolderInferenceProgress(total=2, completed=1, succeeded=1, failed=0)
+    for value in (progress.total, progress.completed, progress.succeeded, progress.failed):
+        assert isinstance(value, int)
+
+    import image_ai_studio.inference.folder_inference as folder_module
+
+    source = inspect.getsource(folder_module)
+    assert "PySide6" not in source
+    assert "PyQt" not in source
+    assert "QThread" not in source
+
+
+# -- progress: immutability & invariants ------------------------------
+
+
+def test_folder_inference_progress_is_frozen() -> None:
+    progress = FolderInferenceProgress(total=3, completed=2, succeeded=1, failed=1)
+    with pytest.raises(FrozenInstanceError):
+        progress.completed = 3  # type: ignore[misc]
+
+
+def test_folder_inference_progress_enforces_count_invariants() -> None:
+    # valid boundary values are accepted
+    FolderInferenceProgress(total=0, completed=0, succeeded=0, failed=0)
+    FolderInferenceProgress(total=5, completed=5, succeeded=2, failed=3)
+
+    with pytest.raises(ValueError):  # succeeded + failed != completed
+        FolderInferenceProgress(total=3, completed=2, succeeded=1, failed=0)
+    with pytest.raises(ValueError):  # completed > total
+        FolderInferenceProgress(total=1, completed=2, succeeded=1, failed=1)
+    with pytest.raises(ValueError):  # negative count
+        FolderInferenceProgress(total=3, completed=0, succeeded=-1, failed=1)
+    with pytest.raises(ValueError):  # negative completed
+        FolderInferenceProgress(total=3, completed=-1, succeeded=0, failed=0)
+
+
+# -- cancellation: terminal value distinct from fatal failure --------
+
+
+def test_folder_inference_cancelled_is_distinct_from_fatal_error() -> None:
+    assert not issubclass(FolderInferenceCancelled, FolderInferenceError)
+    assert not issubclass(FolderInferenceCancelled, ValueError)
+    assert issubclass(FolderInferenceCancelled, Exception)
+
+
+def test_cancel_before_first_image_raises_with_empty_partial_result(
+    tmp_path: Path,
+) -> None:
+    folder = _folder(tmp_path, ("a.png", "b.png", "c.png"))
+    backend = RecordingBackend()
+    should_cancel = CancelAfter(trigger_on_check=0)
+
+    with pytest.raises(FolderInferenceCancelled) as excinfo:
+        run_folder_inference(
+            _request(folder, tmp_path), backend=backend, should_cancel=should_cancel
+        )
+
+    exc = excinfo.value
+    assert backend.calls == []  # no backend call ever started
+    assert isinstance(exc.result, FolderInferenceResult)
+    assert exc.result.items == ()
+    assert exc.discovered_total == 3
+    assert exc.unprocessed == 3
+    assert exc.unprocessed == exc.discovered_total - exc.result.total
+    assert should_cancel.checks == 1  # observed exactly once, before the first image
+
+
+def test_cancel_after_one_image_carries_exact_partial_result(tmp_path: Path) -> None:
+    folder = _folder(tmp_path, ("a.png", "b.png", "c.png", "d.png", "e.png"))
+    backend = RecordingBackend()
+    should_cancel = CancelAfter(trigger_on_check=1)
+
+    with pytest.raises(FolderInferenceCancelled) as excinfo:
+        run_folder_inference(
+            _request(folder, tmp_path), backend=backend, should_cancel=should_cancel
+        )
+
+    exc = excinfo.value
+    assert [c.image_path.name for c in backend.calls] == ["a.png"]
+    assert [i.image_path.name for i in exc.result.items] == ["a.png"]
+    assert exc.result.items[0].succeeded is True
+    assert (exc.result.total, exc.result.succeeded, exc.result.failed) == (1, 1, 0)
+    assert exc.discovered_total == 5
+    assert exc.unprocessed == 4
+
+
+def test_cancel_after_two_images_preserves_order_and_error_values(
+    tmp_path: Path,
+) -> None:
+    folder = _folder(tmp_path, ("a.png", "b.png", "c.png", "d.png"))
+    backend = FailingBackend(fail_names={"a.png"})
+    should_cancel = CancelAfter(trigger_on_check=2)
+
+    with pytest.raises(FolderInferenceCancelled) as excinfo:
+        run_folder_inference(
+            _request(folder, tmp_path), backend=backend, should_cancel=should_cancel
+        )
+
+    partial = excinfo.value.result
+    assert [i.image_path.name for i in partial.items] == ["a.png", "b.png"]
+    fail_a, ok_b = partial.items
+    assert not fail_a.succeeded and fail_a.result is None and "boom: a.png" in fail_a.error
+    assert ok_b.succeeded and ok_b.result == _result()
+    assert (partial.total, partial.succeeded, partial.failed) == (2, 1, 1)
+    assert excinfo.value.unprocessed == 2
+
+
+def test_repeated_true_cancellation_is_idempotent_across_runs(tmp_path: Path) -> None:
+    folder = _folder(tmp_path, ("a.png", "b.png", "c.png"))
+    request = _request(folder, tmp_path)
+
+    for _ in range(3):
+        backend = RecordingBackend()
+        should_cancel = CancelAfter(trigger_on_check=0)  # always True from first check
+        with pytest.raises(FolderInferenceCancelled) as excinfo:
+            run_folder_inference(
+                request, backend=backend, should_cancel=should_cancel
+            )
+        assert backend.calls == []
+        assert excinfo.value.result.items == ()
+        assert excinfo.value.discovered_total == 3
+        assert excinfo.value.unprocessed == 3
+        assert should_cancel.checks == 1
+
+
+def test_cancel_requested_after_final_image_returns_full_result(tmp_path: Path) -> None:
+    folder = _folder(tmp_path, ("a.png", "b.png", "c.png"))
+    cancel_flag = {"value": False}
+
+    class FlipOnLastImageBackend:
+        def __init__(self) -> None:
+            self.calls: list[InferenceRequest] = []
+
+        def __call__(self, request: InferenceRequest) -> InferenceResult:
+            self.calls.append(request)
+            if request.image_path.name == "c.png":
+                # a cancellation request arrives while / right after the final
+                # image runs -- there is no post-last-image boundary to observe it
+                cancel_flag["value"] = True
+            return _result()
+
+    backend = FlipOnLastImageBackend()
+    aggregate = run_folder_inference(
+        _request(folder, tmp_path),
+        backend=backend,
+        should_cancel=lambda: cancel_flag["value"],
+    )
+
+    assert isinstance(aggregate, FolderInferenceResult)
+    assert type(aggregate) is FolderInferenceResult
+    assert [i.image_path.name for i in aggregate.items] == ["a.png", "b.png", "c.png"]
+    assert (aggregate.total, aggregate.succeeded, aggregate.failed) == (3, 3, 0)
+    assert cancel_flag["value"] is True  # request was made, just never observed
+
+
+def test_running_backend_call_is_never_interrupted_by_cancellation(
+    tmp_path: Path,
+) -> None:
+    folder = _folder(tmp_path, ("a.png", "b.png", "c.png"))
+    state = {"cancel": False}
+
+    class RequestsCancelMidCallBackend:
+        def __init__(self) -> None:
+            self.calls: list[InferenceRequest] = []
+
+        def __call__(self, request: InferenceRequest) -> InferenceResult:
+            self.calls.append(request)
+            if request.image_path.name == "b.png":
+                state["cancel"] = True  # cancel requested *during* b's forward pass
+            return _result(index=1)
+
+    backend = RequestsCancelMidCallBackend()
+    with pytest.raises(FolderInferenceCancelled) as excinfo:
+        run_folder_inference(
+            _request(folder, tmp_path),
+            backend=backend,
+            should_cancel=lambda: state["cancel"],
+        )
+
+    exc = excinfo.value
+    # b's call completed and its outcome is preserved in full; it is not discarded
+    assert [c.image_path.name for c in backend.calls] == ["a.png", "b.png"]
+    assert [i.image_path.name for i in exc.result.items] == ["a.png", "b.png"]
+    assert all(i.succeeded and i.result == _result(index=1) for i in exc.result.items)
+    # c never started -- cancellation observed only at the next image boundary
+    assert not any(c.image_path.name == "c.png" for c in backend.calls)
+    assert exc.discovered_total == 3
+    assert exc.unprocessed == 1
+
+
+def test_progress_and_cancel_together_emit_no_snapshot_on_cancel(
+    tmp_path: Path,
+) -> None:
+    folder = _folder(tmp_path, ("a.png", "b.png", "c.png"))
+    backend = RecordingBackend()
+    snaps: list[FolderInferenceProgress] = []
+    should_cancel = CancelAfter(trigger_on_check=2)
+
+    with pytest.raises(FolderInferenceCancelled):
+        run_folder_inference(
+            _request(folder, tmp_path),
+            backend=backend,
+            progress_callback=snaps.append,
+            should_cancel=should_cancel,
+        )
+
+    # initial 0-of-total, then one per completed image (a, b) -- nothing at cancel
+    assert [s.completed for s in snaps] == [0, 1, 2]
+    assert [s.succeeded for s in snaps] == [0, 1, 2]
+
+
+# -- callback / discovery exceptions stay fatal ----------------------
+
+
+def test_progress_callback_exception_on_initial_snapshot_is_fatal(
+    tmp_path: Path,
+) -> None:
+    folder = _folder(tmp_path, ("a.png", "b.png"))
+    backend = RecordingBackend()
+
+    class ProgressBoom(RuntimeError):
+        pass
+
+    def callback(_progress: FolderInferenceProgress) -> None:
+        raise ProgressBoom("progress boom")
+
+    with pytest.raises(ProgressBoom, match="progress boom"):
+        run_folder_inference(
+            _request(folder, tmp_path), backend=backend, progress_callback=callback
+        )
+    assert backend.calls == []  # blew up before any backend call
+
+
+def test_progress_callback_exception_after_isolated_failure_is_fatal(
+    tmp_path: Path,
+) -> None:
+    folder = _folder(tmp_path, ("a.png", "b.png"))
+    backend = FailingBackend(fail_names={"a.png"})
+    seen: list[FolderInferenceProgress] = []
+
+    def callback(progress: FolderInferenceProgress) -> None:
+        seen.append(progress)
+        if progress.completed == 1:
+            raise RuntimeError("post-failure boom")
+
+    with pytest.raises(RuntimeError, match="post-failure boom"):
+        run_folder_inference(
+            _request(folder, tmp_path), backend=backend, progress_callback=callback
+        )
+
+    # the isolated per-image failure was recorded and *followed by* a progress
+    # emission; that emission's exception is fatal (not isolated)
+    assert [p.completed for p in seen] == [0, 1]
+    assert (seen[1].succeeded, seen[1].failed) == (0, 1)
+    assert [c.image_path.name for c in backend.calls] == ["a.png"]
+
+
+def test_discovery_exception_stays_fatal_with_hooks_supplied(tmp_path: Path) -> None:
+    backend = RecordingBackend()
+    snaps: list[FolderInferenceProgress] = []
+
+    with pytest.raises(FolderInferenceError):
+        run_folder_inference(
+            _request(tmp_path / "missing", tmp_path),
+            backend=backend,
+            progress_callback=snaps.append,
+            should_cancel=lambda: False,
+        )
+    assert backend.calls == []
+    assert snaps == []  # no snapshot before discovery succeeds
+
+
+# -- partial cancelled result exports via the unchanged Phase 11 schema
+
+
+def test_partial_cancelled_result_is_compatible_with_phase11_exporter(
+    tmp_path: Path,
+) -> None:
+    from image_ai_studio.inference.folder_result_export import (
+        EXPORT_FORMAT_VERSION,
+        folder_result_to_csv_rows,
+        folder_result_to_json_dict,
+    )
+
+    folder = _folder(tmp_path, ("a.png", "b.png", "c.png", "d.png"))
+    backend = FailingBackend(fail_names={"b.png"})
+    should_cancel = CancelAfter(trigger_on_check=3)  # process a, b, c then cancel
+
+    with pytest.raises(FolderInferenceCancelled) as excinfo:
+        run_folder_inference(
+            _request(folder, tmp_path), backend=backend, should_cancel=should_cancel
+        )
+
+    partial = excinfo.value.result
+    assert [i.image_path.name for i in partial.items] == ["a.png", "b.png", "c.png"]
+    assert (partial.total, partial.succeeded, partial.failed) == (3, 2, 1)
+
+    payload = folder_result_to_json_dict(partial)
+    assert EXPORT_FORMAT_VERSION == 1
+    assert payload["format_version"] == 1
+    # exported counts describe processed items only
+    assert (payload["total"], payload["succeeded"], payload["failed"]) == (3, 2, 1)
+    assert [it["image_path"] for it in payload["items"]] == [
+        str(i.image_path) for i in partial.items
+    ]
+    # cancellation / unprocessed metadata is NOT part of the export schema
+    for key in ("cancelled", "unprocessed", "discovered_total"):
+        assert key not in payload
+
+    rows = folder_result_to_csv_rows(partial)
+    assert len(rows) == 3
+    assert [row[0] for row in rows] == [str(i.image_path) for i in partial.items]
+
+    # the external metadata lives only on the terminal cancellation value
+    assert excinfo.value.discovered_total == 4
+    assert excinfo.value.unprocessed == 1

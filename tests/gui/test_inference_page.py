@@ -23,11 +23,15 @@ from pathlib import Path
 import pytest
 from PySide6.QtWidgets import QFileDialog, QFormLayout
 
+import image_ai_studio.gui.inference_page as inference_page_module
 from image_ai_studio.application.folder_inference_controller import FolderInferenceController
 from image_ai_studio.application.inference_controller import InferenceController
 from image_ai_studio.gui.inference_page import InferencePage
+from image_ai_studio.gui.qt_folder_inference_worker import QtFolderInferenceWorker
 from image_ai_studio.inference.folder_inference import (
+    FolderInferenceCancelled,
     FolderInferenceError,
+    FolderInferenceProgress,
     FolderInferenceRequest,
     FolderInferenceResult,
     ImageOutcome,
@@ -2320,3 +2324,515 @@ def test_export_state_consistent_after_close_coordination(tmp_path, qtbot) -> No
     assert page._folder_export_source is not None
     assert page._export_csv_button.isEnabled() is True
     assert page._export_json_button.isEnabled() is True
+
+
+# ===============================================================================
+# Phase 12 CP3: folder progress UI + cooperative Cancel on InferencePage
+# (QtFolderInferenceWorker progress/cancelled signals; deterministic gated
+#  cooperative fake backend; widget properties only -- no sleeps/screenshots;
+#  progress order/value/text, cancel before/after progress, repeated cancel,
+#  partial-result export, fatal/finished distinction, cleanup, rerun, and
+#  MainWindow-close-triggered cooperative cancellation. Single-image lifecycle
+#  is exercised unchanged.)
+# ===============================================================================
+#
+# required-tests id: phase12_cp3_folder_progress_cancellation_page
+
+
+class _CoopFolderBackend:
+    """Deterministic fake honoring the CP1 `progress_callback`/`should_cancel`
+    hook contract (so `FolderInferenceController` treats it as cooperative).
+    Emits a `0-of-total` snapshot then one snapshot per processed image, and
+    observes `should_cancel` only at image boundaries. `gate_before` (a loop
+    index) pauses right before that boundary's cancel check; `gate_final`
+    pauses after the last image but before returning the full result. Sync is
+    `threading.Event` only -- no sleeps/busy loops."""
+
+    def __init__(
+        self,
+        names,
+        *,
+        gate_before=None,
+        gate_final=False,
+        paused=None,
+        resume=None,
+        fail_names=(),
+        fatal=None,
+    ) -> None:
+        self._names = tuple(names)
+        self.gate_before = gate_before
+        self.gate_final = gate_final
+        self._paused = paused
+        self._resume = resume
+        self._fail_names = frozenset(fail_names)
+        self._fatal = fatal
+        self.calls = 0
+
+    def _pause(self) -> None:
+        if self._paused is not None:
+            self._paused.set()
+        if self._resume is not None:
+            assert self._resume.wait(timeout=5)
+
+    def __call__(self, request, *, progress_callback=None, should_cancel=None):
+        self.calls += 1
+        if self._fatal is not None:
+            raise self._fatal
+        total = len(self._names)
+        outcomes: list = []
+        succeeded = 0
+        failed = 0
+        if progress_callback is not None:
+            progress_callback(
+                FolderInferenceProgress(total=total, completed=0, succeeded=0, failed=0)
+            )
+        for index, name in enumerate(self._names):
+            if index == self.gate_before:
+                self._pause()
+            if should_cancel is not None and should_cancel():
+                raise FolderInferenceCancelled(
+                    FolderInferenceResult(items=tuple(outcomes)), total
+                )
+            if name in self._fail_names:
+                outcomes.append(
+                    ImageOutcome(image_path=Path(name), result=None, error=f"RuntimeError: boom: {name}")
+                )
+                failed += 1
+            else:
+                outcomes.append(
+                    ImageOutcome(image_path=Path(name), result=_folder_infer_result("cat", 0.9), error=None)
+                )
+                succeeded += 1
+            if progress_callback is not None:
+                progress_callback(
+                    FolderInferenceProgress(
+                        total=total, completed=len(outcomes), succeeded=succeeded, failed=failed
+                    )
+                )
+        if self.gate_final:
+            self._pause()
+        return FolderInferenceResult(items=tuple(outcomes))
+
+
+class _CP3RecordingPage(InferencePage):
+    """Records every terminal/progress delivery so tests can assert exact
+    call counts -- a stale/duplicate signal connection would show up here."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.progress_snaps: list = []
+        self.folder_finished_calls: list = []
+        self.folder_cancelled_calls: list = []
+        super().__init__(*args, **kwargs)
+
+    def _on_folder_progress(self, snapshot) -> None:
+        self.progress_snaps.append(snapshot)
+        super()._on_folder_progress(snapshot)
+
+    def _on_folder_finished(self, result) -> None:
+        self.folder_finished_calls.append(result)
+        super()._on_folder_finished(result)
+
+    def _on_folder_cancelled(self, result, discovered_total) -> None:
+        self.folder_cancelled_calls.append((result, discovered_total))
+        super()._on_folder_cancelled(result, discovered_total)
+
+
+def _cp3_page(qtbot, backend, *, cls=InferencePage) -> InferencePage:
+    page = cls(
+        controller=InferenceController(backend=_should_not_run_single),
+        folder_controller=FolderInferenceController(backend=backend),
+    )
+    qtbot.addWidget(page)
+    return page
+
+
+# -- static folder progress/cancel UI ---------------------------------------
+
+
+def test_cp3_progress_bar_and_cancel_present_and_idle(qtbot) -> None:
+    page = _make_page(qtbot)
+    assert page._folder_progress_bar.value() == 0
+    assert page._folder_progress_bar.accessibleName() != ""
+    assert page._folder_cancel_button.text() == "Cancel"
+    assert page._folder_cancel_button.isEnabled() is False
+    assert page._folder_progress_label.text() == "Progress: 0 / 0"
+    assert page._folder_result_group.isAncestorOf(page._folder_progress_bar)
+    assert page._folder_result_group.isAncestorOf(page._folder_cancel_button)
+
+
+def test_cp3_progress_and_cancel_follow_folder_mode(qtbot) -> None:
+    page = _make_page(qtbot)
+    # Both widgets live inside `_folder_result_group`, which is the widget
+    # `_on_mode_changed` actually toggles -- `isVisibleTo(page)` reflects the
+    # ancestor's shown/hidden state without needing `page.show()`.
+    assert page._folder_progress_bar.isVisibleTo(page) is False
+    assert page._folder_cancel_button.isVisibleTo(page) is False
+    page._mode_combo.setCurrentText("Folder")
+    assert page._folder_progress_bar.isVisibleTo(page) is True
+    assert page._folder_cancel_button.isVisibleTo(page) is True
+    page._mode_combo.setCurrentText("Single Image")
+    assert page._folder_progress_bar.isVisibleTo(page) is False
+    assert page._folder_cancel_button.isVisibleTo(page) is False
+
+
+def test_cp3_single_image_run_lifecycle_unchanged(tmp_path, qtbot) -> None:
+    page = InferencePage(
+        controller=InferenceController(backend=lambda request: _fake_inference_result()),
+        folder_controller=FolderInferenceController(backend=_should_not_run_folder),
+    )
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+
+    assert page._status_label.text() == "Finished"
+    assert page._predicted_class_value_label.text() == "cat"
+    assert page._folder_progress_bar.value() == 0
+    assert page._folder_cancel_button.isEnabled() is False
+    assert page._thread is None and page._worker is None
+
+
+# -- progress ordering + value/text state ----------------------------------
+
+
+def test_cp3_progress_snapshots_render_in_monotonic_order_then_finished(tmp_path, qtbot) -> None:
+    backend = _CoopFolderBackend(("a.png", "b.png", "c.png"), fail_names={"b.png"})
+    page = _cp3_page(qtbot, backend, cls=_CP3RecordingPage)
+    _fill_folder_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+
+    assert [s.completed for s in page.progress_snaps] == [0, 1, 2, 3]
+    assert [s.succeeded for s in page.progress_snaps] == [0, 1, 1, 2]
+    assert [s.failed for s in page.progress_snaps] == [0, 0, 1, 1]
+    completed = [s.completed for s in page.progress_snaps]
+    assert completed == sorted(completed)  # monotonic, never decreases
+    assert page._status_label.text() == "Finished"
+    assert page._folder_progress_bar.maximum() == 3
+    assert page._folder_progress_bar.value() == 3
+    assert page._folder_progress_label.text() == "Processed 3 / 3  (Succeeded: 2  Failed: 1)"
+    assert len(page.folder_finished_calls) == 1
+    assert page.folder_cancelled_calls == []
+
+
+def test_cp3_cancel_enabled_only_while_run_can_accept_it(tmp_path, qtbot) -> None:
+    paused, resume = threading.Event(), threading.Event()
+    backend = _CoopFolderBackend(
+        ("a.png", "b.png", "c.png"), gate_before=1, paused=paused, resume=resume
+    )
+    page = _cp3_page(qtbot, backend)
+    _fill_folder_fields(page, tmp_path)
+
+    page._on_run_clicked()
+    qtbot.waitUntil(paused.is_set, timeout=5000)
+    assert page._folder_cancel_button.isEnabled() is True
+
+    page._on_folder_cancel_clicked()
+    assert page._folder_cancel_button.isEnabled() is False  # further clicks disabled
+    assert page._status_label.text() == "Cancelling..."
+    assert page._run_button.isEnabled() is False  # Run not restored yet
+
+    resume.set()
+    qtbot.waitUntil(lambda: page._run_button.isEnabled(), timeout=5000)
+    assert page._folder_cancel_button.isEnabled() is False
+    assert page._folder_cancelling is False
+
+
+# -- cancel BEFORE any progress: empty partial, still retained/exportable --
+
+
+def test_cp3_cancel_before_first_image_reports_empty_partial(tmp_path, qtbot) -> None:
+    paused, resume = threading.Event(), threading.Event()
+    backend = _CoopFolderBackend(
+        ("a.png", "b.png", "c.png"), gate_before=0, paused=paused, resume=resume
+    )
+    page = _cp3_page(qtbot, backend, cls=_CP3RecordingPage)
+    _fill_folder_fields(page, tmp_path)
+
+    page._on_run_clicked()
+    qtbot.waitUntil(paused.is_set, timeout=5000)
+    page._on_folder_cancel_clicked()
+    resume.set()
+
+    qtbot.waitUntil(lambda: page._run_button.isEnabled(), timeout=5000)
+    assert len(page.folder_cancelled_calls) == 1
+    assert page._status_label.text() == "Cancelled: processed 0 of 3 (3 unprocessed)"
+    assert page._folder_results_table.rowCount() == 0
+    assert [s.completed for s in page.progress_snaps] == [0]
+    assert page._folder_export_source is not None
+    assert page._folder_export_source.items == ()
+    assert page._export_csv_button.isEnabled() is True
+    assert page._folder_thread is None and page._folder_worker is None
+
+
+# -- cancel AFTER progress: exact partial rows in deterministic order ------
+
+
+def test_cp3_cancel_after_progress_shows_exact_partial_and_export(tmp_path, qtbot, monkeypatch) -> None:
+    paused, resume = threading.Event(), threading.Event()
+    backend = _CoopFolderBackend(
+        ("a.png", "b.png", "c.png", "d.png"), gate_before=2, paused=paused, resume=resume
+    )
+    page = _cp3_page(qtbot, backend)
+    _fill_folder_fields(page, tmp_path)
+
+    page._on_run_clicked()
+    qtbot.waitUntil(paused.is_set, timeout=5000)
+    page._on_folder_cancel_clicked()
+    page._on_folder_cancel_clicked()  # repeated -- idempotent, nonblocking
+    resume.set()
+
+    qtbot.waitUntil(lambda: page._run_button.isEnabled(), timeout=5000)
+    table = page._folder_results_table
+    assert [table.item(i, 0).text() for i in range(table.rowCount())] == ["a.png", "b.png"]
+    assert page._status_label.text() == "Cancelled: processed 2 of 4 (2 unprocessed)"
+    assert page._folder_summary_label.text() == "Total: 2  Succeeded: 2  Failed: 0"
+    assert page._folder_progress_bar.maximum() == 4
+    assert page._folder_progress_bar.value() == 2
+    retained = page._folder_export_source
+    assert retained is not None and retained.total == 2
+
+    recorded = _patch_export_recorder(monkeypatch)
+    _patch_save_dialog(monkeypatch, tmp_path / "partial.csv")
+    page._export_csv_button.click()
+    assert len(recorded) == 1
+    assert recorded[0][0] is retained
+
+
+# -- fatal failure stays "Failed", distinct from cancellation -------------
+
+
+def test_cp3_fatal_folder_failure_not_shown_as_cancelled(tmp_path, qtbot) -> None:
+    backend = _CoopFolderBackend(
+        ("a.png",), fatal=FolderInferenceError("no supported images in folder: batch")
+    )
+    page = _cp3_page(qtbot, backend)
+    _fill_folder_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+
+    assert page._status_label.text().startswith("Failed")
+    assert "Cancelled" not in page._status_label.text()
+    assert page._folder_export_source is None
+    assert page._export_csv_button.isEnabled() is False
+    assert page._folder_progress_label.text() == "Progress: 0 / 0"
+    assert page._folder_progress_bar.value() == 0
+
+
+def test_cp3_completion_after_all_images_never_cancelled_despite_late_cancel(tmp_path, qtbot) -> None:
+    paused, resume = threading.Event(), threading.Event()
+    backend = _CoopFolderBackend(
+        ("a.png", "b.png"), gate_final=True, paused=paused, resume=resume
+    )
+    page = _cp3_page(qtbot, backend, cls=_CP3RecordingPage)
+    _fill_folder_fields(page, tmp_path)
+
+    page._on_run_clicked()
+    qtbot.waitUntil(paused.is_set, timeout=5000)  # all images done, before return
+    page._on_folder_cancel_clicked()  # too late -- no boundary left to observe it
+    resume.set()
+
+    qtbot.waitUntil(lambda: page._run_button.isEnabled(), timeout=5000)
+    assert page._status_label.text() == "Finished"
+    assert len(page.folder_finished_calls) == 1
+    assert page.folder_cancelled_calls == []
+    assert page._folder_results_table.rowCount() == 2
+
+
+# -- rerun after cancellation: no stale flag / duplicate signals / rows ---
+
+
+def test_cp3_rerun_after_cancellation_finishes_normally(tmp_path, qtbot) -> None:
+    paused, resume = threading.Event(), threading.Event()
+    backend = _CoopFolderBackend(
+        ("a.png", "b.png", "c.png"), gate_before=0, paused=paused, resume=resume
+    )
+    page = _cp3_page(qtbot, backend, cls=_CP3RecordingPage)
+    _fill_folder_fields(page, tmp_path)
+
+    page._on_run_clicked()
+    qtbot.waitUntil(paused.is_set, timeout=5000)
+    page._on_folder_cancel_clicked()
+    resume.set()
+    qtbot.waitUntil(lambda: page._run_button.isEnabled(), timeout=5000)
+    assert len(page.folder_cancelled_calls) == 1
+
+    # rerun -- no gate this time, stale cancel flag must not survive
+    backend.gate_before = None
+    resume.set()
+    _start_and_wait(page, qtbot)
+
+    assert page._status_label.text() == "Finished"
+    assert page._folder_cancelling is False
+    assert len(page.folder_finished_calls) == 1  # exactly one, no duplicate
+    assert len(page.folder_cancelled_calls) == 1  # unchanged
+    assert page._folder_results_table.rowCount() == 3
+    assert [s.completed for s in page.progress_snaps][-1] == 3
+    assert backend.calls == 2
+
+
+def test_cp3_new_run_clears_stale_progress_before_running(tmp_path, qtbot) -> None:
+    started, release = threading.Event(), threading.Event()
+    calls = {"n": 0}
+
+    def backend(request, *, progress_callback=None, should_cancel=None):
+        calls["n"] += 1
+        total = 2
+        if progress_callback is not None:
+            progress_callback(FolderInferenceProgress(total=total, completed=0, succeeded=0, failed=0))
+        if calls["n"] == 1:
+            for i in (1, 2):
+                progress_callback(FolderInferenceProgress(total=total, completed=i, succeeded=i, failed=0))
+            return _aggregate(_ok("a.png"), _ok("b.png"))
+        started.set()
+        assert release.wait(timeout=5)
+        return _aggregate(_ok("x.png"), _ok("y.png"))
+
+    page = _cp3_page(qtbot, backend)
+    _fill_folder_fields(page, tmp_path)
+
+    _start_and_wait(page, qtbot)
+    assert page._folder_progress_bar.value() == 2
+
+    page._on_run_clicked()
+    assert started.wait(timeout=5)
+    assert page._status_label.text() == "Running"
+    assert page._folder_progress_bar.value() == 0
+    assert page._folder_progress_label.text() == "Progress: 0 / 0"
+
+    release.set()
+    qtbot.waitUntil(lambda: page._run_button.isEnabled(), timeout=5000)
+
+
+def test_cp3_worker_qobject_cleaned_up_after_cancelled(tmp_path, qtbot) -> None:
+    paused, resume = threading.Event(), threading.Event()
+    backend = _CoopFolderBackend(
+        ("a.png", "b.png", "c.png"), gate_before=1, paused=paused, resume=resume
+    )
+    page = _cp3_page(qtbot, backend)
+    _fill_folder_fields(page, tmp_path)
+
+    page._on_run_clicked()
+    worker = page._folder_worker
+    destroyed: list = []
+    worker.destroyed.connect(lambda *_: destroyed.append(True))
+    qtbot.waitUntil(paused.is_set, timeout=5000)
+    page._on_folder_cancel_clicked()
+    resume.set()
+
+    qtbot.waitUntil(lambda: destroyed == [True], timeout=5000)
+    assert page._folder_thread is None
+    assert page._folder_worker is None
+
+
+def test_cp3_request_close_during_folder_run_requests_cooperative_cancel(tmp_path, qtbot) -> None:
+    paused, resume = threading.Event(), threading.Event()
+    backend = _CoopFolderBackend(
+        ("a.png", "b.png", "c.png"), gate_before=1, paused=paused, resume=resume
+    )
+    page = _cp3_page(qtbot, backend, cls=_CP3RecordingPage)
+    _fill_folder_fields(page, tmp_path)
+    received: list = []
+    page.close_requested.connect(lambda: received.append(True))
+
+    page._on_run_clicked()
+    qtbot.waitUntil(paused.is_set, timeout=5000)
+    page.request_close()
+    assert page._folder_cancelling is True
+    assert page._status_label.text() == "Cancelling..."
+    assert received == []  # deferred until cleanup
+    resume.set()
+
+    qtbot.waitUntil(lambda: received == [True], timeout=5000)
+    assert len(page.folder_cancelled_calls) == 1  # cooperative cancel took effect
+    assert page._folder_thread is None and page._folder_worker is None
+
+
+def test_folder_cancel_immediately_after_start_preserves_prepared_token_and_reruns(
+    tmp_path, qtbot, monkeypatch
+) -> None:
+    worker_entered = threading.Event()
+    release_worker = threading.Event()
+    begin_calls = 0
+
+    class CountingController(FolderInferenceController):
+        def begin_run(self) -> None:
+            nonlocal begin_calls
+            begin_calls += 1
+            super().begin_run()
+
+    class StartupGatedWorker(QtFolderInferenceWorker):
+        def run(self) -> None:
+            worker_entered.set()
+            assert release_worker.wait(timeout=5)
+            super().run()
+
+    monkeypatch.setattr(inference_page_module, "QtFolderInferenceWorker", StartupGatedWorker)
+    backend = _CoopFolderBackend(("a.png", "b.png"))
+    controller = CountingController(backend=backend)
+    page = InferencePage(
+        controller=InferenceController(backend=_should_not_run_single),
+        folder_controller=controller,
+    )
+    qtbot.addWidget(page)
+    _fill_folder_fields(page, tmp_path)
+
+    page._on_run_clicked()
+    assert worker_entered.wait(timeout=5)
+    assert controller.is_running is True
+    assert begin_calls == 1
+    assert backend.calls == 0
+
+    page._on_folder_cancel_clicked()
+    assert controller.cancel_requested is True
+    release_worker.set()
+    qtbot.waitUntil(lambda: page._folder_thread is None, timeout=5000)
+
+    assert page._status_label.text() == "Cancelled: processed 0 of 2 (2 unprocessed)"
+    assert begin_calls == 1
+
+    # A new worker prepares one fresh token; the prior cancellation is stale.
+    page._on_run_clicked()
+    qtbot.waitUntil(lambda: page._folder_thread is None, timeout=5000)
+    assert begin_calls == 2
+    assert backend.calls == 2
+    assert page._status_label.text() == "Finished"
+
+
+def test_folder_close_immediately_after_start_preserves_prepared_token(
+    tmp_path, qtbot, monkeypatch
+) -> None:
+    worker_entered = threading.Event()
+    release_worker = threading.Event()
+
+    class StartupGatedWorker(QtFolderInferenceWorker):
+        def run(self) -> None:
+            worker_entered.set()
+            assert release_worker.wait(timeout=5)
+            super().run()
+
+    monkeypatch.setattr(inference_page_module, "QtFolderInferenceWorker", StartupGatedWorker)
+    backend = _CoopFolderBackend(("a.png", "b.png"))
+    controller = FolderInferenceController(backend=backend)
+    page = InferencePage(
+        controller=InferenceController(backend=_should_not_run_single),
+        folder_controller=controller,
+    )
+    qtbot.addWidget(page)
+    _fill_folder_fields(page, tmp_path)
+    close_requests: list[bool] = []
+    page.close_requested.connect(lambda: close_requests.append(True))
+
+    page._on_run_clicked()
+    assert worker_entered.wait(timeout=5)
+    assert backend.calls == 0
+
+    page.request_close()
+    assert controller.cancel_requested is True
+    assert close_requests == []
+    release_worker.set()
+    qtbot.waitUntil(lambda: close_requests == [True], timeout=5000)
+
+    assert backend.calls == 1
+    assert page._status_label.text() == "Cancelled: processed 0 of 2 (2 unprocessed)"
+    assert page._folder_thread is None and page._folder_worker is None
