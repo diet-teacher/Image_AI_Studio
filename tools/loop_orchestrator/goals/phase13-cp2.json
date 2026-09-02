@@ -1,0 +1,25 @@
+{
+  "template": false,
+  "checkpoint_id": "phase13-cp2-inference-page-image-preview",
+  "objective": "Integrate the Phase 13 image-preview component into the existing single-image InferencePage input workflow while preserving request mapping, asynchronous inference, folder mode, cancellation, export, and close coordination.",
+  "acceptance_criteria": [
+    "InferencePage contains one clearly labelled preview area associated with the Single Image input and does not create a second inference path or preview model output.",
+    "Selecting an image through the existing Browse action refreshes the preview, and an explicitly committed manual path refreshes it through a deterministic user action without filesystem polling.",
+    "An empty or unreadable path shows the component's neutral or unavailable state without changing the text entered in the request field and without bypassing existing InferenceRequest validation.",
+    "Changing from Single Image to Folder hides or clears single-image preview presentation so it cannot be mistaken for a folder result; returning to Single Image deterministically reflects the current image path.",
+    "Starting, finishing, failing, cancelling, rerunning, exporting, or closing inference preserves the established Phase 6 through Phase 12 thread, signal, control, result, and cleanup contracts.",
+    "Preview work remains synchronous bounded local decoding on the GUI path and never runs model inference, CUDA, network access, directory scans, background workers, or file watchers.",
+    "Existing single-image and folder public APIs, portable artifact and export schemas, request construction, and MainWindow tab integration remain unchanged.",
+    "Tests use local temporary images and fake inference backends, validate widget state programmatically, and contain no screenshot comparison, arbitrary sleep, assertion weakening, or unregistered marker.",
+    "No Git operation is performed."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/gui/inference_page.py",
+    "tests/gui/test_inference_page.py"
+  ],
+  "required_tests": [
+    "phase13_cp2_inference_page_image_preview"
+  ],
+  "claude_prompt": "Implement Phase 13 CP2 only in src/image_ai_studio/gui/inference_page.py and tests/gui/test_inference_page.py, reusing the CP1 image-preview component. Add one minimal Single Image input-preview area. Existing Browse selection and a deterministic committed manual-path action must refresh it; do not poll the filesystem. Empty/invalid paths must not rewrite request text or weaken existing validation. Folder mode must not display a stale single-image preview, and returning to Single Image must reflect the current path. Preserve every existing request mapping, QThread/worker connection, overlap guard, folder progress/cancellation, partial export, rerun, close cleanup, public API, and schema. Use fake inference backends and tmp_path images only; do not run actual inference, CUDA, network, screenshots, sleeps, or Git. Do not remove or weaken assertions, create a new marker, or modify any other file.",
+  "estimated_scope": "Focused integration in one existing GUI module and its existing test module, approximately 140-240 changed lines."
+}

@@ -1,0 +1,23 @@
+{
+  "template": false,
+  "checkpoint_id": "phase13-cp1-image-preview-component",
+  "objective": "Add a small reusable Qt image-preview component that safely presents a local image with bounded aspect-ratio scaling and explicit empty or unreadable states, without invoking inference.",
+  "acceptance_criteria": [
+    "A focused GUI component accepts a local image path, decodes it through supported Qt image APIs, applies orientation metadata where supported, and displays the image without starting inference or loading model artifacts.",
+    "The displayed pixmap preserves aspect ratio and is bounded by a documented preview size so large source images do not expand the page layout to their native dimensions.",
+    "The initial and cleared states use an explicit neutral placeholder, and a missing, non-file, unsupported, or corrupt input produces a concise unavailable state without raising into the Qt event loop.",
+    "Loading a valid image after an invalid image and clearing after a valid image remove stale pixmap and stale error state deterministically.",
+    "The component does not mutate the source file, perform network access, use CUDA, cache decoded images outside widget ownership, or add a dependency.",
+    "Qt tests create only local temporary images and inspect widget state and pixmap dimensions programmatically without screenshots, arbitrary sleeps, or timing races.",
+    "Existing assertions are not removed or weakened, and no Git operation is performed."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/gui/image_preview.py",
+    "tests/gui/test_image_preview.py"
+  ],
+  "required_tests": [
+    "phase13_cp1_image_preview_component"
+  ],
+  "claude_prompt": "Implement Phase 13 CP1 only in src/image_ai_studio/gui/image_preview.py and tests/gui/test_image_preview.py. Create a minimal reusable PySide6 image-preview component for local files with a neutral empty state, concise invalid/unreadable state, orientation-aware Qt decoding where available, bounded aspect-ratio-preserving display, and deterministic clear/reload behavior. It must not run inference, touch model artifacts, mutate inputs, access network/CUDA, add dependencies, cache global image state, use screenshots, or rely on sleeps. Tests must use tmp_path and qtbot, verify text/pixmap state and dimensions programmatically, retain strong assertions, and introduce no unregistered pytest marker. Do not modify any other file, run Git commands, commit, or push.",
+  "estimated_scope": "Small isolated Qt component and focused tests, approximately 180-300 changed lines across two new files."
+}

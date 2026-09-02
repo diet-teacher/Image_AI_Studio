@@ -1,0 +1,25 @@
+{
+  "template": false,
+  "checkpoint_id": "phase13-cp3-image-preview-cpu-graduation",
+  "objective": "Graduate single-image input preview with a real local-image MainWindow integration test and concise user documentation, without changing inference or artifact behavior.",
+  "acceptance_criteria": [
+    "A CPU-local qtbot integration drives the actual MainWindow and InferencePage, selects valid and corrupt local images, and verifies preview state and aspect-ratio bounds without invoking a real model forward.",
+    "The integration proves browse/manual refresh, invalid-to-valid recovery, Single Image to Folder to Single Image transitions, and coexistence with a fake asynchronous inference lifecycle without stale preview or duplicate widgets.",
+    "The test uses deterministic local fixtures and state-based Qt observation only, with no CUDA, network, external download, screenshot comparison, arbitrary sleep, file watcher, or new dependency.",
+    "README receives a concise workflow and a clickable relative link to docs/phase13_inference_image_preview.md without unrelated restructuring.",
+    "The detailed document distinguishes input preview from inference output, documents decoding/scaling/error/mode behavior, accessibility and resource bounds, compatibility, automated evidence, manual checks, limitations, and explicit non-goals without fabricated results.",
+    "Phase 6 through Phase 12 request, thread, cancellation, export, close, artifact, and public API contracts remain unchanged.",
+    "No drag-and-drop, folder thumbnail grid, image editing, result-image rendering, EXIF editing, recursive discovery, packaging, installer, TorchScript migration, CUDA inference, or network feature is added.",
+    "Existing assertions are not removed or weakened, no unregistered marker is added, and no Git operation is performed."
+  ],
+  "allowed_files": [
+    "tests/gui/test_inference_preview_integration.py",
+    "README.md",
+    "docs/phase13_inference_image_preview.md"
+  ],
+  "required_tests": [
+    "phase13_cp3_image_preview_cpu_graduation"
+  ],
+  "claude_prompt": "Implement Phase 13 CP3 only in tests/gui/test_inference_preview_integration.py, README.md, and docs/phase13_inference_image_preview.md. Add a deterministic local-CPU qtbot graduation test using actual MainWindow/InferencePage and local valid/corrupt image fixtures while using a fake inference backend so no real model forward occurs. Verify browse/manual refresh, invalid recovery, bounded aspect ratio, mode round-trip, lifecycle coexistence and exactly one preview widget through programmatic state rather than screenshots or sleeps. Add a concise README workflow with a relative Markdown link and an accurate detailed document that separates input preview from inference result, automated evidence from conditional/manual checks, and records compatibility, bounds, limitations and non-goals without invented test counts. Do not modify production, other tests, APIs, schemas, dependencies, goals, manifests, config, or user settings; do not add drag/drop, folder thumbnails, editing, result rendering, packaging, TorchScript migration, CUDA/network work, or Git operations.",
+  "estimated_scope": "One focused GUI integration test plus concise README and detailed design documentation, approximately 260-420 changed lines."
+}

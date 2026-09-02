@@ -1,0 +1,37 @@
+{
+  "phase_id": "phase13-inference-image-preview",
+  "objective": "Add a bounded, deterministic local input-image preview to the existing single-image inference workflow so users can confirm the selected file before running inference, while preserving all inference, folder, artifact, export, cancellation, and close contracts.",
+  "checkpoints": [
+    {"checkpoint_id": "phase13-cp1-image-preview-component", "goal": "tools/loop_orchestrator/goals/phase13-cp1.json"},
+    {"checkpoint_id": "phase13-cp2-inference-page-image-preview", "goal": "tools/loop_orchestrator/goals/phase13-cp2.json"},
+    {"checkpoint_id": "phase13-cp3-image-preview-cpu-graduation", "goal": "tools/loop_orchestrator/goals/phase13-cp3.json"}
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/gui/image_preview.py",
+    "tests/gui/test_image_preview.py",
+    "src/image_ai_studio/gui/inference_page.py",
+    "tests/gui/test_inference_page.py",
+    "tests/gui/test_inference_preview_integration.py",
+    "README.md",
+    "docs/phase13_inference_image_preview.md"
+  ],
+  "allowed_tests": [
+    "phase13_cp1_image_preview_component",
+    "phase13_cp2_inference_page_image_preview",
+    "phase13_cp3_image_preview_cpu_graduation"
+  ],
+  "final_harness_profile": "full",
+  "max_checkpoints": 3,
+  "max_rework_rounds": 1,
+  "max_model_calls": 16,
+  "max_claude_cost_usd": 8.0,
+  "max_elapsed_seconds": 14400,
+  "completion_conditions": [
+    "Each checkpoint persists its pre-maker baseline, runs its fixed required tests, and receives a read-only verifier PASS based on that checkpoint delta and observed tests without requiring the future final harness.",
+    "A bounded reusable Qt component decodes local input images, preserves aspect ratio and orientation where supported, and represents empty or unreadable input without inference, network, CUDA, global caches, or new dependencies.",
+    "InferencePage integrates exactly one Single Image preview through existing browse/manual input flow while preserving request mapping, asynchronous lifecycle, folder progress/cancellation, partial export, rerun, close coordination and MainWindow behavior.",
+    "A deterministic local qtbot integration and accurate documentation graduate valid/invalid recovery, mode transitions, lifecycle coexistence, resource bounds, compatibility and explicit non-goals without screenshots, arbitrary sleeps, real model inference or fabricated results.",
+    "No change occurs outside the seven allowed files and no public inference API, portable artifact, export schema, dependency, launcher, marker registry, goal, manifest, local config, drag-and-drop, folder thumbnail, image editing, result rendering, packaging or TorchScript migration is introduced.",
+    "The Phase-wide verifier evaluates the manifest allowed-files union after all checkpoint verifiers pass; only then does the orchestrator run the full harness exactly once, with no model verifier after the harness and no automatic restart of a failed Phase."
+  ]
+}
