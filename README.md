@@ -1823,6 +1823,37 @@ Folder 모드로 추론을 시작하면 발견한 이미지 수와 완료한 이
 
 ---
 
+## Phase 13: 단일 이미지 입력 미리보기
+
+Inference 탭의 `Single Image` 모드에 선택한 입력 이미지를 보여 주는 읽기
+전용 `Input Image Preview` 영역을 추가했습니다. `Browse...`로 파일을
+고르거나 `Input Image` 칸에 경로를 입력하고 Enter를 누르거나 포커스를
+옮기면(입력 중 매 글자마다가 아니라 확정 시점에만) 미리보기가 갱신됩니다.
+
+* 미리보기는 **추론 결과가 아니라 입력 이미지**입니다. 예측 클래스,
+  confidence, 결과 이미지와는 무관하고 추론을 시작하지도 않습니다.
+* 디코딩은 Qt가 로컬 파일에서 동기적으로 수행하며 EXIF orientation을
+  반영합니다. 큰 이미지는 종횡비를 유지한 채 문서화된 상한(기본 320x320
+  device-independent 픽셀) 안으로 축소만 되고, 이미 작은 이미지는 원본
+  크기로 표시됩니다.
+* 경로가 비면 중립 placeholder로 돌아가고, 없는 파일·폴더·지원하지 않는
+  형식·깨진 파일은 예외 없이 간결한 `Preview unavailable` 상태로
+  표시됩니다. 잘못된 경로 뒤에 올바른 경로를 주면 정상 상태로
+  회복됩니다.
+* `Folder` 모드로 바꾸면 미리보기를 숨기고 동시에 비웁니다(폴더 결과로
+  오인되지 않도록). `Single Image`로 돌아오면 현재 `Input Image` 경로를
+  다시 반영합니다. 미리보기는 원본 파일을 수정하지 않고 thread·worker·
+  폴더 스캔·파일 watcher를 만들지 않으며 `_build_request`의 매핑/검증도
+  바꾸지 않습니다.
+
+컴포넌트 상태 전이, 디코딩·스케일링·오류·모드 계약, 접근성과 자원 상한,
+Phase 6~12 요청/스레드/취소/내보내기/닫기 계약과의 호환성, 자동 검증
+근거와 수동 확인 항목, 한계와 명시적 비범위는
+[docs/phase13_inference_image_preview.md](docs/phase13_inference_image_preview.md)를
+참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON

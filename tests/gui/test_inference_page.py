@@ -21,11 +21,14 @@ import threading
 from pathlib import Path
 
 import pytest
+from PySide6.QtGui import QImage, qRgb
 from PySide6.QtWidgets import QFileDialog, QFormLayout
 
+import image_ai_studio.gui.image_preview as image_preview_module
 import image_ai_studio.gui.inference_page as inference_page_module
 from image_ai_studio.application.folder_inference_controller import FolderInferenceController
 from image_ai_studio.application.inference_controller import InferenceController
+from image_ai_studio.gui.image_preview import ImagePreview
 from image_ai_studio.gui.inference_page import InferencePage
 from image_ai_studio.gui.qt_folder_inference_worker import QtFolderInferenceWorker
 from image_ai_studio.inference.folder_inference import (
@@ -2836,3 +2839,293 @@ def test_folder_close_immediately_after_start_preserves_prepared_token(
     assert backend.calls == 1
     assert page._status_label.text() == "Cancelled: processed 0 of 2 (2 unprocessed)"
     assert page._folder_thread is None and page._folder_worker is None
+
+
+# ===============================================================================
+# Phase 13 CP2: Single Image input preview integration on InferencePage
+# (Phase 13 CP1 ImagePreview wired to the existing Browse action and a
+#  deterministically committed manual path; folder-mode hide+clear;
+#  return-to-single re-mirror; no second inference path, no request
+#  mapping/validation change, no thread/worker/scan/watcher. Local tmp_path
+#  images + fake backends only -- no real inference/CUDA/network/screenshot/sleep.)
+# ===============================================================================
+#
+# required-tests id: phase13_cp2_inference_page_image_preview
+
+
+def _write_preview_png(path: Path, width: int = 40, height: int = 30) -> Path:
+    image = QImage(width, height, QImage.Format.Format_RGB32)
+    image.fill(qRgb(70, 130, 180))
+    assert image.save(str(path), "PNG"), f"failed to write test PNG at {path}"
+    return path
+
+
+def _patch_open_image_dialog(monkeypatch, returned_path) -> None:
+    """Patch QFileDialog.getOpenFileName so the Browse action selects a fixed
+    local path with no real dialog."""
+
+    def _fake_get_open_file_name(parent, caption="", directory="", filter="", *args, **kwargs):
+        return (str(returned_path), filter)
+
+    monkeypatch.setattr(
+        QFileDialog, "getOpenFileName", staticmethod(_fake_get_open_file_name)
+    )
+
+
+# -- one labelled preview area, bound to the Single Image input ---------------
+
+
+def test_cp2_preview_area_present_and_labelled_for_single_image(qtbot) -> None:
+    page = _make_page(qtbot)
+    assert isinstance(page._image_preview, ImagePreview)
+    assert "Preview" in page._image_preview_group.title()
+    assert page._image_preview_group.isAncestorOf(page._image_preview)
+    # bound to the single-image input area -- not the folder result area, and
+    # not a second copy of the model-output labels.
+    assert not page._folder_result_group.isAncestorOf(page._image_preview)
+    assert not page._image_preview_group.isAncestorOf(page._predicted_class_value_label)
+    # shown in the default single-image mode; neutral placeholder to start.
+    assert page._image_preview_group.isHidden() is False
+    assert page._image_preview.has_image() is False
+    assert page._image_preview.is_unavailable() is False
+    assert page._image_preview.status_text() == image_preview_module.PLACEHOLDER_TEXT
+
+
+# -- Browse action + committed manual path both refresh it -------------------
+
+
+def test_cp2_browse_action_refreshes_preview(tmp_path, qtbot, monkeypatch) -> None:
+    page = _make_page(qtbot)
+    img = _write_preview_png(tmp_path / "pick.png")
+    _patch_open_image_dialog(monkeypatch, img)
+
+    page._browse_image_button.click()
+
+    assert page._image_path_edit.text() == str(img)
+    assert page._image_preview.has_image() is True
+    assert page._image_preview.is_unavailable() is False
+    assert page._image_preview.status_text() == ""
+
+
+def test_cp2_committed_manual_path_refreshes_preview_no_polling(tmp_path, qtbot) -> None:
+    page = _make_page(qtbot)
+    img = _write_preview_png(tmp_path / "typed.png")
+
+    page._image_path_edit.setText(str(img))
+    # Not committed yet -> nothing polls the filesystem, preview stays neutral.
+    assert page._image_preview.has_image() is False
+    assert page._image_preview.status_text() == image_preview_module.PLACEHOLDER_TEXT
+
+    page._image_path_edit.editingFinished.emit()  # deterministic commit action
+
+    assert page._image_preview.has_image() is True
+    assert page._image_path_edit.text() == str(img)  # field text untouched
+
+
+# -- empty / unreadable paths: neutral or unavailable, field + request intact -
+
+
+def test_cp2_empty_path_returns_preview_to_neutral_placeholder(tmp_path, qtbot) -> None:
+    page = _make_page(qtbot)
+    img = _write_preview_png(tmp_path / "a.png")
+    page._image_path_edit.setText(str(img))
+    page._image_path_edit.editingFinished.emit()
+    assert page._image_preview.has_image() is True
+
+    page._image_path_edit.setText("   ")  # whitespace-only == empty
+    page._image_path_edit.editingFinished.emit()
+
+    assert page._image_preview.has_image() is False
+    assert page._image_preview.is_unavailable() is False
+    assert page._image_preview.status_text() == image_preview_module.PLACEHOLDER_TEXT
+    assert page._image_path_edit.text() == "   "  # field text not rewritten
+
+
+def test_cp2_unreadable_path_shows_unavailable_without_touching_field_or_request(
+    tmp_path, qtbot
+) -> None:
+    page = _make_page(qtbot)
+    page._training_output_dir_edit.setText(str(tmp_path))
+    page._model_json_edit.setText(str(tmp_path / "model.json"))
+    missing = tmp_path / "not_here.png"
+    page._image_path_edit.setText(str(missing))
+
+    page._image_path_edit.editingFinished.emit()
+
+    assert page._image_preview.is_unavailable() is True
+    assert page._image_preview.has_image() is False
+    assert page._image_preview.status_text() == image_preview_module.UNAVAILABLE_TEXT
+    # request field text unchanged; request mapping/validation path unchanged.
+    assert page._image_path_edit.text() == str(missing)
+    request = page._build_request()
+    assert request.image_path == missing
+    assert request.state_dict_path == tmp_path / "best_model_state_dict.pt"
+    assert request.class_mapping_path == tmp_path / "class_mapping.json"
+
+
+def test_cp2_corrupt_image_shows_unavailable_without_raising(tmp_path, qtbot) -> None:
+    page = _make_page(qtbot)
+    broken = tmp_path / "broken.png"
+    broken.write_bytes(b"\x89PNG\r\n\x1a\n" + b"not a real png body" * 16)
+
+    page._image_path_edit.setText(str(broken))
+    page._image_path_edit.editingFinished.emit()  # must not raise into Qt
+
+    assert page._image_preview.is_unavailable() is True
+    assert page._image_preview.has_image() is False
+
+
+def test_cp2_full_request_mapping_unchanged_after_preview_refresh(tmp_path, qtbot) -> None:
+    output_dir = tmp_path / "training_out"
+    output_dir.mkdir()
+    model_json = tmp_path / "resnet.json"
+    image = tmp_path / "test.png"
+
+    page = _make_page(qtbot)
+    page._training_output_dir_edit.setText(str(output_dir))
+    page._model_json_edit.setText(str(model_json))
+    page._image_path_edit.setText(str(image))
+    page._device_combo.setCurrentText("cpu")
+    page._precision_combo.setCurrentText("fp32")
+    page._image_path_edit.editingFinished.emit()  # preview -> unavailable (no file)
+    assert page._image_preview.is_unavailable() is True
+
+    request = page._build_request()
+
+    assert request.model_json_path == model_json
+    assert request.image_path == image
+    assert request.state_dict_path == output_dir / "best_model_state_dict.pt"
+    assert request.class_mapping_path == output_dir / "class_mapping.json"
+    assert request.device == "cpu"
+    assert request.precision == "fp32"
+
+
+# -- mode switching: hide + clear, then deterministic re-mirror -------------
+
+
+def test_cp2_switch_to_folder_hides_and_clears_single_image_preview(tmp_path, qtbot) -> None:
+    page = _make_page(qtbot)
+    img = _write_preview_png(tmp_path / "cat.png")
+    page._image_path_edit.setText(str(img))
+    page._image_path_edit.editingFinished.emit()
+    assert page._image_preview.has_image() is True
+
+    page._mode_combo.setCurrentText("Folder")
+
+    assert page._image_preview_group.isHidden() is True
+    assert page._image_preview.has_image() is False  # cleared, not merely hidden
+    assert page._image_preview.is_unavailable() is False
+    assert page._image_preview.status_text() == image_preview_module.PLACEHOLDER_TEXT
+
+
+def test_cp2_return_to_single_image_reflects_current_path(tmp_path, qtbot) -> None:
+    page = _make_page(qtbot)
+    first = _write_preview_png(tmp_path / "first.png", 40, 30)
+    page._image_path_edit.setText(str(first))
+    page._image_path_edit.editingFinished.emit()
+
+    page._mode_combo.setCurrentText("Folder")
+    assert page._image_preview.has_image() is False
+
+    # path changes while folder mode is active (no commit signal in this mode)
+    second = _write_preview_png(tmp_path / "second.png", 60, 20)
+    page._image_path_edit.setText(str(second))
+
+    page._mode_combo.setCurrentText("Single Image")
+
+    assert page._image_preview_group.isHidden() is False
+    assert page._image_preview.has_image() is True  # deterministically re-mirrored
+    pm = page._image_preview.pixmap()
+    assert pm is not None
+    assert (pm.width(), pm.height()) == (60, 20)  # the current path, not the first
+
+
+def test_cp2_return_to_single_image_with_empty_path_shows_placeholder(qtbot) -> None:
+    page = _make_page(qtbot)
+    page._mode_combo.setCurrentText("Folder")
+    page._mode_combo.setCurrentText("Single Image")
+
+    assert page._image_preview.has_image() is False
+    assert page._image_preview.is_unavailable() is False
+    assert page._image_preview.status_text() == image_preview_module.PLACEHOLDER_TEXT
+
+
+# -- isolation: preview work never touches the inference lifecycle ----------
+
+
+def test_cp2_preview_refresh_starts_no_inference_thread_or_worker(
+    tmp_path, qtbot, monkeypatch
+) -> None:
+    from PySide6.QtCore import QThread
+
+    page = InferencePage(
+        controller=InferenceController(backend=_should_not_run_single),
+        folder_controller=FolderInferenceController(backend=_should_not_run_folder),
+    )
+    qtbot.addWidget(page)
+    img = _write_preview_png(tmp_path / "x.png")
+    _patch_open_image_dialog(monkeypatch, img)
+
+    page._browse_image_button.click()
+    page._image_path_edit.setText(str(img))
+    page._image_path_edit.editingFinished.emit()
+    page._mode_combo.setCurrentText("Folder")
+    page._mode_combo.setCurrentText("Single Image")
+
+    assert page._thread is None and page._worker is None
+    assert page._folder_thread is None and page._folder_worker is None
+    assert page._controller.state == "idle"
+    assert page._folder_controller.state == "idle"
+    for value in vars(page._image_preview).values():
+        assert not isinstance(value, QThread)
+
+
+def test_cp2_single_image_run_lifecycle_unchanged_with_preview(tmp_path, qtbot) -> None:
+    controller = InferenceController(backend=lambda request: _fake_inference_result())
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _write_preview_png(tmp_path / "image.png")  # the path _fill_minimum uses
+    _fill_minimum_valid_fields(page, tmp_path)
+    page._image_path_edit.editingFinished.emit()
+    assert page._image_preview.has_image() is True
+
+    _start_and_wait(page, qtbot)
+
+    assert page._status_label.text() == "Finished"
+    assert page._predicted_class_value_label.text() == "cat"
+    assert page._confidence_value_label.text() == "90.00%"
+    assert controller.state == "finished"
+    assert page._thread is None and page._worker is None
+    assert page._image_preview.has_image() is True  # run did not disturb the preview
+
+
+def test_cp2_folder_run_unaffected_by_preview_integration(tmp_path, qtbot) -> None:
+    aggregate = _aggregate(_ok("a.png"), _ok("b.png"))
+    page = _folder_page(qtbot, lambda request: aggregate)
+    _fill_folder_fields(page, tmp_path)
+    assert page._image_preview_group.isHidden() is True
+    assert page._image_preview.has_image() is False
+
+    _start_and_wait(page, qtbot)
+
+    assert page._status_label.text() == "Finished"
+    assert page._folder_results_table.rowCount() == 2
+    assert page._folder_export_source is aggregate
+    assert page._export_csv_button.isEnabled() is True
+    assert page._image_preview.has_image() is False
+
+
+def test_cp2_request_close_when_idle_still_emits_immediately_with_preview_loaded(
+    tmp_path, qtbot
+) -> None:
+    page = _make_page(qtbot)
+    img = _write_preview_png(tmp_path / "p.png")
+    page._image_path_edit.setText(str(img))
+    page._image_path_edit.editingFinished.emit()
+    assert page._image_preview.has_image() is True
+
+    received: list = []
+    page.close_requested.connect(lambda: received.append(True))
+    page.request_close()
+
+    assert received == [True]

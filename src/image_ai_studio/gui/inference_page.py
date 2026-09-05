@@ -68,7 +68,22 @@ rows, cancel status, and export source first; a normal completion after all
 images is never shown as ``Cancelled``. On an accepted ``MainWindow`` close
 during an active folder run, ``request_close()`` also asks for cooperative
 cancellation while still deferring ``close_requested`` to the cleanup
-handler; single-image close behavior is unchanged."""
+handler; single-image close behavior is unchanged.
+
+Phase 13 CP2: the Single Image input gains one clearly labelled read-only
+preview area (``ImagePreview`` from Phase 13 CP1), placed with the
+single-image result group. The existing Browse action and a deterministically
+*committed* manual path (``QLineEdit.editingFinished`` -- Enter or focus-out,
+never per-keystroke, never a filesystem watcher or poll) both refresh it via
+``_refresh_image_preview``; an empty path returns it to the neutral
+placeholder and any unreadable path shows the component's own "unavailable"
+state -- neither rewrites the Input Image field nor changes how
+``_build_request`` maps it or what it validates. Folder mode hides *and*
+clears the preview so it can never be read as a folder result; returning to
+Single Image re-mirrors the current path. The preview is display-only
+synchronous bounded local decoding on the GUI thread: it starts no inference,
+CUDA, thread, worker, watcher, or directory scan, and every Phase 6 through
+Phase 12 request/lifecycle/export/close contract above is untouched."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -94,6 +109,7 @@ from PySide6.QtWidgets import (
 
 from image_ai_studio.application.folder_inference_controller import FolderInferenceController
 from image_ai_studio.application.inference_controller import InferenceController, build_inference_request
+from image_ai_studio.gui.image_preview import ImagePreview
 from image_ai_studio.gui.qt_folder_inference_worker import QtFolderInferenceWorker
 from image_ai_studio.gui.qt_inference_worker import QtInferenceWorker
 from image_ai_studio.inference.folder_inference import (
@@ -315,6 +331,7 @@ class InferencePage(QWidget):
         layout.addLayout(self._build_actions_row())
         layout.addWidget(self._build_status_label())
         layout.addWidget(self._build_result_group())
+        layout.addWidget(self._build_image_preview_group())
         layout.addWidget(self._build_folder_result_group())
         layout.addStretch(1)
         self._on_mode_changed()  # apply initial (single-image) visibility
@@ -344,6 +361,10 @@ class InferencePage(QWidget):
         form.addRow("Model JSON:", model_row)
 
         self._image_path_edit = QLineEdit()
+        # Phase 13 CP2: a *committed* manual edit (Enter or focus-out) is the
+        # deterministic user action that refreshes the preview -- not per-
+        # keystroke `textChanged`, and never a filesystem watcher/poll.
+        self._image_path_edit.editingFinished.connect(self._refresh_image_preview)
         self._browse_image_button = QPushButton("Browse...")
         self._browse_image_button.clicked.connect(self._browse_image)
         image_row = QHBoxLayout()
@@ -419,6 +440,21 @@ class InferencePage(QWidget):
         self._result_group = group
         return group
 
+    def _build_image_preview_group(self) -> QGroupBox:
+        """Phase 13 CP2: one clearly labelled read-only preview area bound to
+        the Single Image input. It wraps the Phase 13 CP1 ``ImagePreview``
+        component (bounded synchronous local decode; its own neutral
+        placeholder / "unavailable" states) and is shown only in single-image
+        mode -- `_on_mode_changed` hides *and* clears it in folder mode so it
+        can never be mistaken for a folder result. No second inference path
+        and no model-output rendering live here."""
+        group = QGroupBox("Input Image Preview")
+        box = QVBoxLayout(group)
+        self._image_preview = ImagePreview()
+        box.addWidget(self._image_preview)
+        self._image_preview_group = group
+        return group
+
     def _build_folder_result_group(self) -> QGroupBox:
         group = QGroupBox("Folder Inference Results")
         box = QVBoxLayout(group)
@@ -491,6 +527,21 @@ class InferencePage(QWidget):
         )
         if path:
             self._image_path_edit.setText(path)
+            self._refresh_image_preview()
+
+    def _refresh_image_preview(self) -> None:
+        """Mirror the current Input Image path into the associated preview
+        (Phase 13 CP2). Empty -> the component's neutral placeholder; any
+        other value is handed straight to the CP1 component, which shows its
+        own bounded pixmap on a valid local decode or its own "unavailable"
+        state otherwise (it never raises). This is display-only: it does not
+        rewrite `_image_path_edit`, does not touch `_build_request` / its
+        validation, and starts no thread, worker, scan, or file watcher."""
+        path = self._image_path_edit.text().strip()
+        if not path:
+            self._image_preview.clear()
+            return
+        self._image_preview.load_image(path)
 
     def _browse_folder(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select Input Folder")
@@ -505,6 +556,15 @@ class InferencePage(QWidget):
         self._folder_input_container.setVisible(folder_mode)
         self._folder_result_group.setVisible(folder_mode)
         self._result_group.setVisible(not folder_mode)
+        # Phase 13 CP2: the single-image preview is shown only in single-image
+        # mode. Switching to folder both hides *and* clears it so a stale
+        # picture can never be read as a folder result; returning to single
+        # image deterministically re-mirrors the current Input Image path.
+        self._image_preview_group.setVisible(not folder_mode)
+        if folder_mode:
+            self._image_preview.clear()
+        else:
+            self._refresh_image_preview()
         # Switching modes leaves any previously shown folder batch behind as
         # a stale result -- drop the retained aggregate so export cannot act
         # on it (Phase 11 CP2) and reset the stale progress readout (Phase 12
