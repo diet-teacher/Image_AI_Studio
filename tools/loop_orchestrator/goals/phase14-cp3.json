@@ -1,0 +1,26 @@
+{
+  "template": false,
+  "checkpoint_id": "phase14-cp3-model-designer-cpu-graduation",
+  "objective": "Graduate the Model Designer with a deterministic local-CPU workflow proving that a model created and saved through the GUI is consumed unchanged by the existing training path, and document the supported workflow and boundaries accurately.",
+  "acceptance_criteria": [
+    "A qtbot integration drives the actual MainWindow Model Designer and TrainingPage to create, validate, save, select, and train a tiny canonical model on a tiny local ImageFolder dataset using CPU.",
+    "The graduation test proves the generated JSON loads through the existing load_model_spec API, builds through the existing builder, reaches the existing build_training_request and training workflow, and produces the established portable training artifacts without a hand-authored model JSON.",
+    "The test verifies deterministic model and layer ordering, the validation shape trace before save, the exact training model path handoff, successful asynchronous completion, thread cleanup, and at least one canonical output artifact without changing production schemas.",
+    "Invalid designer input is rejected before training begins, then can be corrected and rerun successfully without stale error, duplicate tab, duplicate signal, or stale model-path state.",
+    "The integration uses only tiny local fixtures, one short CPU training run, qtbot state observation, and existing public APIs; it uses no CUDA, network, external downloads, screenshot comparison, arbitrary sleeps, or fabricated training results.",
+    "README receives a concise Model Designer workflow and a relative link to docs/phase14_model_designer.md without unrelated restructuring or stale claims that contradict the current GUI.",
+    "The detailed document accurately describes the canonical schema, supported layer controls including structured branches, validation and shape feedback, atomic save, Training tab handoff, error recovery, compatibility with external JSON, automated evidence, manual checks, limitations, and explicit non-goals.",
+    "No graph canvas, drag-and-drop topology, nested branches, arbitrary DAG, model execution preview, hyperparameter search, C++ GUI, packaging, installer, deployment migration, new dependency, public API change, or Phase 15 feature is added.",
+    "Existing assertions are retained, no unregistered marker is added, and no Git operation is performed."
+  ],
+  "allowed_files": [
+    "tests/gui/test_model_designer_integration.py",
+    "README.md",
+    "docs/phase14_model_designer.md"
+  ],
+  "required_tests": [
+    "phase14_cp3_model_designer_cpu_graduation"
+  ],
+  "claude_prompt": "Implement Phase 14 CP3 only in tests/gui/test_model_designer_integration.py, README.md, and docs/phase14_model_designer.md. Add one deterministic local-CPU qtbot graduation workflow using the actual MainWindow, ModelDesigner, TrainingPage, existing model_definition APIs, existing training controller/worker, a tiny tmp_path ImageFolder dataset, and a tiny model created entirely through GUI controls. Prove validation/shape feedback, canonical atomic save, exact training-path handoff, existing request construction, successful asynchronous CPU training, cleanup, artifacts, and invalid-input correction without hand-authoring model JSON. Keep runtime bounded and use qtbot state observation rather than sleeps or screenshots. Add concise README instructions with a relative document link and an accurate detailed guide covering schema/API reuse, supported ordered/form controls and structured non-nested branches, errors, compatibility, evidence, manual checks, limitations, and non-goals. Do not change production or other tests, invent counts/results, add markers/dependencies, run CUDA/network/external downloads, add graph/DAG/packaging/C++/Phase 15 work, or perform Git operations.",
+  "estimated_scope": "One focused real-CPU GUI graduation test plus concise README and detailed documentation, approximately 320-520 changed lines."
+}

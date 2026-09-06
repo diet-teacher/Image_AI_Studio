@@ -1,0 +1,39 @@
+{
+  "phase_id": "phase14-model-designer-gui",
+  "objective": "Provide an integrated ordered/form-based GUI for creating, loading, validating, and saving canonical model_definition.json files and selecting them for the existing training workflow, so users no longer need to hand-edit model JSON.",
+  "checkpoints": [
+    {"checkpoint_id": "phase14-cp1-model-designer-component", "goal": "tools/loop_orchestrator/goals/phase14-cp1.json"},
+    {"checkpoint_id": "phase14-cp2-training-workflow-integration", "goal": "tools/loop_orchestrator/goals/phase14-cp2.json"},
+    {"checkpoint_id": "phase14-cp3-model-designer-cpu-graduation", "goal": "tools/loop_orchestrator/goals/phase14-cp3.json"}
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/gui/model_designer.py",
+    "src/image_ai_studio/gui/training_page.py",
+    "src/image_ai_studio/gui/main_window.py",
+    "tests/gui/test_model_designer.py",
+    "tests/gui/test_training_page.py",
+    "tests/gui/test_main_window.py",
+    "tests/gui/test_model_designer_integration.py",
+    "README.md",
+    "docs/phase14_model_designer.md"
+  ],
+  "allowed_tests": [
+    "phase14_cp1_model_designer_component",
+    "phase14_cp2_training_workflow_integration",
+    "phase14_cp3_model_designer_cpu_graduation"
+  ],
+  "final_harness_profile": "full",
+  "max_checkpoints": 3,
+  "max_rework_rounds": 1,
+  "max_model_calls": 16,
+  "max_claude_cost_usd": 8.0,
+  "max_elapsed_seconds": 14400,
+  "completion_conditions": [
+    "Each checkpoint durably records its pre-maker baseline, passes its fixed required-test allowlist, and receives a read-only checkpoint verifier PASS before the next checkpoint starts.",
+    "Users can create, load, inspect, reorder, edit, validate, and atomically save the existing canonical ModelSpec schema through deterministic Qt controls, including every currently registered layer type and structured non-nested branches, without hand-editing JSON or duplicating model rules.",
+    "MainWindow owns exactly one stable Model Designer tab whose explicit successful save/use path supplies TrainingPage's existing Model JSON input while preserving external JSON selection and every established training, inference, preview, cancellation, export, artifact, rerun, thread-cleanup, and close contract.",
+    "A bounded local-CPU qtbot graduation proves that a GUI-authored model passes existing validation/build APIs and completes the existing asynchronous training workflow on a tiny local dataset, with accurate workflow documentation and no fabricated evidence.",
+    "No change occurs outside the nine Phase files and no public model_definition, application, training, inference or artifact API/schema, dependency, launcher, graph/DAG editor, nested branch, model execution preview, CUDA/network feature, C++ GUI, packaging, installer, deployment migration, or Phase 15 work is introduced.",
+    "After all checkpoint verifiers pass, the Phase-wide read-only verifier evaluates the complete manifest-scoped delta and completion conditions; only its PASS permits the full project harness to run exactly once, and any mutation, ambiguous durable state, failure, or incomplete evidence fails closed without automatic Phase restart."
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "template": false,
+  "checkpoint_id": "phase14-cp1-model-designer-component",
+  "objective": "Add a standalone ordered/form-based Qt Model Designer that creates, loads, edits, validates, and atomically saves the existing canonical ModelSpec JSON format without requiring users to hand-edit JSON.",
+  "acceptance_criteria": [
+    "A standalone ModelDesigner widget provides explicit fields for model name and three-dimensional input shape plus an ordered layer editor with add, remove, move-up, move-down, and layer-specific parameter controls; drag-and-drop graph editing is not introduced.",
+    "The editor covers every currently registered ModelSpec layer type, including structured non-nested BranchSpec branches, through widgets rather than raw JSON text, and preserves the existing prohibition on nested branches.",
+    "New model creation starts from a deterministic valid starter definition that the user can inspect and change without touching a JSON file manually.",
+    "Load uses the existing load_model_spec API and populates the editor deterministically; invalid JSON, unsupported structure, or validation failure produces a concise actionable error and leaves the last valid editor state intact.",
+    "Validation constructs the existing ModelSpec and calls validate_model_spec, then presents either a bounded actionable error or a deterministic per-layer shape trace without duplicating model validation or shape inference rules in the GUI.",
+    "Save is permitted only for a valid ModelSpec, uses the existing save_model_spec atomic writer, writes the canonical model-definition schema, reports the saved path, and does not partially overwrite an existing destination when validation or writing fails.",
+    "Loading and saving an existing canonical model preserves its semantic ModelSpec representation, layer order, branch order, scalar types, and optional values.",
+    "The component performs no training, inference, network, CUDA, background-thread, packaging, launcher, or dependency work and changes no model_definition public API.",
+    "qtbot tests use local tmp_path files and inspect widget state, ordering, validation, shape output, error recovery, and semantic round trips programmatically without screenshots, arbitrary sleeps, assertion weakening, or unregistered markers.",
+    "No Git operation is performed."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/gui/model_designer.py",
+    "tests/gui/test_model_designer.py"
+  ],
+  "required_tests": [
+    "phase14_cp1_model_designer_component"
+  ],
+  "claude_prompt": "Implement Phase 14 CP1 only in src/image_ai_studio/gui/model_designer.py and tests/gui/test_model_designer.py. Build a standalone PySide6 ordered/form-based ModelDesigner for the existing canonical ModelSpec format. Reuse load_model_spec, save_model_spec, model_spec_to_dict/model_spec_from_dict as appropriate, validate_model_spec, the existing spec dataclasses, and their exact validation rules; do not create a parallel model schema or validation layer. Provide deterministic new/load/edit/validate/save behavior, explicit model-name/input-shape fields, ordered layer operations, layer-specific typed controls for all currently registered layer types, and structured non-nested BranchSpec editing without raw JSON entry or graph drag-and-drop. Validation must show the existing shape trace or a bounded actionable error. Failed load must preserve prior valid UI state; failed validation/write must not corrupt an existing file. Save must use the existing atomic serialization API. Tests must use qtbot, tmp_path, canonical semantic comparisons, and programmatic widget assertions only. Do not run training/inference/CUDA/network, add dependencies or markers, weaken assertions, modify model_definition APIs, touch any other file, or perform Git operations.",
+  "estimated_scope": "Medium isolated GUI component and focused tests, approximately 500-850 changed lines across two new files."
+}

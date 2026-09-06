@@ -1,0 +1,30 @@
+{
+  "template": false,
+  "checkpoint_id": "phase14-cp2-training-workflow-integration",
+  "objective": "Integrate exactly one Model Designer into MainWindow and connect a successfully saved canonical model definition to the existing TrainingPage model path while preserving all current training, inference, cancellation, preview, export, and close behavior.",
+  "acceptance_criteria": [
+    "MainWindow creates one stable ModelDesigner reference and adds it exactly once as a Model Designer tab without removing, reordering, duplicating, or otherwise breaking the existing Training and Inference pages.",
+    "A successful designer save can explicitly select that canonical JSON for training through a small stable GUI interface, updating the existing TrainingPage Model JSON field rather than creating a second training request path.",
+    "Cancellation of a file dialog, failed validation, failed load, or failed save does not change the TrainingPage model path and does not start training.",
+    "TrainingPage continues to construct requests only through the existing build_training_request path, and the designer does not call TrainingController or QtTrainingWorker directly.",
+    "The selected designer output remains an ordinary canonical model-definition path, so browse-selected and externally authored valid Model JSON files remain fully compatible.",
+    "Existing TrainingPage enable/disable, asynchronous QThread/worker lifecycle, stop/close coordination, rerun, result display, and artifact behavior remain unchanged.",
+    "Existing InferencePage single/folder request mapping, preview, progress, cancellation, export, rerun, and MainWindow close coordination remain unchanged.",
+    "The designer adds no asynchronous work; idle and active-training close behavior remains non-blocking with no wait(), busy loop, terminate(), duplicate close request, or duplicate signal connection.",
+    "qtbot tests use fake controllers where execution behavior is relevant and verify tab identity, signal/path handoff, error no-op behavior, request mapping, and existing lifecycle contracts programmatically without real inference, CUDA, network, screenshots, or arbitrary sleeps.",
+    "No application, training, inference, model_definition public API, artifact schema, dependency, launcher, or Git operation is changed."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/gui/model_designer.py",
+    "src/image_ai_studio/gui/training_page.py",
+    "src/image_ai_studio/gui/main_window.py",
+    "tests/gui/test_model_designer.py",
+    "tests/gui/test_training_page.py",
+    "tests/gui/test_main_window.py"
+  ],
+  "required_tests": [
+    "phase14_cp2_training_workflow_integration"
+  ],
+  "claude_prompt": "Implement Phase 14 CP2 only in the six allowed files. Integrate exactly one CP1 ModelDesigner as a stable MainWindow tab while preserving the existing Training and Inference tab objects, ordering, lifecycle, and centralized non-blocking close coordination. Add only the minimum explicit saved-model handoff needed so a successful designer save/use action sets TrainingPage's existing Model JSON path. TrainingPage must continue to use _build_request -> build_training_request; do not introduce another controller, worker, request builder, schema, or model-definition API. Failed/cancelled designer operations must be no-ops for the training path. Preserve external Model JSON browse compatibility and every existing training/inference thread, cancellation, preview, export, rerun, result, and close behavior. Use qtbot and fake backends for focused integration assertions; do not run real inference/CUDA/network, rely on sleeps/screenshots, add dependencies/markers, weaken assertions, touch files outside the allowlist, or perform Git operations.",
+  "estimated_scope": "Medium focused integration across three GUI modules and three existing/focused GUI test modules, approximately 260-480 changed lines."
+}
