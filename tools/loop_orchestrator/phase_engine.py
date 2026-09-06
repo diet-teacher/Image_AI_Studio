@@ -18,7 +18,7 @@ from .goal import GoalError, path_allowed
 from .models import VerifierResult
 from .process import (API_CONNECTION_ERROR, MODEL_BUDGET_EXHAUSTED, MODEL_MAX_TURNS,
                       PROCESS_START_FAILED, TIMEOUT, ProcessFailure)
-from .prompts import MAKER, VERIFIER
+from .prompts import MAKER, PHASE_VERIFIER, VERIFIER
 from .repository import base_commit, file_snapshot, git, worktree_snapshot
 
 DIFF_LIMIT = 40_000
@@ -196,7 +196,9 @@ class PhaseEngine:
                 "current_checkpoint_index": 0, "current_checkpoint_id": manifest["checkpoints"][0]["checkpoint_id"],
                 "completed_checkpoints": [], "checkpoints": [], "active_checkpoint": None,
                 "model_calls": 0, "maker_calls": 0, "verifier_calls": 0, "planner_calls": 0,
-                "claude_cost_usd": 0.0, "elapsed_seconds": 0.0, "final_harness": None,
+                "claude_cost_usd": 0.0, "elapsed_seconds": 0.0,
+                "final_harness": {"stage": "NOT_STARTED"},
+                "phase_verifier": {"stage": "NOT_STARTED"},
                 "stop_reason": None, "started_at": _now(), "started_monotonic": self.clock()}
 
     def run(self, manifest: dict, *, execute: bool = False, resume: bool = False) -> dict:
@@ -432,7 +434,7 @@ class PhaseEngine:
                         break
             else:
                 return self._stop(state, "FAILED", "MAX_REWORK_ROUNDS", record)
-        return self._final_harness(state, manifest)
+        return self._phase_verify_then_harness(state, manifest)
 
     def _run_tests_and_verifier(self, state, manifest, record, maker_record, goal, attempt, max_reworks):
         before_tests = git_guard(self.root)
@@ -519,6 +521,32 @@ class PhaseEngine:
         return None
 
     def _final_harness(self, state: dict, manifest: dict) -> dict:
+        phase_verifier = state.get("phase_verifier")
+        verifier_result = phase_verifier.get("result") if isinstance(phase_verifier, dict) else None
+        if (not isinstance(phase_verifier, dict)
+                or phase_verifier.get("stage") != "COMPLETE"
+                or not set(self._PHASE_VERIFIER_SNAPSHOT_FIELDS).issubset(phase_verifier)
+                or not isinstance(verifier_result, dict)
+                or verifier_result.get("verdict") != "PASS"):
+            return self._stop(state, "BLOCKED", "PHASE_VERIFIER_PASS_REQUIRED")
+        if phase_verifier["verified_snapshot_digest"] != _snapshot_digest(
+                phase_verifier["verified_snapshot"]):
+            return self._stop(state, "BLOCKED", "PHASE_VERIFIER_STATE_INCOMPLETE")
+        verified_current = git_guard(self.root)
+        if (verified_current["repository"] != phase_verifier["verified_snapshot"]
+                or verified_current["protected"] != phase_verifier["verified_protected"]
+                or verified_current["head"] != phase_verifier["verified_head"]
+                or verified_current["staged"] != phase_verifier["verified_staged"]):
+            return self._stop(state, "BLOCKED", "PHASE_VERIFIER_SNAPSHOT_MISMATCH")
+        harness = state.get("final_harness")
+        harness_stage = harness.get("stage") if isinstance(harness, dict) else None
+        if not isinstance(harness_stage, str) or harness_stage not in {
+                "NOT_STARTED", "PENDING_CALL", "COMPLETE"}:
+            return self._stop(state, "BLOCKED", "FINAL_HARNESS_STATE_INCOMPLETE")
+        if harness_stage == "PENDING_CALL":
+            return self._stop(state, "BLOCKED", "FINAL_HARNESS_STATE_INCOMPLETE")
+        if harness_stage == "COMPLETE":
+            return self._finalize_harness_result(state, harness)
         if state["completed_checkpoints"] != [item["checkpoint_id"] for item in manifest["checkpoints"]]:
             return self._stop(state, "BLOCKED", "PHASE_INCOMPLETE")
         if "phase_baseline" not in state:
@@ -543,6 +571,9 @@ class PhaseEngine:
         if remaining <= 0:
             return self._stop(state, "BLOCKED", "MAX_ELAPSED_SECONDS")
         before = git_guard(self.root)
+        state["final_harness"] = {"stage": "PENDING_CALL",
+                                  "before_snapshot_digest": _snapshot_digest(before["repository"])}
+        self._persist(state, "final-harness-before", state["final_harness"])
         try:
             code, report = self.harness_runner(self.root, PROFILES[manifest["final_harness_profile"]],
                                                max_elapsed_seconds=remaining)
@@ -561,15 +592,250 @@ class PhaseEngine:
         after = git_guard(self.root)
         harness_guard = guard_diagnostics(before, after, state["base_commit"], [], self.root,
                                           require_unchanged=True)
-        state["final_harness"] = {"exit_code": code, **report, "guard": harness_guard}
+        state["final_harness"] = {
+            "exit_code": code, **report,
+            "stage": "COMPLETE", "guard": harness_guard,
+            "verified_snapshot": after["repository"], "verified_snapshot_digest": _snapshot_digest(after["repository"]),
+            "verified_protected": after["protected"], "verified_head": after["head"], "verified_staged": after["staged"],
+        }
         self._persist(state, "project-harness", state["final_harness"])
-        if has_guard_violation(harness_guard):
-            return self._stop(state, "BLOCKED", "FINAL_HARNESS_MODIFIED_WORKTREE", state["final_harness"])
-        if code == 0 and report.get("state") == "PASSED":
+        return self._finalize_harness_result(state, state["final_harness"])
+
+    _FINAL_HARNESS_SNAPSHOT_FIELDS = ("verified_snapshot", "verified_snapshot_digest",
+                                      "verified_protected", "verified_head", "verified_staged", "guard")
+
+    @staticmethod
+    def _string_list(value: object) -> bool:
+        return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+    @classmethod
+    def _complete_harness_record_valid(cls, harness: object) -> bool:
+        """Validate the durable no-call recovery record before using nested values."""
+        if not isinstance(harness, dict) or harness.get("stage") != "COMPLETE":
+            return False
+        if not set(cls._FINAL_HARNESS_SNAPSHOT_FIELDS).issubset(harness):
+            return False
+        snapshot = harness.get("verified_snapshot")
+        protected = harness.get("verified_protected")
+        digest = harness.get("verified_snapshot_digest")
+        head = harness.get("verified_head")
+        staged = harness.get("verified_staged")
+        guard = harness.get("guard")
+        exit_code = harness.get("exit_code")
+        report_state = harness.get("state")
+        if (not isinstance(snapshot, dict)
+                or not all(isinstance(path, str) and isinstance(entry, dict)
+                           for path, entry in snapshot.items())
+                or not isinstance(protected, dict)
+                or set(protected) != set(PROTECTED_LOCAL_FILES)
+                or not all(isinstance(entry, dict) for entry in protected.values())
+                or not isinstance(digest, str)
+                or not isinstance(head, str)
+                or not cls._string_list(staged)
+                or not isinstance(exit_code, int) or isinstance(exit_code, bool)
+                or not isinstance(report_state, str)
+                or not isinstance(guard, dict)):
+            return False
+        guard_types = {
+            "changed_files": cls._string_list,
+            "diff": lambda value: isinstance(value, str),
+            "file_diagnostics": lambda value: isinstance(value, dict),
+            "allowed_files_violations": cls._string_list,
+            "protected_file_violations": cls._string_list,
+            "head_before": lambda value: isinstance(value, str),
+            "head_after": lambda value: isinstance(value, str),
+            "head_violation": lambda value: isinstance(value, bool),
+            "staged_before": cls._string_list,
+            "staged_after": cls._string_list,
+            "staged_violation": lambda value: isinstance(value, bool),
+        }
+        if any(key not in guard or not validator(guard[key])
+               for key, validator in guard_types.items()):
+            return False
+        try:
+            return digest == _snapshot_digest(snapshot)
+        except (TypeError, ValueError):
+            return False
+
+    def _finalize_harness_result(self, state: dict, harness: dict) -> dict:
+        """Deterministically terminalize a durable COMPLETE harness record without rerunning it.
+
+        Reached both immediately after a fresh harness call and on resume of a durable
+        COMPLETE record. A crash between persisting COMPLETE and reaching the terminal
+        ``_stop`` below leaves the same COMPLETE record on disk, so resume replays only
+        this pure result mapping -- never the harness subprocess itself.
+        """
+        if not self._complete_harness_record_valid(harness):
+            return self._stop(state, "BLOCKED", "FINAL_HARNESS_STATE_INCOMPLETE")
+        current = git_guard(self.root)
+        if (current["repository"] != harness["verified_snapshot"]
+                or current["protected"] != harness["verified_protected"]
+                or current["head"] != harness["verified_head"]
+                or current["staged"] != harness["verified_staged"]):
+            return self._stop(state, "BLOCKED", "FINAL_HARNESS_SNAPSHOT_MISMATCH")
+        if has_guard_violation(harness["guard"]):
+            return self._stop(state, "BLOCKED", "FINAL_HARNESS_MODIFIED_WORKTREE", harness)
+        if harness.get("exit_code") == 0 and harness.get("state") == "PASSED":
             return self._stop(state, "READY_TO_COMMIT", "PHASE_COMPLETE")
-        if code == 1 or report.get("state") == "FAILED":
-            return self._stop(state, "FAILED", "FINAL_HARNESS_FAILED", state["final_harness"])
-        return self._stop(state, "BLOCKED", "FINAL_HARNESS_INFRASTRUCTURE_FAILURE", state["final_harness"])
+        if harness.get("exit_code") == 1 or harness.get("state") == "FAILED":
+            return self._stop(state, "FAILED", "FINAL_HARNESS_FAILED", harness)
+        return self._stop(state, "BLOCKED", "FINAL_HARNESS_INFRASTRUCTURE_FAILURE", harness)
+
+    _PHASE_VERIFIER_SNAPSHOT_FIELDS = ("result", "verified_snapshot", "verified_snapshot_digest",
+                                      "verified_protected", "verified_head", "verified_staged")
+
+    @staticmethod
+    def _phase_verifier_evidence(state: dict, manifest: dict) -> dict:
+        checkpoints = []
+        for entry, record in zip(manifest["checkpoints"], state["checkpoints"]):
+            attempt = record["attempts"][-1] if record.get("attempts") else {}
+            checkpoints.append({
+                "checkpoint_id": record.get("checkpoint_id"),
+                "goal": entry.get("goal_value"),
+                "final_files": record.get("final_files"),
+                "tests": attempt.get("tests"),
+                "checkpoint_verifier": attempt.get("verifier"),
+            })
+        return {
+            "phase_id": manifest["phase_id"],
+            "objective": manifest["objective"],
+            "completion_conditions": manifest["completion_conditions"],
+            "allowed_files": manifest["allowed_files"],
+            "checkpoints": checkpoints,
+        }
+
+    def _phase_verifier_preflight(self, state: dict, manifest: dict, current: dict) -> dict | None:
+        expected = [item["checkpoint_id"] for item in manifest["checkpoints"]]
+        records = state.get("checkpoints", [])
+        record_ids = [record.get("checkpoint_id") for record in records if isinstance(record, dict)]
+        checkpoint_verdicts = [
+            ((record.get("attempts") or [{}])[-1].get("verifier") or {}).get("verdict")
+            for record in records if isinstance(record, dict)
+        ]
+        if (state.get("completed_checkpoints") != expected or record_ids != expected
+                or len(records) != len(expected)
+                or any(record.get("stage") != "COMPLETE" for record in records if isinstance(record, dict))
+                or checkpoint_verdicts != ["PASS"] * len(expected)):
+            return {"reason": "PHASE_INCOMPLETE"}
+        baseline = state.get("phase_baseline")
+        if not isinstance(baseline, dict) or state.get("phase_baseline_digest") != _snapshot_digest(baseline):
+            return {"reason": "PHASE_VERIFIER_BASELINE_MISMATCH"}
+        phase_files, phase_diff, diagnostics = snapshot_delta(baseline, current["repository"])
+        violations = []
+        for path_name in phase_files:
+            try:
+                if not path_allowed(path_name, manifest["allowed_files"], self.root):
+                    violations.append(path_name)
+            except GoalError:
+                violations.append(path_name)
+        if (violations or current["head"] != state.get("base_commit") or current["staged"]
+                or current["repository"] != state.get("last_observed_snapshot")
+                or current["protected"] != state.get("last_observed_protected")):
+            return {
+                "reason": "PHASE_VERIFIER_PREFLIGHT_INTEGRITY_FAILURE",
+                "phase_changed_files": phase_files,
+                "phase_diff": phase_diff,
+                "phase_file_diagnostics": diagnostics,
+                "allowed_files_violations": sorted(set(violations)),
+                "head": current["head"],
+                "staged": current["staged"],
+                "repository_matches_last_observed": current["repository"] == state.get("last_observed_snapshot"),
+                "protected_matches_last_observed": current["protected"] == state.get("last_observed_protected"),
+            }
+        return None
+
+    def _phase_verify_then_harness(self, state: dict, manifest: dict) -> dict:
+        """Distinct pre-harness Phase-wide verifier gate; final harness follows only a durable PASS.
+
+        A crash before this ever ran leaves durable ``NOT_STARTED`` state (safe: call it fresh). A
+        missing legacy field or a crash mid-call is ambiguous and fails closed rather than risking a
+        duplicate model call. Only a durable ``COMPLETE`` PASS record whose exact repository,
+        protected-file, HEAD, and staged snapshot still matches lets resume enter the harness.
+        """
+        pending = state.get("phase_verifier")
+        if isinstance(pending, dict) and pending.get("stage") == "NOT_STARTED":
+            return self._call_phase_verifier(state, manifest)
+        if not isinstance(pending, dict) or pending.get("stage") not in {"PENDING_CALL", "COMPLETE"}:
+            return self._stop(state, "BLOCKED", "PHASE_VERIFIER_STATE_INCOMPLETE")
+        if pending["stage"] == "PENDING_CALL":
+            return self._stop(state, "BLOCKED", "PHASE_VERIFIER_STATE_INCOMPLETE")
+        if not set(self._PHASE_VERIFIER_SNAPSHOT_FIELDS).issubset(pending):
+            return self._stop(state, "BLOCKED", "PHASE_VERIFIER_STATE_INCOMPLETE")
+        result = pending.get("result")
+        if not isinstance(result, dict) or result.get("verdict") != "PASS":
+            return self._stop(state, "BLOCKED", "PHASE_VERIFIER_PASS_REQUIRED")
+        if pending["verified_snapshot_digest"] != _snapshot_digest(pending["verified_snapshot"]):
+            return self._stop(state, "BLOCKED", "PHASE_VERIFIER_STATE_INCOMPLETE")
+        current = git_guard(self.root)
+        if (current["repository"] != pending["verified_snapshot"]
+                or current["protected"] != pending["verified_protected"]
+                or current["head"] != pending["verified_head"]
+                or current["staged"] != pending["verified_staged"]):
+            return self._stop(state, "BLOCKED", "PHASE_VERIFIER_SNAPSHOT_MISMATCH")
+        return self._final_harness(state, manifest)
+
+    def _call_phase_verifier(self, state: dict, manifest: dict) -> dict:
+        before = git_guard(self.root)
+        preflight_failure = self._phase_verifier_preflight(state, manifest, before)
+        if preflight_failure:
+            return self._stop(state, "BLOCKED", preflight_failure["reason"], preflight_failure)
+        allowed, reason = self._before_call(state, manifest, "codex")
+        if not allowed:
+            return self._stop(state, "BLOCKED", reason)
+        phase_files, phase_diff, phase_diagnostics = snapshot_delta(state["phase_baseline"], before["repository"])
+        state["model_calls"] += 1; state["verifier_calls"] += 1
+        state["phase_verifier"] = {
+            "stage": "PENDING_CALL", "call_index": state["model_calls"],
+            "baseline_digest": state["phase_baseline_digest"],
+            "before_snapshot_digest": _snapshot_digest(before["repository"]),
+        }
+        self._persist(state, "phase-verifier-before", state["phase_verifier"])
+        verifier = None; verifier_error = None; verifier_interrupted = False
+        try:
+            verifier = self.codex.verify(PHASE_VERIFIER.format(
+                phase_contract=json.dumps(self._phase_verifier_evidence(state, manifest)),
+                base=state["base_commit"],
+                phase_files=phase_files, phase_diff=phase_diff))
+        except KeyboardInterrupt:
+            verifier_interrupted = True
+        except Exception as exc:
+            verifier_error = exc
+        after = git_guard(self.root)
+        guard = guard_diagnostics(before, after, state["base_commit"], [], self.root, require_unchanged=True)
+        details = {"phase_changed_files": phase_files, "phase_diff": phase_diff,
+                  "phase_file_diagnostics": phase_diagnostics, "guard": guard}
+        state["last_observed_snapshot"], state["last_observed_protected"] = after["repository"], after["protected"]
+        if has_guard_violation(guard):
+            return self._stop(state, "BLOCKED", "PHASE_VERIFIER_SAFETY_VIOLATION", details)
+        if verifier_interrupted:
+            return self._stop(state, "BLOCKED", "INTERRUPTED", details)
+        if verifier_error is not None:
+            if isinstance(verifier_error, ProcessFailure):
+                details["verifier_error"] = verifier_error.diagnostics()
+                final = "BLOCKED" if verifier_error.kind in {PROCESS_START_FAILED, TIMEOUT} else "FAILED"
+                return self._stop(state, final, f"PHASE_VERIFIER_ERROR: {verifier_error.kind}", details)
+            details["verifier_error"] = {"type": type(verifier_error).__name__, "error": str(verifier_error)[-4000:]}
+            return self._stop(state, "FAILED", "PHASE_VERIFIER_ERROR", details)
+        try:
+            verifier_result = asdict(verifier)
+            verdict = verifier_result.get("verdict")
+        except (AttributeError, TypeError, ValueError):
+            details["verifier_error"] = {"type": "MALFORMED_RESULT"}
+            return self._stop(state, "FAILED", "PHASE_VERIFIER_MALFORMED_RESULT", details)
+        details["verifier"] = verifier_result
+        state["phase_verifier"] = {
+            "stage": "COMPLETE", "result": verifier_result,
+            "verified_snapshot": after["repository"], "verified_snapshot_digest": _snapshot_digest(after["repository"]),
+            "verified_protected": after["protected"], "verified_head": after["head"], "verified_staged": after["staged"],
+        }
+        self._persist(state, "phase-verifier-complete", state["phase_verifier"])
+        if verdict == "PASS":
+            return self._final_harness(state, manifest)
+        if verdict == "BLOCKED":
+            return self._stop(state, "BLOCKED", "PHASE_VERIFIER_BLOCKED", details)
+        if verdict == "FAIL":
+            return self._stop(state, "FAILED", "PHASE_VERIFIER_FAILED", details)
+        return self._stop(state, "BLOCKED", "PHASE_VERIFIER_UNSUPPORTED_VERDICT", details)
 
     def _resume_invalid(self, manifest: dict, reason: str, details=None) -> dict:
         return self._stop(self._initial_state(manifest), "BLOCKED", reason, details)
@@ -586,18 +852,50 @@ class PhaseEngine:
                     "completed_checkpoints", "checkpoints", "current_checkpoint_index"}
         if not isinstance(saved, dict) or saved.get("record_type") != "phase" or not required.issubset(saved):
             return self._resume_invalid(manifest, "RESUME_STATE_NOT_PHASE")
-        phase_fields = {"phase_baseline", "phase_baseline_digest", "phase_baseline_protected", "last_observed_snapshot",
-                        "last_observed_protected"}
-        if not phase_fields.issubset(saved):
-            return self._stop(saved, "BLOCKED", "RESUME_INCOMPLETE_CHECKPOINT_STATE")
-        if saved["phase_baseline_digest"] != _snapshot_digest(saved["phase_baseline"]):
-            return self._stop(saved, "BLOCKED", "RESUME_INCOMPLETE_CHECKPOINT_STATE")
-        saved["started_monotonic"] = self.clock() - float(saved.get("elapsed_seconds", 0))
         if saved.get("phase_id") != manifest["phase_id"] or saved.get("manifest_digest") != manifest["manifest_digest"]:
             return self._stop(saved, "BLOCKED", "RESUME_MANIFEST_MISMATCH")
         if saved.get("base_commit") != base_commit(self.root):
             return self._stop(saved, "BLOCKED", "RESUME_BASE_COMMIT_MISMATCH")
-        active = saved.get("active_checkpoint"); completed = len(saved.get("completed_checkpoints", []))
+        active = saved.get("active_checkpoint")
+        expected_completed = [item["checkpoint_id"] for item in manifest["checkpoints"]]
+        completed_items = saved.get("completed_checkpoints")
+        if not isinstance(completed_items, list) or not all(isinstance(item, str) for item in completed_items):
+            return self._stop(saved, "BLOCKED", "RESUME_INCOMPLETE_CHECKPOINT_STATE")
+        completed = len(completed_items)
+        all_completed = completed_items == expected_completed
+        if completed >= len(expected_completed) and not all_completed:
+            return self._stop(saved, "BLOCKED", "RESUME_INCOMPLETE_CHECKPOINT_STATE")
+        final_harness = saved.get("final_harness")
+        if all_completed:
+            stage = final_harness.get("stage") if isinstance(final_harness, dict) else None
+            if not isinstance(stage, str) or stage not in {"NOT_STARTED", "PENDING_CALL", "COMPLETE"}:
+                return self._stop(saved, "BLOCKED", "FINAL_HARNESS_STATE_INCOMPLETE")
+            if active is not None:
+                return self._stop(saved, "BLOCKED", "RESUME_INCOMPLETE_CHECKPOINT_STATE")
+            if stage == "PENDING_CALL":
+                return self._stop(saved, "BLOCKED", "FINAL_HARNESS_STATE_INCOMPLETE")
+            if stage == "COMPLETE":
+                return self._finalize_harness_result(saved, final_harness)
+        else:
+            # A harness cannot logically have started before all checkpoints complete, so
+            # the old missing/None representation is safe to normalize only in this state.
+            if "final_harness" not in saved or final_harness is None:
+                saved["final_harness"] = {"stage": "NOT_STARTED"}
+            elif (not isinstance(final_harness, dict)
+                    or final_harness.get("stage") != "NOT_STARTED"):
+                return self._stop(saved, "BLOCKED", "FINAL_HARNESS_STATE_INCOMPLETE")
+        phase_fields = {"phase_baseline", "phase_baseline_digest", "phase_baseline_protected", "last_observed_snapshot",
+                        "last_observed_protected", "phase_verifier"}
+        if not phase_fields.issubset(saved):
+            return self._stop(saved, "BLOCKED", "RESUME_INCOMPLETE_CHECKPOINT_STATE")
+        try:
+            baseline_valid = (isinstance(saved["phase_baseline"], dict)
+                              and saved["phase_baseline_digest"] == _snapshot_digest(saved["phase_baseline"]))
+            saved["started_monotonic"] = self.clock() - float(saved.get("elapsed_seconds", 0))
+        except (TypeError, ValueError):
+            baseline_valid = False
+        if not baseline_valid:
+            return self._stop(saved, "BLOCKED", "RESUME_INCOMPLETE_CHECKPOINT_STATE")
         if completed < len(manifest["checkpoints"]):
             baseline_fields = {"checkpoint_id", "goal", "baseline", "baseline_digest", "baseline_protected", "stage",
                                "last_observed_snapshot", "last_observed_protected", "next_attempt",
@@ -639,8 +937,8 @@ class PhaseEngine:
             failure = self.preflight()
             if failure:
                 return self._stop(saved, "BLOCKED", "RESUME_EXECUTABLE_PREFLIGHT_FAILED", failure)
-        if completed >= len(manifest["checkpoints"]):
-            return self._final_harness(saved, manifest)
+        if all_completed:
+            return self._phase_verify_then_harness(saved, manifest)
         return self._run_checkpoints(saved, manifest, completed)
 
     def _tests(self, required, run_id):

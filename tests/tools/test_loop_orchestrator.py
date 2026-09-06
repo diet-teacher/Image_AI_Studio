@@ -12,7 +12,7 @@ from tools.loop_orchestrator.budget import BudgetDecision, BudgetManager
 from tools.loop_orchestrator.engine import LoopEngine
 from tools.loop_orchestrator.goal import GoalError
 from tools.loop_orchestrator.phase import PhaseManifestError, validate_phase_manifest
-from tools.loop_orchestrator.phase_engine import PhaseEngine
+from tools.loop_orchestrator.phase_engine import PhaseEngine, _snapshot_digest, git_guard
 from tools.loop_orchestrator.models import ClaudeInvocation, MakerResult, PlannerResult, State, VerifierResult
 from tools.loop_orchestrator.process import (
     API_CONNECTION_ERROR, JSON_PARSE_FAILED, MODEL_BUDGET_EXHAUSTED, MODEL_MAX_TURNS,
@@ -778,7 +778,7 @@ class PhaseEngineTests(unittest.TestCase):
 
     class Codex:
         def __init__(self, verdicts=None, mutate_root=None, failure_at=None):
-            self.verdicts = list(verdicts or ["PASS", "PASS"]); self.prompts = []
+            self.verdicts = list(verdicts or ["PASS", "PASS", "PASS"]); self.prompts = []
             self.plans = 0; self.mutate_root = mutate_root; self.failure_at = failure_at
         def verify(self, prompt):
             self.prompts.append(prompt)
@@ -872,16 +872,196 @@ class PhaseEngineTests(unittest.TestCase):
         self.config["allowed_tests"] = original
 
     def test_two_checkpoints_pass_then_final_harness_ready(self):
+        harness_calls = []
+        self.assertEqual({"stage": "NOT_STARTED"},
+                         self.engine()._initial_state(self.manifest())["final_harness"])
+        def harness(root, profile, **kwargs):
+            harness_calls.append(1)
+            return 0, {"state": "PASSED", "profile": profile.name, "steps": [], "run_id": "harness"}
         maker, codex = self.Maker(self.root), self.Codex()
-        state = self.engine(maker, codex).run(self.manifest(), execute=True)
+        state = self.engine(maker, codex, harness_runner=harness).run(self.manifest(), execute=True)
         self.assertEqual("READY_TO_COMMIT", state["state"], state)
         self.assertEqual(["cp1", "cp2"], state["completed_checkpoints"])
-        self.assertEqual(2, maker.calls); self.assertEqual(2, len(codex.prompts)); self.assertEqual(0, codex.plans)
+        self.assertEqual(2, maker.calls); self.assertEqual(3, len(codex.prompts)); self.assertEqual(0, codex.plans)
+        self.assertEqual(1, len(harness_calls))
+        self.assertEqual("COMPLETE", state["phase_verifier"]["stage"])
+        self.assertEqual("PASS", state["phase_verifier"]["result"]["verdict"])
+        self.assertIn("PHASE CONTRACT AND CHECKPOINT EVIDENCE", codex.prompts[2])
+        self.assertIn("cp1.txt", codex.prompts[2]); self.assertIn("cp2.txt", codex.prompts[2])
+        self.assertIn("absence of final-harness evidence is expected", codex.prompts[2])
+        self.assertEqual(5, state["model_calls"]); self.assertEqual(3, state["verifier_calls"])
         self.assertEqual("changed-1\n", (self.root / "cp1.txt").read_text())
         self.assertEqual("changed-2\n", (self.root / "cp2.txt").read_text())
 
+        # A terminal-state resume cannot repeat either the verifier or harness.
+        resumed_codex = self.Codex()
+        resumed = self.engine(codex=resumed_codex, harness_runner=harness).run(
+            self.manifest(), execute=True, resume=True)
+        self.assertEqual("READY_TO_COMMIT", resumed["state"])
+        self.assertEqual([], resumed_codex.prompts)
+        self.assertEqual(1, len(harness_calls))
+
+    def test_phase_verifier_failures_never_run_harness(self):
+        cases = [
+            ("FAIL", "FAILED", "PHASE_VERIFIER_FAILED"),
+            ("BLOCKED", "BLOCKED", "PHASE_VERIFIER_BLOCKED"),
+            ("MAYBE", "BLOCKED", "PHASE_VERIFIER_UNSUPPORTED_VERDICT"),
+        ]
+        for verdict, expected_state, reason in cases:
+            with self.subTest(verdict=verdict):
+                harness_calls = []
+                state = self.engine(
+                    codex=self.Codex(["PASS", "PASS", verdict]),
+                    harness_runner=lambda *a, **k: harness_calls.append(1),
+                ).run(self.manifest(), execute=True)
+                self.assertEqual(expected_state, state["state"]); self.assertEqual(reason, state["stop_reason"])
+                self.assertEqual([], harness_calls)
+                (self.root / "cp1.txt").write_text("one-before\n", encoding="utf-8")
+                (self.root / "cp2.txt").write_text("two-before\n", encoding="utf-8")
+
+    def test_phase_verifier_exceptions_never_run_harness(self):
+        failures = [
+            ProcessFailure(PROCESS_START_FAILED, "start"),
+            ProcessFailure(TIMEOUT, "timeout"),
+            ProcessFailure(NONZERO_EXIT, "nonzero", return_code=1),
+            ProcessFailure(JSON_PARSE_FAILED, "malformed"),
+            RuntimeError("unexpected"),
+        ]
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__, kind=getattr(failure, "kind", None)):
+                harness_calls = []
+                class FailingPhaseCodex(self.Codex):
+                    def verify(inner, prompt):
+                        inner.prompts.append(prompt)
+                        if len(inner.prompts) == 3:
+                            raise failure
+                        return VerifierResult("PASS", [], [], [], None, [], "ok")
+                state = self.engine(
+                    codex=FailingPhaseCodex(), harness_runner=lambda *a, **k: harness_calls.append(1)
+                ).run(self.manifest(), execute=True)
+                self.assertIn(state["state"], {"BLOCKED", "FAILED"})
+                self.assertTrue(state["stop_reason"].startswith("PHASE_VERIFIER_ERROR"))
+                self.assertEqual([], harness_calls)
+                (self.root / "cp1.txt").write_text("one-before\n", encoding="utf-8")
+                (self.root / "cp2.txt").write_text("two-before\n", encoding="utf-8")
+
+    def test_phase_verifier_mutation_blocks_before_harness(self):
+        harness_calls = []
+        class MutatingPhaseCodex(self.Codex):
+            def verify(inner, prompt):
+                inner.prompts.append(prompt)
+                if len(inner.prompts) == 3:
+                    (inner.root / "verifier.txt").write_text("bad", encoding="utf-8")
+                return VerifierResult("PASS", [], [], [], None, [], "ok")
+            def __init__(inner, root):
+                super().__init__(); inner.root = root
+        state = self.engine(
+            codex=MutatingPhaseCodex(self.root), harness_runner=lambda *a, **k: harness_calls.append(1)
+        ).run(self.manifest(), execute=True)
+        self.assertEqual("BLOCKED", state["state"])
+        self.assertEqual("PHASE_VERIFIER_SAFETY_VIOLATION", state["stop_reason"])
+        self.assertEqual([], harness_calls)
+        self.assertIn("verifier.txt", state["recent_result"]["guard"]["changed_files"])
+
+    def test_phase_verifier_protected_file_mutation_blocks_before_harness(self):
+        harness_calls = []
+        class ProtectedMutatingPhaseCodex(self.Codex):
+            def __init__(inner, root):
+                super().__init__(); inner.root = root
+            def verify(inner, prompt):
+                inner.prompts.append(prompt)
+                if len(inner.prompts) == 3:
+                    (inner.root / ".loop/config.json").write_text("{}", encoding="utf-8")
+                return VerifierResult("PASS", [], [], [], None, [], "ok")
+        state = self.engine(
+            codex=ProtectedMutatingPhaseCodex(self.root),
+            harness_runner=lambda *a, **k: harness_calls.append(1),
+        ).run(self.manifest(), execute=True)
+        self.assertEqual("BLOCKED", state["state"])
+        self.assertEqual("PHASE_VERIFIER_SAFETY_VIOLATION", state["stop_reason"])
+        self.assertEqual([], harness_calls)
+        self.assertEqual([".loop/config.json"], state["recent_result"]["guard"]["protected_file_violations"])
+
+    def test_phase_verifier_intent_crash_resume_fails_closed_without_duplicate(self):
+        class CrashPhaseCodex(self.Codex):
+            def verify(inner, prompt):
+                inner.prompts.append(prompt)
+                if len(inner.prompts) == 3:
+                    raise SystemExit("crash in phase verifier")
+                return VerifierResult("PASS", [], [], [], None, [], "ok")
+        codex = CrashPhaseCodex()
+        with self.assertRaises(SystemExit):
+            self.engine(codex=codex).run(self.manifest(), execute=True)
+        saved = json.loads((self.root / ".loop/state.json").read_text(encoding="utf-8"))["state"]
+        self.assertEqual("PENDING_CALL", saved["phase_verifier"]["stage"])
+        self.assertEqual(5, saved["model_calls"]); self.assertEqual(3, saved["verifier_calls"])
+        resumed_codex, harness_calls = self.Codex(), []
+        resumed = self.engine(
+            codex=resumed_codex, harness_runner=lambda *a, **k: harness_calls.append(1)
+        ).run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("BLOCKED", resumed["state"])
+        self.assertEqual("PHASE_VERIFIER_STATE_INCOMPLETE", resumed["stop_reason"])
+        self.assertEqual([], resumed_codex.prompts); self.assertEqual([], harness_calls)
+
+    def test_phase_verifier_pass_crash_resume_skips_duplicate_and_runs_harness_once(self):
+        with patch.object(PhaseEngine, "_final_harness", side_effect=SystemExit("after pass")):
+            with self.assertRaises(SystemExit):
+                self.engine().run(self.manifest(), execute=True)
+        saved = json.loads((self.root / ".loop/state.json").read_text(encoding="utf-8"))["state"]
+        self.assertEqual("COMPLETE", saved["phase_verifier"]["stage"])
+        resumed_codex, harness_calls = self.Codex(), []
+        def harness(root, profile, **kwargs):
+            harness_calls.append(1)
+            return 0, {"state": "PASSED", "profile": profile.name, "steps": [], "run_id": "resumed"}
+        resumed = self.engine(codex=resumed_codex, harness_runner=harness).run(
+            self.manifest(), execute=True, resume=True)
+        self.assertEqual("READY_TO_COMMIT", resumed["state"])
+        self.assertEqual([], resumed_codex.prompts); self.assertEqual(1, len(harness_calls))
+
+    def test_phase_verifier_resume_states_and_snapshot_mismatch_fail_closed(self):
+        # Crash immediately before the new gate: durable NOT_STARTED is safe to call once on resume.
+        with patch.object(PhaseEngine, "_phase_verify_then_harness", side_effect=SystemExit("before gate")):
+            with self.assertRaises(SystemExit):
+                self.engine().run(self.manifest(), execute=True)
+        saved = json.loads((self.root / ".loop/state.json").read_text(encoding="utf-8"))["state"]
+        self.assertEqual("NOT_STARTED", saved["phase_verifier"]["stage"])
+        resumed_codex = self.Codex(["PASS"])
+        resumed = self.engine(codex=resumed_codex).run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("READY_TO_COMMIT", resumed["state"]); self.assertEqual(1, len(resumed_codex.prompts))
+
+        # A durable PASS cannot be reused after its verified tree changes.
+        wrapper = json.loads((self.root / ".loop/state.json").read_text(encoding="utf-8"))
+        wrapper["state"]["final_harness"] = {"stage": "NOT_STARTED"}
+        (self.root / "cp1.txt").write_text("changed after phase verification\n", encoding="utf-8")
+        current = git_guard(self.root)
+        wrapper["state"]["last_observed_snapshot"] = current["repository"]
+        wrapper["state"]["last_observed_protected"] = current["protected"]
+        (self.root / ".loop/state.json").write_text(json.dumps(wrapper), encoding="utf-8")
+        mismatch_codex = self.Codex()
+        mismatch = self.engine(codex=mismatch_codex).run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("PHASE_VERIFIER_SNAPSHOT_MISMATCH", mismatch["stop_reason"])
+        self.assertEqual([], mismatch_codex.prompts)
+        (self.root / "cp1.txt").write_text("changed-1\n", encoding="utf-8")
+
+        # A legacy completed state without the new durable field is never guessed from current files.
+        state_path = self.root / ".loop/state.json"; wrapper = json.loads(state_path.read_text(encoding="utf-8"))
+        wrapper["state"].pop("phase_verifier"); wrapper["state"]["final_harness"] = {"stage": "NOT_STARTED"}
+        state_path.write_text(json.dumps(wrapper), encoding="utf-8")
+        legacy_codex = self.Codex()
+        blocked = self.engine(codex=legacy_codex).run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("RESUME_INCOMPLETE_CHECKPOINT_STATE", blocked["stop_reason"])
+        self.assertEqual([], legacy_codex.prompts)
+
+    def test_phase_verifier_budget_and_model_call_gates_prevent_harness(self):
+        value = dict(self.raw_manifest); value["max_model_calls"] = 4
+        codex, harness_calls = self.Codex(), []
+        state = self.engine(codex=codex, harness_runner=lambda *a, **k: harness_calls.append(1)).run(
+            self.manifest(value), execute=True)
+        self.assertEqual("MAX_MODEL_CALLS", state["stop_reason"])
+        self.assertEqual(2, len(codex.prompts)); self.assertEqual([], harness_calls)
+
     def test_fail_rework_pass_then_next_checkpoint(self):
-        maker, codex = self.Maker(self.root), self.Codex(["FAIL", "PASS", "PASS"])
+        maker, codex = self.Maker(self.root), self.Codex(["FAIL", "PASS", "PASS", "PASS"])
         state = self.engine(maker, codex).run(self.manifest(), execute=True)
         self.assertEqual("READY_TO_COMMIT", state["state"], state); self.assertEqual(3, maker.calls)
         self.assertEqual([None, "session-1", None], maker.sessions)
@@ -918,6 +1098,18 @@ class PhaseEngineTests(unittest.TestCase):
         self.assertEqual("RESUME_INCOMPLETE_CHECKPOINT_STATE", resumed["stop_reason"])
         self.assertEqual(0, maker.calls)
 
+    def test_final_harness_requires_durable_phase_verifier_pass(self):
+        class LateMutationHarness:
+            def __call__(inner, root, profile, **kwargs):
+                raise AssertionError("harness must not run")
+        manifest = self.manifest()
+        state = self.engine()._initial_state(manifest)
+        state.update({"phase_baseline": {}, "completed_checkpoints": ["cp1", "cp2"],
+                      "started_monotonic": 0})
+        (self.root / "outside.txt").write_text("bad", encoding="utf-8")
+        result = self.engine(harness_runner=LateMutationHarness())._final_harness(state, manifest)
+        self.assertEqual("PHASE_VERIFIER_PASS_REQUIRED", result["stop_reason"])
+
     def test_final_phase_guard_uses_manifest_union(self):
         class LateMutationHarness:
             def __call__(inner, root, profile, **kwargs):
@@ -927,6 +1119,14 @@ class PhaseEngineTests(unittest.TestCase):
         state.update({"phase_baseline": {}, "completed_checkpoints": ["cp1", "cp2"],
                       "started_monotonic": 0})
         (self.root / "outside.txt").write_text("bad", encoding="utf-8")
+        current = git_guard(self.root)
+        state["phase_verifier"] = {
+            "stage": "COMPLETE", "result": {"verdict": "PASS"},
+            "verified_snapshot": current["repository"],
+            "verified_snapshot_digest": _snapshot_digest(current["repository"]),
+            "verified_protected": current["protected"],
+            "verified_head": current["head"], "verified_staged": current["staged"],
+        }
         result = self.engine(harness_runner=LateMutationHarness())._final_harness(state, manifest)
         self.assertEqual("FINAL_PHASE_SCOPE_VIOLATION", result["stop_reason"])
 
@@ -974,7 +1174,7 @@ class PhaseEngineTests(unittest.TestCase):
         self.assertEqual("BLOCKED", state["state"]); self.assertEqual(["cp1"], state["completed_checkpoints"])
         self.assertTrue((self.root / ".loop" / "handoff.json").is_file())
         self.assertTrue(any((self.root / ".loop" / "runs" / state["run_id"]).glob("*.json")))
-        resumed_maker, resumed_codex = self.Maker(self.root), self.Codex(["PASS"])
+        resumed_maker, resumed_codex = self.Maker(self.root), self.Codex(["PASS", "PASS"])
         resumed = self.engine(resumed_maker, resumed_codex).run(self.manifest(), execute=True, resume=True)
         self.assertEqual("READY_TO_COMMIT", resumed["state"], resumed); self.assertEqual(1, resumed_maker.calls)
         self.assertEqual(["cp1", "cp2"], resumed["completed_checkpoints"])
@@ -988,7 +1188,7 @@ class PhaseEngineTests(unittest.TestCase):
                 inner.calls += 1
                 return ClaudeInvocation(MakerResult("DONE", "base", [], [], [], "no change"),
                                         session_id or "resume-session", 0.1, 1)
-        maker, codex = NoopMaker(), self.Codex(["PASS"])
+        maker, codex = NoopMaker(), self.Codex(["PASS", "PASS"])
         resumed = self.engine(maker, codex).run(self.manifest(), execute=True, resume=True)
         self.assertEqual("READY_TO_COMMIT", resumed["state"], resumed)
         self.assertEqual(1, maker.calls)
@@ -1156,6 +1356,367 @@ class PhaseEngineTests(unittest.TestCase):
         self.assertEqual("FINAL_HARNESS_INTERRUPTED", state["stop_reason"])
         self.assertEqual("KeyboardInterrupt", state["recent_result"]["error"]["type"])
 
+    @staticmethod
+    def passing_harness(calls):
+        def harness(root, profile, **kwargs):
+            calls.append(1)
+            return 0, {"state": "PASSED", "profile": profile.name, "steps": [], "run_id": "harness"}
+        return harness
+
+    def test_final_harness_pending_then_complete_persist_ordering(self):
+        harness_calls = []
+        state = self.engine(harness_runner=self.passing_harness(harness_calls)).run(self.manifest(), execute=True)
+        self.assertEqual("READY_TO_COMMIT", state["state"], state)
+        self.assertEqual(1, len(harness_calls))
+        self.assertEqual("COMPLETE", state["final_harness"]["stage"])
+        run_dir = self.root / ".loop" / "runs" / state["run_id"]
+        pending_records = list(run_dir.glob("*-final-harness-before.json"))
+        complete_records = list(run_dir.glob("*-project-harness.json"))
+        self.assertEqual(1, len(pending_records)); self.assertEqual(1, len(complete_records))
+        pending_index = int(pending_records[0].name.split("-", 1)[0])
+        complete_index = int(complete_records[0].name.split("-", 1)[0])
+        self.assertLess(pending_index, complete_index)
+        pending_saved = json.loads(pending_records[0].read_text(encoding="utf-8"))["state"]["final_harness"]
+        self.assertEqual("PENDING_CALL", pending_saved["stage"])
+
+    def test_final_harness_crash_after_pending_persist_before_call_blocks_without_rerun(self):
+        harness_calls = []
+        original_persist = PhaseEngine._persist
+        def crashing_persist(self, state, role, result=None):
+            original_persist(self, state, role, result=result)
+            if role == "final-harness-before":
+                raise SystemExit("crash after pending persisted")
+        with patch.object(PhaseEngine, "_persist", crashing_persist):
+            with self.assertRaises(SystemExit):
+                self.engine(harness_runner=self.passing_harness(harness_calls)).run(self.manifest(), execute=True)
+        self.assertEqual([], harness_calls)
+        saved = json.loads((self.root / ".loop/state.json").read_text(encoding="utf-8"))["state"]
+        self.assertEqual("PENDING_CALL", saved["final_harness"]["stage"])
+        resumed_codex, resumed_calls = self.Codex(), []
+        resumed = self.engine(codex=resumed_codex,
+                              harness_runner=lambda *a, **k: resumed_calls.append(1)).run(
+            self.manifest(), execute=True, resume=True)
+        self.assertEqual("BLOCKED", resumed["state"])
+        self.assertEqual("FINAL_HARNESS_STATE_INCOMPLETE", resumed["stop_reason"])
+        self.assertEqual([], resumed_calls); self.assertEqual([], resumed_codex.prompts)
+
+    def test_final_harness_crash_during_call_blocks_without_rerun_on_resume(self):
+        harness_calls = []
+        def crashing_harness(root, profile, **kwargs):
+            harness_calls.append(1)
+            raise SystemExit("crash during harness call")
+        with self.assertRaises(SystemExit):
+            self.engine(harness_runner=crashing_harness).run(self.manifest(), execute=True)
+        self.assertEqual(1, len(harness_calls))
+        saved = json.loads((self.root / ".loop/state.json").read_text(encoding="utf-8"))["state"]
+        self.assertEqual("PENDING_CALL", saved["final_harness"]["stage"])
+        resumed_codex, resumed_calls = self.Codex(), []
+        resumed = self.engine(codex=resumed_codex,
+                              harness_runner=lambda *a, **k: resumed_calls.append(1)).run(
+            self.manifest(), execute=True, resume=True)
+        self.assertEqual("BLOCKED", resumed["state"])
+        self.assertEqual("FINAL_HARNESS_STATE_INCOMPLETE", resumed["stop_reason"])
+        self.assertEqual([], resumed_calls); self.assertEqual([], resumed_codex.prompts)
+        self.assertEqual(1, len(harness_calls))
+
+    def test_final_harness_complete_pass_crash_before_stop_resumes_ready_to_commit(self):
+        harness_calls = []
+        harness = self.passing_harness(harness_calls)
+        with patch.object(PhaseEngine, "_stop", side_effect=SystemExit("crash before stop")):
+            with self.assertRaises(SystemExit):
+                self.engine(harness_runner=harness).run(self.manifest(), execute=True)
+        self.assertEqual(1, len(harness_calls))
+        saved = json.loads((self.root / ".loop/state.json").read_text(encoding="utf-8"))["state"]
+        self.assertEqual("COMPLETE", saved["final_harness"]["stage"])
+        self.assertEqual("RUNNING", saved["state"])
+        resumed_codex = self.Codex()
+        resumed = self.engine(codex=resumed_codex, harness_runner=harness).run(
+            self.manifest(), execute=True, resume=True)
+        self.assertEqual("READY_TO_COMMIT", resumed["state"])
+        self.assertEqual(1, len(harness_calls)); self.assertEqual([], resumed_codex.prompts)
+        # Repeated resume of an already-terminal Phase must not call the harness again.
+        resumed_again = self.engine(codex=self.Codex(), harness_runner=harness).run(
+            self.manifest(), execute=True, resume=True)
+        self.assertEqual("READY_TO_COMMIT", resumed_again["state"])
+        self.assertEqual(1, len(harness_calls))
+
+    def test_final_harness_complete_fail_crash_before_stop_resumes_failed(self):
+        harness_calls = []
+        def harness(root, profile, **kwargs):
+            harness_calls.append(1)
+            return 1, {"state": "FAILED", "profile": profile.name, "steps": [], "run_id": "harness"}
+        with patch.object(PhaseEngine, "_stop", side_effect=SystemExit("crash before stop")):
+            with self.assertRaises(SystemExit):
+                self.engine(harness_runner=harness).run(self.manifest(), execute=True)
+        self.assertEqual(1, len(harness_calls))
+        saved = json.loads((self.root / ".loop/state.json").read_text(encoding="utf-8"))["state"]
+        self.assertEqual("COMPLETE", saved["final_harness"]["stage"])
+        resumed_codex = self.Codex()
+        resumed = self.engine(codex=resumed_codex, harness_runner=harness).run(
+            self.manifest(), execute=True, resume=True)
+        self.assertEqual("FAILED", resumed["state"])
+        self.assertEqual("FINAL_HARNESS_FAILED", resumed["stop_reason"])
+        self.assertEqual(1, len(harness_calls)); self.assertEqual([], resumed_codex.prompts)
+
+    def test_final_harness_complete_resume_ignores_live_budget_and_preflight(self):
+        harness_calls = []
+        with patch.object(PhaseEngine, "_stop", side_effect=SystemExit("crash before stop")):
+            with self.assertRaises(SystemExit):
+                self.engine(harness_runner=self.passing_harness(harness_calls)).run(
+                    self.manifest(), execute=True)
+        state_path = self.root / ".loop/state.json"
+        original = json.loads(state_path.read_text(encoding="utf-8"))
+
+        class RejectingBudget:
+            def __init__(inner): inner.calls = []
+            def check(inner, role, *, starting_checkpoint=False):
+                inner.calls.append((role, starting_checkpoint))
+                raise AssertionError("durable COMPLETE must not inspect live provider budget")
+
+        for name, code, report_state, expected_state, expected_reason in (
+                ("pass", 0, "PASSED", "READY_TO_COMMIT", "PHASE_COMPLETE"),
+                ("fail", 1, "FAILED", "FAILED", "FINAL_HARNESS_FAILED")):
+            with self.subTest(result=name):
+                wrapper = json.loads(json.dumps(original))
+                wrapper["state"]["final_harness"]["exit_code"] = code
+                wrapper["state"]["final_harness"]["state"] = report_state
+                state_path.write_text(json.dumps(wrapper), encoding="utf-8")
+                budget, preflight_calls, resumed_harness, codex = RejectingBudget(), [], [], self.Codex()
+                def forbidden_preflight():
+                    preflight_calls.append(1)
+                    raise AssertionError("durable COMPLETE must not run executable preflight")
+                resumed = PhaseEngine(
+                    self.root, self.config, self.Maker(self.root), codex, budget,
+                    harness_runner=lambda *a, **k: resumed_harness.append(1),
+                    preflight=forbidden_preflight,
+                ).run(self.manifest(), execute=True, resume=True)
+                self.assertEqual(expected_state, resumed["state"])
+                self.assertEqual(expected_reason, resumed["stop_reason"])
+                self.assertEqual([], budget.calls); self.assertEqual([], preflight_calls)
+                self.assertEqual([], resumed_harness); self.assertEqual([], codex.prompts)
+        self.assertEqual(1, len(harness_calls))
+
+    def test_final_harness_pending_and_completed_legacy_states_block_before_live_gates(self):
+        harness_calls = []
+        with patch.object(PhaseEngine, "_stop", side_effect=SystemExit("crash before stop")):
+            with self.assertRaises(SystemExit):
+                self.engine(harness_runner=self.passing_harness(harness_calls)).run(
+                    self.manifest(), execute=True)
+        state_path = self.root / ".loop/state.json"
+        original = json.loads(state_path.read_text(encoding="utf-8"))
+
+        class ForbiddenBudget:
+            def check(inner, role, *, starting_checkpoint=False):
+                raise AssertionError("ambiguous harness state must block before budget")
+
+        forms = (
+            ("pending", {"stage": "PENDING_CALL"}, False),
+            ("none", None, False),
+            ("missing", None, True),
+            ("string", "bad", False),
+            ("number", 7, False),
+            ("list", [], False),
+            ("missing_stage", {}, False),
+            ("none_stage", {"stage": None}, False),
+            ("list_stage", {"stage": []}, False),
+            ("dict_stage", {"stage": {}}, False),
+            ("number_stage", {"stage": 1}, False),
+            ("unsupported", {"stage": "UNKNOWN"}, False),
+        )
+        for name, value, remove in forms:
+            with self.subTest(form=name):
+                wrapper = json.loads(json.dumps(original))
+                if remove:
+                    wrapper["state"].pop("final_harness")
+                else:
+                    wrapper["state"]["final_harness"] = value
+                state_path.write_text(json.dumps(wrapper), encoding="utf-8")
+                preflight_calls, resumed_harness, codex = [], [], self.Codex()
+                def forbidden_preflight():
+                    preflight_calls.append(1)
+                    raise AssertionError("ambiguous harness state must block before preflight")
+                resumed = PhaseEngine(
+                    self.root, self.config, self.Maker(self.root), codex, ForbiddenBudget(),
+                    harness_runner=lambda *a, **k: resumed_harness.append(1),
+                    preflight=forbidden_preflight,
+                ).run(self.manifest(), execute=True, resume=True)
+                self.assertEqual("BLOCKED", resumed["state"])
+                self.assertEqual("FINAL_HARNESS_STATE_INCOMPLETE", resumed["stop_reason"])
+                self.assertEqual([], preflight_calls); self.assertEqual([], resumed_harness)
+                self.assertEqual([], codex.prompts)
+        self.assertEqual(1, len(harness_calls))
+
+    def test_final_harness_malformed_complete_matrix_fails_closed_before_live_gates(self):
+        harness_calls = []
+        with patch.object(PhaseEngine, "_stop", side_effect=SystemExit("crash before stop")):
+            with self.assertRaises(SystemExit):
+                self.engine(harness_runner=self.passing_harness(harness_calls)).run(
+                    self.manifest(), execute=True)
+        state_path = self.root / ".loop/state.json"
+        original = json.loads(state_path.read_text(encoding="utf-8"))
+        mutations = (
+            ("snapshot_none", lambda h: h.update(verified_snapshot=None)),
+            ("snapshot_list", lambda h: h.update(verified_snapshot=[])),
+            ("digest_none", lambda h: h.update(verified_snapshot_digest=None)),
+            ("protected_none", lambda h: h.update(verified_protected=None)),
+            ("head_none", lambda h: h.update(verified_head=None)),
+            ("staged_none", lambda h: h.update(verified_staged=None)),
+            ("guard_none", lambda h: h.update(guard=None)),
+            ("guard_list", lambda h: h.update(guard=[])),
+            ("guard_missing", lambda h: h["guard"].pop("head_violation")),
+            ("report_state_wrong_type", lambda h: h.update(state=[])),
+            ("exit_code_wrong_type", lambda h: h.update(exit_code="0")),
+        )
+
+        class ForbiddenBudget:
+            def check(inner, role, *, starting_checkpoint=False):
+                raise AssertionError("malformed COMPLETE must block before budget")
+
+        for name, mutate in mutations:
+            with self.subTest(mutation=name):
+                wrapper = json.loads(json.dumps(original))
+                mutate(wrapper["state"]["final_harness"])
+                state_path.write_text(json.dumps(wrapper), encoding="utf-8")
+                preflight_calls, resumed_harness, codex = [], [], self.Codex()
+                def forbidden_preflight():
+                    preflight_calls.append(1)
+                    raise AssertionError("malformed COMPLETE must block before preflight")
+                resumed = PhaseEngine(
+                    self.root, self.config, self.Maker(self.root), codex, ForbiddenBudget(),
+                    harness_runner=lambda *a, **k: resumed_harness.append(1),
+                    preflight=forbidden_preflight,
+                ).run(self.manifest(), execute=True, resume=True)
+                self.assertEqual("BLOCKED", resumed["state"])
+                self.assertEqual("FINAL_HARNESS_STATE_INCOMPLETE", resumed["stop_reason"])
+                self.assertEqual([], preflight_calls); self.assertEqual([], resumed_harness)
+                self.assertEqual([], codex.prompts)
+        self.assertEqual(1, len(harness_calls))
+
+    def test_final_harness_complete_snapshot_mismatch_blocks_without_rerun(self):
+        harness_calls = []
+        harness = self.passing_harness(harness_calls)
+        state = self.engine(harness_runner=harness).run(self.manifest(), execute=True)
+        self.assertEqual("READY_TO_COMMIT", state["state"]); self.assertEqual(1, len(harness_calls))
+        state_path = self.root / ".loop" / "state.json"
+        wrapper = json.loads(state_path.read_text(encoding="utf-8"))
+        wrapper["state"]["final_harness"]["verified_head"] = "0" * 40
+        state_path.write_text(json.dumps(wrapper), encoding="utf-8")
+        class ForbiddenBudget:
+            def check(inner, role, *, starting_checkpoint=False):
+                raise AssertionError("COMPLETE snapshot mismatch must block before budget")
+        preflight_calls, resumed_codex = [], self.Codex()
+        def forbidden_preflight():
+            preflight_calls.append(1)
+            raise AssertionError("COMPLETE snapshot mismatch must block before preflight")
+        resumed = PhaseEngine(
+            self.root, self.config, self.Maker(self.root), resumed_codex, ForbiddenBudget(),
+            harness_runner=harness, preflight=forbidden_preflight,
+        ).run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("BLOCKED", resumed["state"])
+        self.assertEqual("FINAL_HARNESS_SNAPSHOT_MISMATCH", resumed["stop_reason"])
+        self.assertEqual([], preflight_calls)
+        self.assertEqual(1, len(harness_calls)); self.assertEqual([], resumed_codex.prompts)
+
+    def test_final_harness_not_started_resume_keeps_live_gates_and_single_call_order(self):
+        with patch.object(PhaseEngine, "_phase_verify_then_harness", side_effect=SystemExit("before gate")):
+            with self.assertRaises(SystemExit):
+                self.engine().run(self.manifest(), execute=True)
+
+        class CountingBudget:
+            def __init__(inner, delegate): inner.delegate, inner.calls = delegate, []
+            def check(inner, role, *, starting_checkpoint=False):
+                inner.calls.append((role, starting_checkpoint))
+                return inner.delegate.check(role, starting_checkpoint=starting_checkpoint)
+
+        budget, preflight_calls, harness_calls, codex = CountingBudget(self.budget()), [], [], self.Codex(["PASS"])
+        def preflight():
+            preflight_calls.append(1)
+            return None
+        resumed = PhaseEngine(
+            self.root, self.config, self.Maker(self.root), codex, budget,
+            harness_runner=self.passing_harness(harness_calls), preflight=preflight,
+        ).run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("READY_TO_COMMIT", resumed["state"], resumed)
+        self.assertGreaterEqual(len(budget.calls), 3)
+        self.assertEqual([1], preflight_calls)
+        self.assertEqual(1, len(codex.prompts)); self.assertEqual(1, len(harness_calls))
+
+    def test_final_harness_malformed_and_legacy_state_fail_closed_without_call(self):
+        harness_calls = []
+        harness = self.passing_harness(harness_calls)
+        state = self.engine(harness_runner=harness).run(self.manifest(), execute=True)
+        self.assertEqual("READY_TO_COMMIT", state["state"]); self.assertEqual(1, len(harness_calls))
+        state_path = self.root / ".loop" / "state.json"
+        original_wrapper = json.loads(state_path.read_text(encoding="utf-8"))
+        original_harness = original_wrapper["state"]["final_harness"]
+        mutations = (
+            ("legacy_none", lambda h: None),
+            ("legacy_missing_stage", lambda h: {k: v for k, v in h.items() if k != "stage"}),
+            ("missing_snapshot_digest", lambda h: {k: v for k, v in h.items() if k != "verified_snapshot_digest"}),
+            ("not_a_dict", lambda h: "corrupted"),
+        )
+        for name, mutate in mutations:
+            with self.subTest(mutation=name):
+                wrapper = json.loads(json.dumps(original_wrapper))
+                wrapper["state"]["final_harness"] = mutate(original_harness)
+                state_path.write_text(json.dumps(wrapper), encoding="utf-8")
+                resumed = self.engine(codex=self.Codex(), harness_runner=harness).run(
+                    self.manifest(), execute=True, resume=True)
+                self.assertEqual("BLOCKED", resumed["state"])
+                self.assertEqual("FINAL_HARNESS_STATE_INCOMPLETE", resumed["stop_reason"])
+        self.assertEqual(1, len(harness_calls))
+
+    def test_completed_legacy_none_and_missing_harness_state_never_run_verifier_or_harness(self):
+        harness_calls = []
+        harness = self.passing_harness(harness_calls)
+        state = self.engine(harness_runner=harness).run(self.manifest(), execute=True)
+        self.assertEqual("READY_TO_COMMIT", state["state"]); self.assertEqual(1, len(harness_calls))
+        state_path = self.root / ".loop/state.json"
+        original = json.loads(state_path.read_text(encoding="utf-8"))
+        for name in ("none", "missing"):
+            with self.subTest(form=name):
+                wrapper = json.loads(json.dumps(original))
+                if name == "none":
+                    wrapper["state"]["final_harness"] = None
+                else:
+                    wrapper["state"].pop("final_harness")
+                state_path.write_text(json.dumps(wrapper), encoding="utf-8")
+                codex, resumed_calls = self.Codex(), []
+                resumed = self.engine(
+                    codex=codex, harness_runner=lambda *a, **k: resumed_calls.append(1)
+                ).run(self.manifest(), execute=True, resume=True)
+                self.assertEqual("BLOCKED", resumed["state"])
+                self.assertEqual("FINAL_HARNESS_STATE_INCOMPLETE", resumed["stop_reason"])
+                self.assertNotEqual("READY_TO_COMMIT", resumed["state"])
+                self.assertEqual([], codex.prompts); self.assertEqual([], resumed_calls)
+        self.assertEqual(1, len(harness_calls))
+
+    def test_incomplete_checkpoint_legacy_none_harness_state_keeps_checkpoint_recovery(self):
+        stopped = self.engine(codex=self.Codex(failure_at=2)).run(self.manifest(), execute=True)
+        self.assertEqual(["cp1"], stopped["completed_checkpoints"])
+        state_path = self.root / ".loop/state.json"
+        wrapper = json.loads(state_path.read_text(encoding="utf-8"))
+        wrapper["state"]["final_harness"] = None
+        state_path.write_text(json.dumps(wrapper), encoding="utf-8")
+        maker, codex, harness_calls = self.Maker(self.root), self.Codex(["PASS", "PASS"]), []
+        resumed = self.engine(
+            maker=maker, codex=codex, harness_runner=self.passing_harness(harness_calls)
+        ).run(self.manifest(), execute=True, resume=True)
+        self.assertEqual("READY_TO_COMMIT", resumed["state"], resumed)
+        self.assertEqual(1, maker.calls); self.assertEqual(2, len(codex.prompts))
+        self.assertEqual(1, len(harness_calls))
+
+    def test_no_phase_verifier_pass_leaves_harness_not_started(self):
+        harness_calls = []
+        state = self.engine(
+            codex=self.Codex(["PASS", "PASS", "FAIL"]),
+            harness_runner=lambda *a, **k: harness_calls.append(1),
+        ).run(self.manifest(), execute=True)
+        self.assertEqual("FAILED", state["state"])
+        self.assertEqual("PHASE_VERIFIER_FAILED", state["stop_reason"])
+        self.assertEqual({"stage": "NOT_STARTED"}, state["final_harness"])
+        self.assertEqual([], harness_calls)
+
     def test_post_call_cost_overrun_blocks_before_verifier(self):
         self.config["claude_max_budget_usd"] = 0.1
         value = dict(self.raw_manifest); value["max_claude_cost_usd"] = 0.15
@@ -1220,7 +1781,7 @@ class PhaseEngineTests(unittest.TestCase):
         self.assertEqual([None, "resume-session", None], maker.sessions)
         self.assertAlmostEqual(0.5, state["claude_cost_usd"], places=6)
         self.assertEqual(3, maker.calls); self.assertEqual(3, state["maker_calls"])
-        self.assertEqual(5, state["model_calls"])
+        self.assertEqual(6, state["model_calls"]); self.assertEqual(3, state["verifier_calls"])
 
     def test_max_turns_without_session_blocks_without_continuation(self):
         failure = ProcessFailure(MODEL_MAX_TURNS, "max turns", return_code=1,
@@ -1332,7 +1893,7 @@ class PhaseEngineTests(unittest.TestCase):
                                         f"post-crash-session-{inner.calls}", 0.05, 1)
         resumed_maker = ResumeMaker(self.root)
         resumed_engine = PhaseEngine(self.root, dict(self.config, max_maker_continuations=1), resumed_maker,
-                                     self.Codex(["PASS", "PASS"]), self.budget(), harness_runner=self.harness())
+                                     self.Codex(["PASS", "PASS", "PASS"]), self.budget(), harness_runner=self.harness())
         resumed = resumed_engine.run(self.manifest(), execute=True, resume=True)
         self.assertEqual("READY_TO_COMMIT", resumed["state"], resumed)
         self.assertEqual(2, resumed_maker.calls)
@@ -1400,7 +1961,7 @@ class PhaseEngineTests(unittest.TestCase):
                                         f"fresh-session-{inner.calls}", 0.05, 1)
         resumed_maker = ResumeMaker(self.root)
         resumed_engine = PhaseEngine(self.root, dict(self.config, max_api_connection_retries=1), resumed_maker,
-                                     self.Codex(["PASS", "PASS"]), self.budget(), harness_runner=self.harness())
+                                     self.Codex(["PASS", "PASS", "PASS"]), self.budget(), harness_runner=self.harness())
         resumed = resumed_engine.run(self.manifest(), execute=True, resume=True)
         self.assertEqual("READY_TO_COMMIT", resumed["state"], resumed)
         self.assertIsNone(resumed_maker.sessions[0])
@@ -1514,7 +2075,7 @@ class PhaseEngineTests(unittest.TestCase):
 
         resumed_maker = self.Maker(self.root)
         resumed = PhaseEngine(self.root, dict(self.config, max_maker_continuations=1), resumed_maker,
-                             self.Codex(["PASS", "PASS"]), self.budget(), harness_runner=self.harness()
+                             self.Codex(["PASS", "PASS", "PASS"]), self.budget(), harness_runner=self.harness()
                              ).run(self.manifest(), execute=True, resume=True)
         self.assertEqual("READY_TO_COMMIT", resumed["state"], resumed)
         self.assertEqual(2, resumed_maker.calls)
@@ -1523,7 +2084,7 @@ class PhaseEngineTests(unittest.TestCase):
         self.assertIsNone(resumed_maker.sessions[1])
         self.assertEqual(2, len(resumed["checkpoints"][0]["attempts"]))
         self.assertAlmostEqual(0.3, resumed["claude_cost_usd"], places=6)
-        self.assertEqual(5, resumed["model_calls"]); self.assertEqual(3, resumed["maker_calls"])
+        self.assertEqual(6, resumed["model_calls"]); self.assertEqual(3, resumed["maker_calls"])
 
     def test_api_retry_recovery_transition_persists_before_next_call_and_survives_crash(self):
         failure = ProcessFailure(API_CONNECTION_ERROR, "conn", return_code=1,
@@ -1547,14 +2108,14 @@ class PhaseEngineTests(unittest.TestCase):
 
         resumed_maker = self.Maker(self.root)
         resumed = PhaseEngine(self.root, dict(self.config, max_api_connection_retries=1), resumed_maker,
-                             self.Codex(["PASS", "PASS"]), self.budget(), harness_runner=self.harness()
+                             self.Codex(["PASS", "PASS", "PASS"]), self.budget(), harness_runner=self.harness()
                              ).run(self.manifest(), execute=True, resume=True)
         self.assertEqual("READY_TO_COMMIT", resumed["state"], resumed)
         self.assertIsNone(resumed_maker.sessions[0])
         self.assertNotIn("CONTINUE_CHECKPOINT", resumed_maker.prompts[0])
         self.assertEqual(2, len(resumed["checkpoints"][0]["attempts"]))
         self.assertAlmostEqual(0.2, resumed["claude_cost_usd"], places=6)
-        self.assertEqual(5, resumed["model_calls"]); self.assertEqual(3, resumed["maker_calls"])
+        self.assertEqual(6, resumed["model_calls"]); self.assertEqual(3, resumed["maker_calls"])
 
     def test_resume_missing_pending_call_after_recorded_recovery_decision_fails_closed(self):
         failure = ProcessFailure(MODEL_BUDGET_EXHAUSTED, "budget exhausted", return_code=1,
