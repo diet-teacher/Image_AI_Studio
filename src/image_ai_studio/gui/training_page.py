@@ -111,6 +111,15 @@ class TrainingPage(QWidget):
         self._close_pending = True
         self._on_stop_clicked()
 
+    def set_model_json_path(self, path: str) -> None:
+        """Model Designer 통합 전용의 작은 setter -- 기존 "Model JSON"
+        입력 위젯을 Browse 핸들러와 정확히 같은 방식으로 갱신한다.
+        `_build_request()` -> `build_training_request()` 경로가 읽는
+        필드도 바로 이 위젯이므로 두 번째 training request 경로를 만들지
+        않으며, 이후 사용자의 Browse/직접 입력/수동 수정이 그대로
+        authoritative하다."""
+        self._model_json_edit.setText(path)
+
     # -- UI 구성 -----------------------------------------------------------------
 
     def _build_ui(self) -> None:

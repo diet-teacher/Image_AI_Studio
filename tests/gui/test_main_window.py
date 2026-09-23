@@ -8,14 +8,16 @@ import threading
 from pathlib import Path
 
 import pytest
-from PySide6.QtWidgets import QMessageBox, QTabWidget
+from PySide6.QtWidgets import QFileDialog, QMessageBox, QTabWidget
 
 from image_ai_studio.application.folder_inference_controller import FolderInferenceController
 from image_ai_studio.application.inference_controller import InferenceController
 from image_ai_studio.application.training_controller import TrainingController
 from image_ai_studio.gui.inference_page import InferencePage
 from image_ai_studio.gui.main_window import MainWindow
+from image_ai_studio.gui.model_designer import ModelDesigner
 from image_ai_studio.gui.training_page import TrainingPage
+from image_ai_studio.model_definition.serialization import load_model_spec
 from image_ai_studio.inference.folder_inference import (
     FolderInferenceCancelled,
     FolderInferenceError,
@@ -88,10 +90,12 @@ def test_central_widget_is_tab_widget(qtbot) -> None:
     assert isinstance(window.centralWidget(), QTabWidget)
 
 
-def test_tab_widget_has_exactly_two_tabs(qtbot) -> None:
+def test_tab_widget_has_exactly_three_tabs(qtbot) -> None:
+    """CP2 adds one Model Designer tab; the existing Training/Inference tabs
+    are preserved, so the tab count goes from two to exactly three."""
     window = MainWindow()
     qtbot.addWidget(window)
-    assert window._tabs.count() == 2
+    assert window._tabs.count() == 3
 
 
 def test_training_page_added_exactly_once(qtbot) -> None:
@@ -108,13 +112,217 @@ def test_inference_page_added_exactly_once(qtbot) -> None:
     assert pages.count(window._inference_page) == 1
 
 
-def test_stable_references_to_both_pages(qtbot) -> None:
+def test_model_designer_added_exactly_once(qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    pages = [window._tabs.widget(i) for i in range(window._tabs.count())]
+    assert pages.count(window._model_designer) == 1
+    assert isinstance(window._model_designer, ModelDesigner)
+
+
+def test_stable_references_to_all_pages_in_order(qtbot) -> None:
     window = MainWindow()
     qtbot.addWidget(window)
     assert isinstance(window._training_page, TrainingPage)
     assert isinstance(window._inference_page, InferencePage)
+    assert isinstance(window._model_designer, ModelDesigner)
+    # Training/Inference identity + order preserved; designer appended last.
     assert window._tabs.widget(0) is window._training_page
     assert window._tabs.widget(1) is window._inference_page
+    assert window._tabs.widget(2) is window._model_designer
+
+
+def test_designer_tab_reselection_preserves_page_identity(qtbot) -> None:
+    """Navigating to the designer tab and back leaves every tab object and
+    the tab ordering untouched (re-entry preserves page state)."""
+    window = MainWindow()
+    qtbot.addWidget(window)
+    designer = window._model_designer
+    pages = [window._tabs.widget(i) for i in range(window._tabs.count())]
+    assert pages.count(designer) == 1
+
+    window._tabs.setCurrentWidget(designer)
+    window._tabs.setCurrentWidget(window._training_page)
+    window._tabs.setCurrentWidget(designer)
+
+    assert window._tabs.widget(0) is window._training_page
+    assert window._tabs.widget(1) is window._inference_page
+    assert window._tabs.widget(2) is designer
+
+
+# -- Model Designer -> Training handoff (CP2) ---------------------------------
+
+
+def _stub_save_dialog(monkeypatch, path) -> None:
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(path), ""))
+    )
+
+
+def test_designer_save_for_training_sets_training_path_and_navigates_once(tmp_path, monkeypatch, qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window._tabs.setCurrentWidget(window._model_designer)
+    target = tmp_path / "designed_model.json"
+    _stub_save_dialog(monkeypatch, target)
+
+    window._model_designer._on_use_for_training_clicked()
+
+    expected = str(Path(target).resolve())
+    assert target.exists()
+    # Ordinary canonical model-definition file: externally loadable.
+    load_model_spec(target)
+    # The designer output lands in the *existing* Model JSON input widget --
+    # the same field _build_request() reads on line
+    # `model_json_path=self._model_json_edit.text().strip()`.
+    assert window._training_page._model_json_edit.text() == expected
+    assert window._tabs.currentWidget() is window._training_page
+    assert window._training_page.is_training_active() is False
+
+
+def test_designer_navigation_happens_exactly_once_per_action(tmp_path, monkeypatch, qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window._tabs.setCurrentWidget(window._model_designer)
+    training_index = window._tabs.indexOf(window._training_page)
+    switches: list[int] = []
+    window._tabs.currentChanged.connect(switches.append)
+    _stub_save_dialog(monkeypatch, tmp_path / "m.json")
+
+    window._model_designer._on_use_for_training_clicked()
+
+    # Exactly one navigation, and it lands on Training.
+    assert switches == [training_index]
+    assert window._tabs.currentWidget() is window._training_page
+
+
+def test_designer_dialog_cancel_does_not_change_training_path_or_navigate(monkeypatch, qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window._training_page._model_json_edit.setText("/existing/authored.json")
+    window._tabs.setCurrentWidget(window._model_designer)
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: ("", ""))
+    )
+
+    window._model_designer._on_use_for_training_clicked()
+
+    assert window._training_page._model_json_edit.text() == "/existing/authored.json"
+    assert window._tabs.currentWidget() is window._model_designer
+    assert window._training_page.is_training_active() is False
+
+
+def test_designer_failed_save_does_not_change_training_path_or_navigate(tmp_path, monkeypatch, qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window._training_page._model_json_edit.setText("/existing/authored.json")
+    window._tabs.setCurrentWidget(window._model_designer)
+    window._model_designer._name_edit.setText("")  # invalid: ModelSpec.name must be non-empty
+    target = tmp_path / "must_not_exist.json"
+    _stub_save_dialog(monkeypatch, target)
+
+    window._model_designer._on_use_for_training_clicked()
+
+    assert not target.exists()
+    assert window._model_designer._status_label.text().startswith("Save failed:")
+    assert window._training_page._model_json_edit.text() == "/existing/authored.json"
+    assert window._tabs.currentWidget() is window._model_designer
+
+
+def test_designer_handoff_then_manual_override_is_authoritative(tmp_path, monkeypatch, qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    _stub_save_dialog(monkeypatch, tmp_path / "designed.json")
+
+    window._model_designer._on_use_for_training_clicked()
+    window._training_page._model_json_edit.setText("/manually/chosen.json")
+
+    # Manual override after the handoff wins -- the designer does not lock or
+    # re-assert the field.
+    assert window._training_page._model_json_edit.text() == "/manually/chosen.json"
+
+
+def test_designer_repeated_use_updates_path_each_time(tmp_path, monkeypatch, qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+
+    first = tmp_path / "first.json"
+    _stub_save_dialog(monkeypatch, first)
+    window._model_designer._on_use_for_training_clicked()
+    assert window._training_page._model_json_edit.text() == str(Path(first).resolve())
+
+    window._tabs.setCurrentWidget(window._model_designer)
+    second = tmp_path / "second.json"
+    _stub_save_dialog(monkeypatch, second)
+    window._model_designer._on_use_for_training_clicked()
+    assert window._training_page._model_json_edit.text() == str(Path(second).resolve())
+    assert window._tabs.currentWidget() is window._training_page
+
+
+def test_designer_signal_has_one_coordinator_call_per_emission(monkeypatch, qtbot) -> None:
+    """The single construction-time connection must not accumulate across
+    re-entry or repeated handoffs."""
+    window = MainWindow()
+    qtbot.addWidget(window)
+    calls: list[str] = []
+    original_setter = window._training_page.set_model_json_path
+
+    def record_path(path: str) -> None:
+        calls.append(path)
+        original_setter(path)
+
+    monkeypatch.setattr(window._training_page, "set_model_json_path", record_path)
+    training_index = window._tabs.indexOf(window._training_page)
+    navigation: list[int] = []
+    window._tabs.currentChanged.connect(navigation.append)
+
+    window._tabs.setCurrentWidget(window._model_designer)
+    navigation.clear()
+    window._model_designer.model_saved_for_training.emit("C:/models/first.json")
+    assert calls == ["C:/models/first.json"]
+    assert navigation == [training_index]
+
+    window._tabs.setCurrentWidget(window._model_designer)
+    navigation.clear()
+    window._model_designer.model_saved_for_training.emit("C:/models/second.json")
+    assert calls == ["C:/models/first.json", "C:/models/second.json"]
+    assert navigation == [training_index]
+
+
+def test_designer_training_reentry_preserves_both_page_states(tmp_path, monkeypatch, qtbot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    designer = window._model_designer
+    designer._name_edit.setText("reentry_model")
+    target = tmp_path / "reentry.json"
+    _stub_save_dialog(monkeypatch, target)
+
+    designer._on_use_for_training_clicked()
+    expected_path = str(Path(target).resolve())
+    assert window._tabs.currentWidget() is window._training_page
+
+    window._tabs.setCurrentWidget(designer)
+
+    assert designer._name_edit.text() == "reentry_model"
+    assert window._training_page._model_json_edit.text() == expected_path
+    assert window._tabs.count() == 3
+
+
+def test_designer_tab_does_not_join_close_coordination(tmp_path, monkeypatch, qtbot) -> None:
+    """The designer adds no async work: an idle close is still immediate and
+    the centralized close-pending state is untouched by the designer tab."""
+    window = MainWindow()
+    qtbot.addWidget(window)
+    _stub_save_dialog(monkeypatch, tmp_path / "m.json")
+    window._model_designer._on_use_for_training_clicked()
+    window.show()
+
+    window.close()
+
+    assert window.isVisible() is False
+    assert window._close_pending is False
+    assert window._training_close_done is True
+    assert window._inference_close_done is True
 
 
 # -- idle close ------------------------------------------------------------------

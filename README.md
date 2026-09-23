@@ -1854,6 +1854,21 @@ Phase 6~12 요청/스레드/취소/내보내기/닫기 계약과의 호환성, �
 
 ---
 
+## Phase 14: Model Designer
+
+`Model Designer` 탭에서 기존 canonical `ModelSpec`을 순서형 폼으로 만들고,
+불러오고, 검증한 뒤 JSON으로 원자적으로 저장할 수 있습니다. `Validate`는
+레이어별 shape 흐름을 보여 주며, `Save for Training...`은 검증과 저장이
+모두 성공한 경우에만 저장된 JSON의 정규화된 절대경로를 기존 `Training`
+탭의 `Model JSON` 입력에 전달하고 해당 탭으로 이동합니다. 이후 Browse나
+직접 입력으로 경로를 바꾸면 사용자가 선택한 값이 그대로 우선합니다.
+
+지원 레이어, 정밀 숫자 처리, 실패 시 rollback, 구조화된 branch 범위,
+CPU 통합 검증 및 명시적인 비범위는
+[Phase 14 Model Designer](docs/phase14_model_designer.md)를 참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON
@@ -1957,6 +1972,11 @@ Phase 6~12 요청/스레드/취소/내보내기/닫기 계약과의 호환성, �
 
 다음은 아직 구현되지 않았습니다:
 
+현재는 PySide6 기반 Training, Inference, Model Designer UI를 제공합니다.
+Training의 Stop과 폴더 추론의 Cancel은 GUI thread를 막거나 worker를 강제
+종료하지 않는 cooperative 방식입니다. 특히 폴더 추론 취소는 현재 처리 중인
+단일 이미지의 forward가 끝난 뒤 다음 이미지 경계에서 적용될 수 있습니다.
+
 * augmentation (RandomCrop, RandomHorizontalFlip, ColorJitter,
   RandAugment, AutoAugment 등)
 * `ImageFolder` 폴더의 자동 Train/Val/Test split (train/val/test로
@@ -2007,9 +2027,10 @@ Phase 6~12 요청/스레드/취소/내보내기/닫기 계약과의 호환성, �
 * 기존 `--checkpoint-out` 경로를 명시적으로 덮어쓰도록 강제하는 옵션
   (예: `--overwrite-checkpoint`) -- in-place resume(`--resume-from`과
   `--checkpoint-out`이 같은 경로) 외에는 항상 새 경로가 필요함 (Phase 4J)
-* `SIGTERM`/`SIGHUP` graceful shutdown, batch 중간 cancellation, GUI stop
-  button(Ctrl+C cooperative stop 자체는 Phase 4K에서 지원 -- 위 "Phase 4K"
-  절 참고)
+* `SIGTERM`/`SIGHUP` graceful shutdown, 현재 실행 중인 training batch나
+  단일-image forward 자체를 중간에 강제로 끊는 cancellation(Training GUI
+  Stop, 폴더 추론 Cancel 및 Ctrl+C cooperative stop은 각각의 안전한 경계에서
+  지원)
 * CPU AMP(CUDA FP16/BF16 AMP 자체는 각각 Phase 4S/4T에서 지원 -- 위
   "Phase 4S"/"Phase 4T" 절 참고), multi-GPU/distributed training,
   gradient accumulation, GradScaler tuning parameter CLI/config 노출,
@@ -2017,7 +2038,6 @@ Phase 6~12 요청/스레드/취소/내보내기/닫기 계약과의 호환성, �
 * 일반 DAG(`GraphSpec`/`NodeSpec`/`EdgeSpec`), long skip connection,
   중첩 `BranchSpec`
 * Detection/Segmentation training
-* PySide6 UI
 
 이 항목들은 구체적인 필요가 확인되기 전까지 의도적으로 보류하고
 있습니다 (과설계 방지). 각 Phase가 무엇을 의도적으로 제외했는지는

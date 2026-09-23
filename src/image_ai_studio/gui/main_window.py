@@ -1,14 +1,16 @@
-"""Phase 5C: top-level application window. Phase 6C CP4는 여기에 완성된
-`InferencePage`를 두 번째 tab으로 추가하고, training/inference 둘 다에
-대응하는 중앙집중형, non-blocking close coordination을 더한다 --
-`QThread.terminate()`나 GUI thread를 얼리는 blocking wait는 여전히
-쓰지 않는다."""
+"""Top-level application window.
+
+Training과 Inference의 중앙집중형 non-blocking close coordination을
+유지하면서 Phase 14 CP2의 Model Designer를 세 번째 tab으로 통합한다.
+`QThread.terminate()`나 GUI thread를 얼리는 blocking wait는 쓰지 않는다.
+"""
 from __future__ import annotations
 
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QMainWindow, QMessageBox, QTabWidget, QWidget
 
 from image_ai_studio.gui.inference_page import InferencePage
+from image_ai_studio.gui.model_designer import ModelDesigner
 from image_ai_studio.gui.training_page import TrainingPage
 
 
@@ -19,11 +21,24 @@ class MainWindow(QMainWindow):
 
         self._training_page = TrainingPage(self)
         self._inference_page = InferencePage(self)
+        # Phase 14 CP2: exactly one Model Designer, appended after the
+        # existing Training/Inference tabs so their objects, order, and
+        # lifecycle are untouched. The designer does no async work and is not
+        # part of close coordination.
+        self._model_designer = ModelDesigner(self)
 
         self._tabs = QTabWidget(self)
         self._tabs.addTab(self._training_page, "Training")
         self._tabs.addTab(self._inference_page, "Inference")
+        self._tabs.addTab(self._model_designer, "Model Designer")
         self.setCentralWidget(self._tabs)
+
+        # A successful, explicit "Save for Training" in the designer emits the
+        # normalized absolute canonical JSON path; MainWindow feeds it into
+        # TrainingPage's existing Model JSON input and shows the Training tab
+        # once. Failed/cancelled designer actions never emit, so this is a
+        # no-op for the training path. Connected exactly once.
+        self._model_designer.model_saved_for_training.connect(self._on_model_designer_saved)
 
         # -- centralized pending-close coordination (CP4) -----------------------
         self._close_pending = False
@@ -70,6 +85,19 @@ class MainWindow(QMainWindow):
             self._inference_page.request_close()
 
         event.ignore()  # 실제 close는 active했던 page들의 close_requested가 모두 도착한 뒤에만 일어난다
+
+    # -- Model Designer -> Training handoff (CP2) ------------------------------
+
+    def _on_model_designer_saved(self, model_json_path: str) -> None:
+        """Model Designer의 명시적 "Save for Training" 액션이 검증 +
+        canonical atomic save를 모두 통과한 뒤 emit한 정규화된 절대
+        경로를 받아 기존 TrainingPage Model JSON 입력에 넣고 Training
+        탭으로 정확히 한 번 이동한다. 학습을 시작하지 않고, 새 training
+        request/controller/worker 경로도 만들지 않는다 -- 이후 사용자의
+        Browse/수동 입력이 그대로 우선한다. 실패/취소한 designer 액션은
+        애초에 이 신호를 보내지 않으므로 training 경로에 대해 no-op이다."""
+        self._training_page.set_model_json_path(model_json_path)
+        self._tabs.setCurrentWidget(self._training_page)
 
     # -- per-page close-ready handlers -------------------------------------------
 

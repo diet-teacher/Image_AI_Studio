@@ -6,8 +6,10 @@ Start/Stop lifecycle, progress/finished/failed 표시, 반복 실행만
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
 import pytest
+from PySide6.QtWidgets import QFileDialog
 
 from image_ai_studio.application.training_controller import TrainingController
 from image_ai_studio.gui.training_page import TrainingPage, parse_class_weights
@@ -123,6 +125,78 @@ def test_initial_state(qtbot) -> None:
     assert page._scheduler_factor_spin.isEnabled() is False  # scheduler 기본 None
     assert page._gradient_clip_spin.isEnabled() is False  # optional 기본 비활성
     assert page._export_torchscript_check.isChecked() is True  # backend 기본값과 일치
+
+
+# -- set_model_json_path(): Model Designer handoff into the existing field ------
+
+
+def test_set_model_json_path_updates_existing_model_json_widget(tmp_path, qtbot) -> None:
+    page = TrainingPage(controller=TrainingController(backend=lambda *a, **k: _fake_result()))
+    qtbot.addWidget(page)
+
+    page.set_model_json_path(str(tmp_path / "designed.json"))
+
+    assert page._model_json_edit.text() == str(tmp_path / "designed.json")
+
+
+def test_set_model_json_path_feeds_build_training_request(tmp_path, qtbot) -> None:
+    """The value set via the CP2 setter is consumed by the *existing*
+    _build_request -> build_training_request path, not a second request path."""
+    page = TrainingPage(controller=TrainingController(backend=lambda *a, **k: _fake_result()))
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+    handoff = tmp_path / "from_designer.json"
+    page.set_model_json_path(str(handoff))
+
+    request = page._build_request()
+
+    assert request.model_json_path == Path(handoff)
+
+
+def test_set_model_json_path_then_manual_edit_is_authoritative(tmp_path, qtbot) -> None:
+    page = TrainingPage(controller=TrainingController(backend=lambda *a, **k: _fake_result()))
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+    page.set_model_json_path(str(tmp_path / "from_designer.json"))
+
+    # A later Browse / direct typing overrides the handoff value.
+    page._model_json_edit.setText(str(tmp_path / "manually_chosen.json"))
+    request = page._build_request()
+
+    assert request.model_json_path == Path(tmp_path / "manually_chosen.json")
+
+
+def test_model_browse_after_handoff_is_authoritative(tmp_path, monkeypatch, qtbot) -> None:
+    page = TrainingPage(controller=TrainingController(backend=lambda *a, **k: _fake_result()))
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+    page.set_model_json_path(str(tmp_path / "from_designer.json"))
+    browsed = tmp_path / "browse_selected.json"
+    monkeypatch.setattr(
+        QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (str(browsed), ""))
+    )
+
+    page._on_browse_model_json()
+    request = page._build_request()
+
+    assert page._model_json_edit.text() == str(browsed)
+    assert request.model_json_path == browsed
+
+
+def test_set_model_json_path_does_not_start_training_or_change_lifecycle(tmp_path, qtbot) -> None:
+    controller = TrainingController(backend=lambda *a, **k: _fake_result())
+    page = TrainingPage(controller=controller)
+    qtbot.addWidget(page)
+
+    page.set_model_json_path(str(tmp_path / "designed.json"))
+
+    assert controller.state == "idle"
+    assert page.is_training_active() is False
+    assert page._thread is None
+    assert page._worker is None
+    assert page._start_button.isEnabled() is True
+    assert page._stop_button.isEnabled() is False
+    assert page._status_label.text() == "Idle"
 
 
 # -- widget -> request mapping ---------------------------------------------------
