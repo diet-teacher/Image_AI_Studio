@@ -192,4 +192,3 @@ def test_model_designer_to_real_cpu_training_graduation(
     ):
         assert (output_dir / artifact_name).is_file()
     assert model_spec_to_dict(load_model_spec(output_dir / "model_definition.json")) == expected_definition
-
