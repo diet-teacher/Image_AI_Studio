@@ -1,0 +1,28 @@
+{
+  "template": false,
+  "checkpoint_id": "phase15-cp3-artifact-integrity-cpu-graduation",
+  "objective": "Graduate portable bundle integrity through the existing GUI-selected training-to-inference path and document the exact compatibility and security boundary without expanding the public workflow.",
+  "acceptance_criteria": [
+    "InferencePage's existing canonical bundle auto-discovery continues to populate the same three request paths and therefore receives core integrity verification without duplicating hashing or manifest validation in Qt code.",
+    "The established single-image and folder inference GUI lifecycles, preview, progress, cooperative cancellation, export, rerun, thread cleanup, close coordination, and manual path override contracts remain unchanged.",
+    "A bounded local-CPU integration test performs the existing tiny ImageFolder training workflow, observes a valid manifest for the three canonical outputs, selects the produced bundle through the real GUI request path, and completes real single-image inference successfully.",
+    "The graduation test proves that changing one covered artifact after training is rejected before inference and that a copied legacy three-file bundle with no manifest remains usable through the existing compatibility path.",
+    "README and a focused Phase 15 document describe the fixed manifest filename, schema version, covered files, validation timing, training publication order, legacy absence behavior, explicit-path boundary, bounded SHA-256 checks, and recovery guidance accurately.",
+    "Documentation explicitly states that checksums detect accidental corruption and mixed/stale bundle members but provide no signature, provenance, confidentiality, or protection against a malicious party that can replace both artifacts and manifest.",
+    "No public application/controller/worker request API, existing artifact schema, dependency, launcher, packaging/installer, TorchScript format, CUDA behavior, automatic migration, or unrelated GUI feature is changed.",
+    "Tests are deterministic and bounded, use qtbot/local tmp_path/CPU only, inspect programmatic state rather than screenshots, and use no arbitrary sleeps, network, assertion deletion, assertion weakening, or unregistered marker.",
+    "Only the five allowed GUI/integration/documentation files are changed and no Git operation is performed."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/gui/inference_page.py",
+    "tests/gui/test_inference_page.py",
+    "tests/gui/test_training_inference_integration.py",
+    "README.md",
+    "docs/phase15_portable_artifact_integrity.md"
+  ],
+  "required_tests": [
+    "phase15_cp3_artifact_integrity_cpu_graduation"
+  ],
+  "claude_prompt": "Implement Phase 15 CP3 only in the five allowed files. Keep integrity logic in the core CP1/CP2 modules: the GUI must continue using its existing canonical bundle discovery and build_inference_request path without duplicating hashes, changing public APIs, or altering lifecycle behavior. Add bounded deterministic qtbot/local-CPU coverage that trains a tiny existing ImageFolder workflow, verifies the emitted manifest, selects the real bundle through the GUI path, runs real single-image inference, detects a changed covered artifact before inference, and proves that a copied legacy bundle without a manifest still works. Update README minimally and add docs/phase15_portable_artifact_integrity.md describing the exact schema, publication/verification sequence, compatibility boundary, failure recovery, and security limitation that SHA-256 is not a signature or authenticity guarantee. Preserve all CP1-CP14 training/inference/GUI contracts. Do not modify core/application/worker/public APIs, dependencies, launchers, packaging, markers, other files, or existing assertion meaning; do not use network/CUDA/arbitrary sleep/screenshots or perform Git operations.",
+  "estimated_scope": "Small GUI compatibility check, one bounded CPU graduation, and documentation, approximately 250-450 changed lines across five files."
+}

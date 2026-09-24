@@ -1,0 +1,42 @@
+{
+  "phase_id": "phase15-portable-artifact-integrity-manifest",
+  "objective": "Make newly trained portable artifact bundles self-checking against accidental corruption and mixed-run files through a deterministic optional SHA-256 manifest, while preserving every existing artifact schema, public API, and legacy bundle path.",
+  "checkpoints": [
+    {"checkpoint_id": "phase15-cp1-artifact-integrity-manifest-contract", "goal": "tools/loop_orchestrator/goals/phase15-cp1.json"},
+    {"checkpoint_id": "phase15-cp2-training-inference-integrity-integration", "goal": "tools/loop_orchestrator/goals/phase15-cp2.json"},
+    {"checkpoint_id": "phase15-cp3-artifact-integrity-cpu-graduation", "goal": "tools/loop_orchestrator/goals/phase15-cp3.json"}
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/training/artifact_manifest.py",
+    "tests/training/test_artifact_manifest.py",
+    "src/image_ai_studio/training/imagefolder_workflow.py",
+    "tests/training/test_imagefolder_workflow.py",
+    "src/image_ai_studio/inference/single_image_inference.py",
+    "tests/inference/test_single_image_inference.py",
+    "src/image_ai_studio/gui/inference_page.py",
+    "tests/gui/test_inference_page.py",
+    "tests/gui/test_training_inference_integration.py",
+    "README.md",
+    "docs/phase15_portable_artifact_integrity.md"
+  ],
+  "allowed_tests": [
+    "phase15_cp1_artifact_integrity_manifest_contract",
+    "phase15_cp2_training_inference_integrity_integration",
+    "phase15_cp3_artifact_integrity_cpu_graduation"
+  ],
+  "final_harness_profile": "full",
+  "max_checkpoints": 3,
+  "max_rework_rounds": 1,
+  "max_model_calls": 16,
+  "max_claude_cost_usd": 7.5,
+  "max_elapsed_seconds": 14400,
+  "completion_conditions": [
+    "Each checkpoint durably records its pre-maker baseline, passes its fixed required-test allowlist, and receives a read-only checkpoint verifier PASS before the next checkpoint starts.",
+    "The fixed versioned manifest deterministically covers exactly model_definition.json, best_model_state_dict.pt, and class_mapping.json with byte sizes and SHA-256 digests, is atomically published last after successful training artifacts, and cannot remain as false current evidence after a failed or partial replacement.",
+    "Single-image inference validates a present same-directory canonical manifest before artifact deserialization, reports bounded actionable integrity failures, and preserves the established behavior of legacy bundles without a manifest and explicit noncanonical artifact paths.",
+    "A bounded real local-CPU training-to-GUI-inference graduation proves valid-bundle success, changed-artifact rejection, and legacy compatibility while all prior lifecycle, preview, folder inference, export, cancellation, cleanup, rerun, close, and manual-path contracts remain intact.",
+    "README and the Phase 15 document match the implementation and state clearly that checksums are not signatures or provenance, with no change to existing artifact/checkpoint/TorchScript schemas, public controller/worker/request/result APIs, dependencies, launcher, packaging/installer, CUDA behavior, or automatic migration.",
+    "No change occurs outside the eleven Phase files, no existing assertion is deleted or meaningfully weakened, and no network-dependent or arbitrary-sleep test is introduced.",
+    "After all checkpoint verifiers pass, the Phase-wide read-only verifier evaluates the complete manifest-scoped delta and completion conditions; only its PASS permits the full project harness to run exactly once, and any mutation, ambiguous durable state, failure, or incomplete evidence fails closed without automatic Phase restart."
+  ]
+}

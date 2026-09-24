@@ -1,0 +1,25 @@
+{
+  "template": false,
+  "checkpoint_id": "phase15-cp1-artifact-integrity-manifest-contract",
+  "objective": "Define a deterministic, versioned, atomically written integrity manifest for the existing portable training artifact bundle without changing any existing artifact format or public workflow API.",
+  "acceptance_criteria": [
+    "A focused training.artifact_manifest module defines one fixed manifest filename and a versioned JSON schema covering exactly model_definition.json, best_model_state_dict.pt, and class_mapping.json.",
+    "Each manifest entry records the canonical relative filename, exact byte size, and lowercase SHA-256 digest, and serialization order and formatting are deterministic across repeated writes for unchanged artifact bytes.",
+    "Manifest creation accepts only a single bundle directory and the three fixed regular non-symlink files inside it; missing files, directory entries, symlinks, absolute paths, traversal, duplicate entries, malformed digests, unsupported versions, and unexpected schema structure fail with bounded actionable errors.",
+    "The manifest is published with the existing atomic_write_text primitive so encoding or replacement failure cannot expose partial JSON and an existing destination remains intact when publication fails.",
+    "Loading and verification distinguish a missing optional manifest from a present invalid manifest, stream file hashing in bounded chunks, and never deserialize model or checkpoint payloads merely to calculate integrity.",
+    "The API and documentation in the module describe SHA-256 as corruption and mixed-bundle detection, not cryptographic authenticity or signature verification.",
+    "Existing model_definition.json, best_model_state_dict.pt, class_mapping.json, checkpoint, TorchScript, workflow-result, and request formats and public APIs remain unchanged.",
+    "Tests use local deterministic bytes and tmp_path to cover stable output, successful verification, changed bytes, changed size, missing artifacts, malformed/version-invalid manifests, unsafe paths, symlinks where supported, bounded chunked hashing, and atomic-write failure without network, CUDA, arbitrary sleeps, marker additions, assertion deletion, or assertion weakening.",
+    "Only src/image_ai_studio/training/artifact_manifest.py and tests/training/test_artifact_manifest.py are changed and no Git operation is performed."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/training/artifact_manifest.py",
+    "tests/training/test_artifact_manifest.py"
+  ],
+  "required_tests": [
+    "phase15_cp1_artifact_integrity_manifest_contract"
+  ],
+  "claude_prompt": "Implement Phase 15 CP1 only in src/image_ai_studio/training/artifact_manifest.py and tests/training/test_artifact_manifest.py. Add a deterministic versioned JSON integrity manifest for exactly the existing canonical portable files model_definition.json, best_model_state_dict.pt, and class_mapping.json. Record canonical relative names, byte sizes, and lowercase SHA-256 digests; hash files in bounded chunks and reject missing, non-regular, symlinked, unsafe, duplicate, malformed, or unsupported content with bounded actionable errors. Publish through the existing training.artifact_io.atomic_write_text primitive so failures preserve the prior destination. Expose a small typed API that later workflow and inference checkpoints can call to write, load, and verify a bundle, including an explicit distinction between an absent optional manifest and a present invalid one. Do not change existing artifact formats or public workflow/request/result APIs and do not claim signatures or malicious-tamper authenticity. Add focused deterministic tmp_path tests, preserve all existing assertions, add no marker/dependency, use no network/CUDA/sleep, touch no other file, and perform no Git operation.",
+  "estimated_scope": "Small integrity contract and focused unit tests, approximately 250-450 changed lines across two new files."
+}

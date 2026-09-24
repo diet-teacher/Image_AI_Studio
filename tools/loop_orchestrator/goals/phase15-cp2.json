@@ -1,0 +1,29 @@
+{
+  "template": false,
+  "checkpoint_id": "phase15-cp2-training-inference-integrity-integration",
+  "objective": "Publish the integrity manifest last from successful training runs and validate present same-directory manifests before single-image artifact deserialization while preserving legacy bundles and public APIs.",
+  "acceptance_criteria": [
+    "A successful run_imagefolder_training_workflow publishes the integrity manifest only after the three canonical portable artifacts have been written successfully, and the manifest verifies the final bytes actually present at the canonical paths.",
+    "If any canonical artifact write or manifest calculation/publication fails, the exception remains visible, no partial manifest is exposed, and a stale manifest from an older bundle cannot falsely attest the newly mixed artifact set.",
+    "The existing per-file atomicity contract remains explicit: this checkpoint does not claim or simulate a multi-file transaction and does not roll back already published canonical artifacts.",
+    "Single-image inference automatically verifies a present fixed-name manifest before loading model JSON, class mapping, or state dict when the three requested canonical paths identify one common bundle directory.",
+    "A present manifest with a missing, size-mismatched, digest-mismatched, renamed, or malformed artifact fails before model construction or image inference with a bounded actionable error that identifies the affected canonical artifact without exposing file contents.",
+    "A legacy bundle without a manifest continues through the established semantic validation and inference path unchanged, and explicit noncanonical artifact paths retain their existing behavior rather than silently binding to an unrelated sibling manifest.",
+    "Training and inference public dataclasses, controller/worker contracts, three canonical artifact schemas, checkpoint/TorchScript behavior, stop semantics, and result values remain backward compatible.",
+    "Deterministic CPU tests cover successful publication and inference, stale-manifest invalidation, artifact-write and manifest-write failures, corrupted JSON/state-dict/mapping bytes, manifest absence compatibility, and validation-before-deserialization without network, CUDA, arbitrary sleeps, assertion deletion, or assertion weakening.",
+    "Only the six allowed implementation/test files are changed and no GUI, documentation, dependency, launcher, packaging, or Git work is introduced."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/training/artifact_manifest.py",
+    "tests/training/test_artifact_manifest.py",
+    "src/image_ai_studio/training/imagefolder_workflow.py",
+    "tests/training/test_imagefolder_workflow.py",
+    "src/image_ai_studio/inference/single_image_inference.py",
+    "tests/inference/test_single_image_inference.py"
+  ],
+  "required_tests": [
+    "phase15_cp2_training_inference_integrity_integration"
+  ],
+  "claude_prompt": "Implement Phase 15 CP2 only in the six allowed files. Reuse the CP1 artifact_manifest API. Have the existing ImageFolder workflow invalidate any stale integrity manifest before it starts replacing canonical bundle members, then publish a new manifest last and atomically only after model_definition.json, best_model_state_dict.pt, and class_mapping.json are all successfully published. Preserve Phase 8 per-file atomicity and do not claim a multi-file transaction or add rollback. In single-image inference, before deserialization, verify a present fixed-name manifest only when the three requested paths are the exact canonical filenames in one common directory. Fail closed on a present invalid manifest with bounded actionable errors; preserve legacy no-manifest and explicit noncanonical-path behavior. Do not change public request/result/controller/worker APIs or existing artifact/checkpoint/TorchScript formats. Add deterministic CPU tests that prove ordering, stale-manifest safety, failures, tamper detection before deserialization, and backward compatibility. Do not modify GUI/docs/dependencies/markers, weaken or delete assertions, use network/CUDA/arbitrary sleep, touch any other file, or perform Git operations.",
+  "estimated_scope": "Medium training and inference integration with focused regressions, approximately 300-550 changed lines across six existing/new files."
+}
