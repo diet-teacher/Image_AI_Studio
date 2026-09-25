@@ -167,6 +167,14 @@ _EXPORT_ERROR_MAX_CHARS = 200
 """GUI thread에서 잡은 export 쓰기 오류를 상태 라벨에 보여줄 때의
 길이 상한(bounded error)."""
 
+_INFERENCE_ERROR_MAX_CHARS = 200
+"""Worker가 전달한 단일 이미지 오류의 첫 줄에 적용하는 표시 상한.
+
+Worker payload에는 진단용 traceback이 뒤따를 수 있고 예외 첫 줄에도
+사용자 제어 경로가 들어갈 수 있다. GUI는 traceback을 버리고 이 상한으로
+자른 간결한 설명만 표시한다.
+"""
+
 
 def _format_confidence(confidence: float) -> str:
     return f"{confidence:.2%}"
@@ -183,6 +191,18 @@ def _format_probabilities(probabilities: dict[str, float]) -> str:
         return _RESULT_PLACEHOLDER
     lines = [f"{class_name}: {value:.2%}" for class_name, value in sorted(probabilities.items())]
     return "\n".join(lines)
+
+
+def _bounded_inference_error(message: str) -> str:
+    first_line = message.splitlines()[0] if message else "Unknown error"
+    if len(first_line) <= _INFERENCE_ERROR_MAX_CHARS:
+        return first_line
+    # Preserve both the stable exception/category prefix and the actionable
+    # reason at the end (for example ``SHA-256 mismatch``), while eliding the
+    # potentially attacker-controlled long path in the middle.
+    tail_chars = 60
+    head_chars = _INFERENCE_ERROR_MAX_CHARS - tail_chars - 5
+    return first_line[:head_chars] + " ... " + first_line[-tail_chars:]
 
 
 def _folder_progress_text(total: int, completed: int, succeeded: int, failed: int) -> str:
@@ -705,8 +725,7 @@ class InferencePage(QWidget):
         # 이전 성공 결과가 남아 있으면 stale prediction으로 보일 수
         # 있으므로 실패 시에도 결과 영역을 초기화한다.
         self._clear_result_display()
-        first_line = message.splitlines()[0] if message else "Unknown error"
-        self._status_label.setText(f"Failed: {first_line}")
+        self._status_label.setText(f"Failed: {_bounded_inference_error(message)}")
 
     def _on_thread_finished(self) -> None:
         self._thread = None

@@ -39,6 +39,10 @@ from image_ai_studio.model_definition.builder import build_model
 from image_ai_studio.model_definition.serialization import load_model_spec, save_model_spec
 from image_ai_studio.model_definition.specs import ModelSpec
 from image_ai_studio.model_definition.validation import validate_model_spec
+from image_ai_studio.training.artifact_manifest import (
+    ARTIFACT_MANIFEST_FILENAME,
+    write_manifest,
+)
 from image_ai_studio.training.checkpoint import (
     load_training_checkpoint,
     save_state_dict,
@@ -584,6 +588,17 @@ def run_imagefolder_training_workflow(
     output_dir = request.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Phase 15 CP2: a manifest from an earlier run must stop being visible
+    # before the first canonical bundle member is replaced.  The three
+    # artifact writes below intentionally remain individually atomic (this is
+    # not a multi-file transaction), so a later failure may leave a mixed
+    # bundle.  Removing the old attestation first ensures that such a bundle
+    # cannot look verified.  ``unlink`` also removes a symlink without
+    # following it; a directory or an unlink error fails before any canonical
+    # artifact is changed.
+    artifact_manifest_path = output_dir / ARTIFACT_MANIFEST_FILENAME
+    artifact_manifest_path.unlink(missing_ok=True)
+
     # Phase 7 checkpoint 1: 이미 load_model_spec()으로 읽고
     # validate_model_spec()으로 검증까지 마친 바로 그 model_spec을 다시
     # 직렬화한다 -- request.model_json_path의 원본 bytes를 복사하지 않는다
@@ -690,6 +705,12 @@ def run_imagefolder_training_workflow(
         # 그대로 전파한다.
         ts_model_path.unlink(missing_ok=True)
         ts_metadata_path.unlink(missing_ok=True)
+
+    # Publish last, from the final bytes now present at all three canonical
+    # paths.  write_manifest() hashes those files itself and uses the existing
+    # atomic text writer.  If hashing/publication fails, the exception remains
+    # visible and the stale manifest removed above is not restored.
+    write_manifest(output_dir)
 
     return ImageFolderWorkflowResult(
         history=history,

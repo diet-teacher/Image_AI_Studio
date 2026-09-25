@@ -23,8 +23,10 @@ against a legacy-style output directory (one predating Phase 7, i.e. without
 regression guard too."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import shutil
 from pathlib import Path
 
 import pytest
@@ -46,6 +48,12 @@ _CLASS_COLORS = {"cat": (250, 250, 250), "dog": (5, 5, 5)}
 _CONFIDENCE_PATTERN = re.compile(r"^\d{1,3}\.\d{2}%$")
 _PROBABILITY_LINE_PATTERN = re.compile(r"^(.+): (\d{1,3}\.\d{2})%$")
 _DURATION_PATTERN = re.compile(r"^\d+\.\d{2} ms$")
+_PHASE15_CANONICAL_ARTIFACTS = (
+    "model_definition.json",
+    "best_model_state_dict.pt",
+    "class_mapping.json",
+)
+_PHASE15_MANIFEST_FILENAME = "artifact_manifest.json"
 
 
 def _make_dataset(root: Path) -> None:
@@ -153,6 +161,40 @@ def _assert_valid_inference_result(inference_page, class_mapping: dict) -> None:
     assert inference_page._image_path_edit.isEnabled() is True
     assert inference_page._device_combo.isEnabled() is True
     assert inference_page._precision_combo.isEnabled() is True
+
+
+def _independent_sha256(path: Path) -> str:
+    """Independent test-side digest; intentionally does not reuse production helpers."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(64 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _assert_phase15_manifest_matches_bundle(output_dir: Path) -> None:
+    manifest_path = output_dir / _PHASE15_MANIFEST_FILENAME
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert set(payload) == {"schema_version", "artifacts"}
+    assert payload["schema_version"] == 1
+    entries = payload["artifacts"]
+    assert [entry["filename"] for entry in entries] == list(_PHASE15_CANONICAL_ARTIFACTS)
+    for entry in entries:
+        assert set(entry) == {"filename", "size_bytes", "sha256"}
+        artifact = output_dir / entry["filename"]
+        assert entry["size_bytes"] == artifact.stat().st_size
+        assert entry["sha256"] == _independent_sha256(artifact)
+
+
+def _run_real_bundle_inference(inference_page, qtbot, output_dir: Path, image_path: Path) -> str:
+    inference_page._training_output_dir_edit.setText(str(output_dir))
+    inference_page._model_json_edit.clear()
+    inference_page._image_path_edit.setText(str(image_path))
+    inference_page._device_combo.setCurrentText("cpu")
+    inference_page._precision_combo.setCurrentText("fp32")
+    inference_page._on_run_clicked()
+    qtbot.waitUntil(lambda: inference_page._thread is None, timeout=30000)
+    return inference_page._status_label.text()
 
 
 def test_phase7_cp3_output_dir_alone_drives_inference_without_model_json(tmp_path: Path, qtbot) -> None:
@@ -329,3 +371,93 @@ def test_phase7_cp3_explicit_model_json_still_works_for_legacy_output_dir(tmp_pa
     _assert_valid_inference_result(inference_page, class_mapping)
 
     qtbot.waitUntil(lambda: _thread_cleaned_up(inference_page), timeout=5000)
+
+
+def test_phase15_cp3_manifest_cpu_graduation_and_gui_recovery(tmp_path: Path, qtbot) -> None:
+    """Graduate the optional manifest through real CPU training and GUI inference.
+
+    One bounded test covers valid, corrupt, mixed-run, missing, and legacy bundles.
+    Every inference uses the production page request/controller/worker/backend path.
+    """
+    dataset_root = tmp_path / "dataset"
+    _make_dataset(dataset_root)
+    image_path = dataset_root / "test" / "cat" / "0.png"
+    model_a = tmp_path / "model_a.json"
+    model_b = tmp_path / "model_b.json"
+    _write_model_json(model_a, "phase15_cp3_bundle_a")
+    _write_model_json(model_b, "phase15_cp3_bundle_b")
+    output_a = tmp_path / "run_a"
+    output_b = tmp_path / "run_b"
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    training_page = window._training_page
+    inference_page = window._inference_page
+
+    _run_real_training(
+        training_page,
+        qtbot,
+        model_json_path=model_a,
+        dataset_root=dataset_root,
+        output_dir=output_a,
+    )
+    _run_real_training(
+        training_page,
+        qtbot,
+        model_json_path=model_b,
+        dataset_root=dataset_root,
+        output_dir=output_b,
+    )
+    _assert_phase15_manifest_matches_bundle(output_a)
+    _assert_phase15_manifest_matches_bundle(output_b)
+    class_mapping = json.loads((output_a / "class_mapping.json").read_text(encoding="utf-8"))
+
+    window._tabs.setCurrentWidget(inference_page)
+
+    # A. A newly trained canonical bundle verifies and performs real inference.
+    assert _run_real_bundle_inference(inference_page, qtbot, output_a, image_path) == "Finished"
+    _assert_valid_inference_result(inference_page, class_mapping)
+
+    # B. Byte corruption is rejected before a result can be displayed.
+    corrupt = tmp_path / "corrupt"
+    shutil.copytree(output_a, corrupt)
+    with (corrupt / "best_model_state_dict.pt").open("ab") as stream:
+        stream.write(b"phase15-corruption")
+    corrupt_status = _run_real_bundle_inference(inference_page, qtbot, corrupt, image_path)
+    assert corrupt_status.startswith("Failed: ManifestError: artifact bundle integrity verification failed:")
+    assert len(corrupt_status) <= 208
+    assert "corrupted or mixed-bundle artifact" in corrupt_status
+    assert "Traceback" not in corrupt_status
+    assert inference_page._predicted_class_value_label.text() == "--"
+
+    # Recovery on the same page must clear the stale error and produce a result.
+    assert _run_real_bundle_inference(inference_page, qtbot, output_a, image_path) == "Finished"
+    _assert_valid_inference_result(inference_page, class_mapping)
+
+    # C. A real artifact from a second training run cannot be mixed into run A.
+    mixed = tmp_path / "mixed"
+    shutil.copytree(output_a, mixed)
+    shutil.copyfile(output_b / "model_definition.json", mixed / "model_definition.json")
+    mixed_status = _run_real_bundle_inference(inference_page, qtbot, mixed, image_path)
+    assert mixed_status.startswith("Failed: ManifestError: artifact bundle integrity verification failed:")
+    assert "corrupted or mixed-bundle artifact" in mixed_status
+    assert len(mixed_status) <= 208
+    assert "Traceback" not in mixed_status
+    assert inference_page._predicted_class_value_label.text() == "--"
+
+    # D. A covered canonical artifact missing from a manifested bundle fails closed.
+    missing = tmp_path / "missing"
+    shutil.copytree(output_a, missing)
+    (missing / "class_mapping.json").unlink()
+    missing_status = _run_real_bundle_inference(inference_page, qtbot, missing, image_path)
+    assert missing_status.startswith("Failed: ManifestError: artifact bundle integrity verification failed:")
+    assert "missing" in missing_status
+    assert len(missing_status) <= 208
+
+    # E. Removing only the optional manifest reproduces a legacy canonical bundle.
+    legacy = tmp_path / "legacy"
+    shutil.copytree(output_a, legacy)
+    (legacy / _PHASE15_MANIFEST_FILENAME).unlink()
+    assert _run_real_bundle_inference(inference_page, qtbot, legacy, image_path) == "Finished"
+    _assert_valid_inference_result(inference_page, class_mapping)
+    assert inference_page._thread is None and inference_page._worker is None

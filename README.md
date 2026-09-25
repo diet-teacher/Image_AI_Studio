@@ -1869,6 +1869,26 @@ CPU 통합 검증 및 명시적인 비범위는
 
 ---
 
+## Phase 15: 휴대 산출물 무결성 매니페스트
+
+새 ImageFolder 학습 결과에는 기존 세 canonical 산출물
+(`model_definition.json`, `best_model_state_dict.pt`, `class_mapping.json`)과
+함께 `artifact_manifest.json`이 마지막에 게시됩니다. 스키마 버전 1의 이
+파일은 세 산출물의 고정 순서, 바이트 크기와 SHA-256을 기록합니다. canonical
+bundle에 매니페스트가 있으면 단일 이미지 추론은 모델이나 체크포인트를
+역직렬화하기 전에 이를 검증하므로 우연한 손상, 누락 및 서로 다른 학습
+실행의 파일 혼합을 간결한 무결성 오류로 거부합니다.
+
+매니페스트가 없는 기존 3-file canonical bundle과 명시적으로 지정한
+noncanonical 파일 경로는 기존 호환 경로를 유지합니다. 체크섬은 서명이나
+출처 증명이 아니며, 공격자가 산출물과 매니페스트를 함께 바꾸는 경우를
+탐지하지 못합니다. 게시·검증 순서, directory alias와 artifact symlink
+경계, GUI 복구 동작 및 잔여 한계는
+[Phase 15 portable artifact integrity](docs/phase15_portable_artifact_integrity.md)를
+참고하세요.
+
+---
+
 ## 현재 지원 범위
 
 * Sequential 기반 Model Definition (`ModelSpec`/`LayerSpec`, JSON

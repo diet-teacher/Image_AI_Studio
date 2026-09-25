@@ -18,9 +18,15 @@ from image_ai_studio.inference.single_image_inference import (
     InferenceResult,
     run_single_image_inference,
 )
+from image_ai_studio.inference import single_image_inference
 from image_ai_studio.model_definition.builder import build_model
 from image_ai_studio.model_definition.serialization import save_model_spec
 from image_ai_studio.model_definition.specs import FlattenSpec, LinearSpec, ModelSpec, ReLUSpec
+from image_ai_studio.training.artifact_manifest import (
+    ARTIFACT_MANIFEST_FILENAME,
+    ManifestError,
+    write_manifest,
+)
 from image_ai_studio.training.checkpoint import save_state_dict
 from image_ai_studio.training.torchvision_dataset import build_transform, save_class_mapping
 
@@ -36,15 +42,19 @@ def _make_model_spec(name: str = "phase6b_inference_test", *, out_features: int 
 
 
 def _make_artifacts(
-    root: Path, *, classes: list[str] | None = None, out_features: int | None = None
+    root: Path,
+    *,
+    classes: list[str] | None = None,
+    out_features: int | None = None,
+    canonical: bool = False,
 ) -> tuple[Path, Path, Path, Path]:
     classes = classes if classes is not None else ["cat", "dog"]
     model_spec = _make_model_spec(out_features=out_features if out_features is not None else len(classes))
-    model_json_path = root / "model.json"
+    model_json_path = root / ("model_definition.json" if canonical else "model.json")
     save_model_spec(model_spec, model_json_path)
 
     model = build_model(model_spec)
-    state_dict_path = root / "state_dict.pt"
+    state_dict_path = root / ("best_model_state_dict.pt" if canonical else "state_dict.pt")
     save_state_dict(model, state_dict_path)
 
     class_mapping_path = root / "class_mapping.json"
@@ -57,9 +67,17 @@ def _make_artifacts(
 
 
 def _request(
-    root: Path, *, device: str = "cpu", precision: str = "fp32", classes: list[str] | None = None, **overrides
+    root: Path,
+    *,
+    device: str = "cpu",
+    precision: str = "fp32",
+    classes: list[str] | None = None,
+    canonical: bool = False,
+    **overrides,
 ) -> InferenceRequest:
-    model_json_path, state_dict_path, class_mapping_path, image_path = _make_artifacts(root, classes=classes)
+    model_json_path, state_dict_path, class_mapping_path, image_path = _make_artifacts(
+        root, classes=classes, canonical=canonical
+    )
     kwargs = dict(
         model_json_path=model_json_path,
         state_dict_path=state_dict_path,
@@ -126,6 +144,231 @@ def test_class_mapping_index_to_name_matches_classes_order(tmp_path: Path) -> No
     result = run_single_image_inference(request)
     assert set(result.probabilities.keys()) == {"alpha", "beta"}
     assert result.predicted_class in ("alpha", "beta")
+
+
+# -- Phase 15 optional bundle integrity gate -----------------------------------
+
+
+def test_canonical_bundle_with_valid_manifest_runs_inference(tmp_path: Path) -> None:
+    request = _request(tmp_path, canonical=True)
+    write_manifest(tmp_path)
+
+    result = run_single_image_inference(request)
+
+    assert result.predicted_class in ("cat", "dog")
+
+
+@pytest.mark.parametrize(
+    ("filename", "replacement"),
+    [
+        ("model_definition.json", b"{}"),
+        ("best_model_state_dict.pt", b"replaced state dict"),
+        ("class_mapping.json", b"{}"),
+    ],
+)
+def test_manifest_rejects_changed_canonical_artifact_before_deserialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    replacement: bytes,
+) -> None:
+    request = _request(tmp_path, canonical=True)
+    write_manifest(tmp_path)
+    (tmp_path / filename).write_bytes(replacement)
+
+    deserialized = False
+
+    def unexpected_load(*_args: object, **_kwargs: object) -> object:
+        nonlocal deserialized
+        deserialized = True
+        raise AssertionError("artifact deserialization must not run")
+
+    monkeypatch.setattr(single_image_inference, "load_model_spec", unexpected_load)
+    monkeypatch.setattr(single_image_inference, "load_class_mapping", unexpected_load)
+    monkeypatch.setattr(single_image_inference, "load_state_dict", unexpected_load)
+
+    with pytest.raises(ManifestError, match=rf"integrity verification failed:.*{filename}"):
+        run_single_image_inference(request)
+    assert deserialized is False
+
+
+def test_manifest_rejects_missing_canonical_artifact_before_deserialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = _request(tmp_path, canonical=True)
+    write_manifest(tmp_path)
+    request.state_dict_path.unlink()
+
+    called = False
+
+    def unexpected_load(*_args: object, **_kwargs: object) -> object:
+        nonlocal called
+        called = True
+        raise AssertionError("model JSON must not be loaded")
+
+    monkeypatch.setattr(single_image_inference, "load_model_spec", unexpected_load)
+    with pytest.raises(ManifestError) as exc_info:
+        run_single_image_inference(request)
+    message = str(exc_info.value)
+    assert "missing" in message.lower()
+    assert "best_model_state_dict.pt" in message
+    assert len(message) <= 1024
+    assert called is False
+
+
+@pytest.mark.parametrize("manifest_bytes", [b"{not json", b"\xff\xfe"])
+def test_present_malformed_manifest_fails_closed(
+    tmp_path: Path, manifest_bytes: bytes
+) -> None:
+    request = _request(tmp_path, canonical=True)
+    (tmp_path / ARTIFACT_MANIFEST_FILENAME).write_bytes(manifest_bytes)
+
+    with pytest.raises(ManifestError, match="artifact bundle integrity verification failed"):
+        run_single_image_inference(request)
+
+
+def test_legacy_canonical_bundle_without_manifest_remains_supported(tmp_path: Path) -> None:
+    request = _request(tmp_path, canonical=True)
+
+    result = run_single_image_inference(request)
+
+    assert result.predicted_class in ("cat", "dog")
+    assert not (tmp_path / ARTIFACT_MANIFEST_FILENAME).exists()
+
+
+def test_explicit_noncanonical_paths_ignore_unrelated_sibling_manifest(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    (tmp_path / ARTIFACT_MANIFEST_FILENAME).write_bytes(b"not valid JSON")
+
+    result = run_single_image_inference(request)
+
+    assert result.predicted_class in ("cat", "dog")
+
+
+def test_canonical_filenames_from_different_directories_do_not_bind_manifest(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    model_path, _state_path, _mapping_path, image_path = _make_artifacts(first, canonical=True)
+    _model2, state_path, mapping_path, _image2 = _make_artifacts(second, canonical=True)
+    (first / ARTIFACT_MANIFEST_FILENAME).write_bytes(b"not valid JSON")
+
+    request = InferenceRequest(
+        model_json_path=model_path,
+        state_dict_path=state_path,
+        class_mapping_path=mapping_path,
+        image_path=image_path,
+        device="cpu",
+        precision="fp32",
+    )
+    result = run_single_image_inference(request)
+
+    assert result.predicted_class in ("cat", "dog")
+
+
+def test_mixed_real_and_alias_parents_cannot_bypass_manifest_before_deserialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inject equal physical identity without requiring symlink privileges."""
+    request = _request(tmp_path, canonical=True)
+    write_manifest(tmp_path)
+    request.state_dict_path.write_bytes(b"replaced but intentionally not deserializable")
+    alias_parent = tmp_path / "bundle-alias"
+    mixed_request = InferenceRequest(
+        model_json_path=request.model_json_path,
+        state_dict_path=alias_parent / "best_model_state_dict.pt",
+        class_mapping_path=request.class_mapping_path,
+        image_path=request.image_path,
+        device="cpu",
+        precision="fp32",
+    )
+
+    expected_identity = "injected-same-physical-directory"
+
+    def injected_identity(path: Path) -> str:
+        assert path.parent in (tmp_path, alias_parent)
+        return expected_identity
+
+    deserialized = False
+
+    def unexpected_load(*_args: object, **_kwargs: object) -> object:
+        nonlocal deserialized
+        deserialized = True
+        raise AssertionError("artifact deserialization must not run")
+
+    monkeypatch.setattr(single_image_inference, "_physical_parent_identity", injected_identity)
+    monkeypatch.setattr(single_image_inference, "load_model_spec", unexpected_load)
+    monkeypatch.setattr(single_image_inference, "load_class_mapping", unexpected_load)
+    monkeypatch.setattr(single_image_inference, "load_state_dict", unexpected_load)
+
+    with pytest.raises(ManifestError) as exc_info:
+        run_single_image_inference(mixed_request)
+    message = str(exc_info.value)
+    assert "integrity verification failed" in message
+    assert "best_model_state_dict.pt" in message
+    assert "mismatch" in message.lower()
+    assert len(message) <= 1024
+    assert deserialized is False
+
+
+def test_valid_canonical_bundle_through_directory_alias_runs_inference(tmp_path: Path) -> None:
+    bundle_dir = tmp_path / "bundle"
+    bundle_dir.mkdir()
+    request = _request(bundle_dir, canonical=True)
+    write_manifest(bundle_dir)
+    alias_dir = tmp_path / "bundle-alias"
+    try:
+        alias_dir.symlink_to(bundle_dir, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are not supported/permitted in this environment: {exc}")
+
+    alias_request = InferenceRequest(
+        model_json_path=alias_dir / "model_definition.json",
+        state_dict_path=alias_dir / "best_model_state_dict.pt",
+        class_mapping_path=alias_dir / "class_mapping.json",
+        image_path=request.image_path,
+        device="cpu",
+        precision="fp32",
+    )
+    result = run_single_image_inference(alias_request)
+
+    assert result.predicted_class in ("cat", "dog")
+
+
+@pytest.mark.parametrize("resolution_error", [OSError("denied"), RuntimeError("symlink loop")])
+def test_canonical_parent_resolution_failure_fails_closed_before_deserialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resolution_error: Exception,
+) -> None:
+    request = _request(tmp_path, canonical=True)
+    write_manifest(tmp_path)
+    deserialized = False
+
+    def fail_resolve(_path: Path, *, strict: bool = False) -> Path:
+        assert strict is True
+        raise resolution_error
+
+    def unexpected_load(*_args: object, **_kwargs: object) -> object:
+        nonlocal deserialized
+        deserialized = True
+        raise AssertionError("artifact deserialization must not run")
+
+    monkeypatch.setattr(Path, "resolve", fail_resolve)
+    monkeypatch.setattr(single_image_inference, "load_model_spec", unexpected_load)
+
+    with pytest.raises(ManifestError) as exc_info:
+        run_single_image_inference(request)
+    message = str(exc_info.value)
+    assert "integrity verification failed" in message
+    assert "cannot resolve parent directory" in message
+    assert "model_definition.json" in message
+    assert type(resolution_error).__name__ in message
+    assert len(message) <= 1024
+    assert deserialized is False
 
 
 # -- preprocessing parity(가장 중요한 신규 테스트) -------------------------------

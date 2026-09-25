@@ -41,6 +41,7 @@ from image_ai_studio.inference.folder_inference import (
 )
 from image_ai_studio.inference.folder_result_export import FolderResultExportError
 from image_ai_studio.inference.single_image_inference import InferenceResult
+from image_ai_studio.training.artifact_manifest import ManifestError
 
 pytestmark = pytest.mark.phase6c_cp1_inference_page
 
@@ -448,6 +449,60 @@ def test_failed_run_shows_concise_error_and_restores_controls(tmp_path, qtbot) -
     assert controller.state == "failed"
     assert page._run_button.isEnabled() is True
     assert page._model_json_edit.isEnabled() is True
+
+
+def test_integrity_failure_is_bounded_cleans_up_and_allows_valid_rerun_during_close(
+    tmp_path, qtbot
+) -> None:
+    """A core ManifestError crosses the existing controller/worker boundary,
+    but the GUI exposes neither its traceback nor an unbounded attacker-controlled
+    path. Close remains deferred until cleanup, and the same page can be reused.
+    """
+    backend_started = threading.Event()
+    release_backend = threading.Event()
+    calls = 0
+    long_path = "C:/untrusted/" + ("nested-segment/" * 80) + "artifact.json"
+
+    def integrity_then_success(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            backend_started.set()
+            assert release_backend.wait(timeout=5)
+            raise ManifestError(
+                f"artifact bundle integrity verification failed: {long_path}: SHA-256 mismatch"
+            )
+        return _fake_inference_result()
+
+    controller = InferenceController(backend=integrity_then_success)
+    page = InferencePage(controller=controller)
+    qtbot.addWidget(page)
+    _fill_minimum_valid_fields(page, tmp_path)
+    close_requests: list[bool] = []
+    page.close_requested.connect(lambda: close_requests.append(True))
+
+    page._on_run_clicked()
+    assert backend_started.wait(timeout=5)
+    page.request_close()
+    assert close_requests == []
+    release_backend.set()
+
+    qtbot.waitUntil(lambda: page._thread is None, timeout=5000)
+    qtbot.waitUntil(lambda: close_requests == [True], timeout=5000)
+    failed_text = page._status_label.text()
+    assert failed_text.startswith("Failed: ManifestError: artifact bundle integrity verification failed:")
+    assert len(failed_text) <= len("Failed: ") + inference_page_module._INFERENCE_ERROR_MAX_CHARS
+    assert "SHA-256 mismatch" in failed_text
+    assert long_path not in failed_text
+    assert "Traceback" not in failed_text
+    assert page._predicted_class_value_label.text() == "--"
+    assert page._run_button.isEnabled() is True
+
+    page._on_run_clicked()
+    qtbot.waitUntil(lambda: page._thread is None, timeout=5000)
+    assert page._status_label.text() == "Finished"
+    assert page._predicted_class_value_label.text() == _fake_inference_result().predicted_class
+    assert calls == 2
 
 
 # -- overlap prevention -------------------------------------------------------------

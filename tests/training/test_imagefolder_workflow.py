@@ -28,6 +28,10 @@ from image_ai_studio.model_definition.specs import (
     ReLUSpec,
 )
 from image_ai_studio.parity.compare_outputs import CPU_FP32_ATOL, CPU_FP32_RTOL, compare_outputs
+from image_ai_studio.training.artifact_manifest import (
+    ARTIFACT_MANIFEST_FILENAME,
+    verify_manifest,
+)
 from image_ai_studio.training.checkpoint import load_state_dict, load_training_checkpoint
 from image_ai_studio.training.config import TrainingConfig
 from image_ai_studio.training.imagefolder_resume import (
@@ -50,7 +54,7 @@ from image_ai_studio.training.imagefolder_workflow import (
     _validate_precision_device_compatibility,
     run_imagefolder_training_workflow,
 )
-from image_ai_studio.training import artifact_io
+from image_ai_studio.training import artifact_io, imagefolder_workflow
 from image_ai_studio.training.loop import TrainingHistory, evaluate_classification_metrics, run_training
 from image_ai_studio.training.torchvision_dataset import load_class_mapping, make_imagefolder_datasets
 
@@ -2990,6 +2994,7 @@ def test_successful_run_publishes_loadable_canonical_artifacts_via_atomic_writer
 
     # 셋 다 원자적 primitive를 거쳤다.
     assert set(_CANONICAL_ATOMIC_ARTIFACTS) <= set(published)
+    assert published[-1] == ARTIFACT_MANIFEST_FILENAME
 
     # 셋 다 canonical 경로에 존재하고 established load 경로로 읽힌다.
     assert result.class_mapping_path == output_dir / "class_mapping.json"
@@ -2997,6 +3002,7 @@ def test_successful_run_publishes_loadable_canonical_artifacts_via_atomic_writer
     assert load_model_spec(output_dir / _MODEL_DEFINITION_FILENAME) == spec
     assert load_class_mapping(result.class_mapping_path)["classes"] == ["cat", "dog"]
     load_state_dict(build_model(spec), result.best_model_state_dict_path)  # torch.load 경로
+    verify_manifest(output_dir)
 
     assert _helper_temp_files(output_dir) == []
 
@@ -3108,4 +3114,59 @@ def test_failed_state_dict_publication_preserves_that_file_but_not_siblings_as_t
     # 먼저 게시된 형제: 트랜잭션 롤백 없음 -- 새 실행의 내용으로 이미 게시됨.
     assert load_model_spec(output_dir / _MODEL_DEFINITION_FILENAME) == second_spec
 
+    # The old manifest was invalidated before the first canonical replacement,
+    # so it cannot falsely attest this intentionally mixed, failed-run bundle.
+    assert not (output_dir / ARTIFACT_MANIFEST_FILENAME).exists()
+
     assert _helper_temp_files(output_dir) == []
+
+
+def test_manifest_publication_failure_is_visible_and_leaves_no_stale_attestation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed final manifest publication is not hidden or rolled back.
+
+    Canonical artifacts remain per-file atomic, but an older valid manifest is
+    removed before replacement and is never restored after this failure.
+    """
+    output_dir = tmp_path / "out"
+    first_root = tmp_path / "first_ds"
+    _make_two_class_dataset(first_root, ("ant", "bee"))
+    _run_once(_write_model_json(tmp_path / "first", _spec(name="first")), first_root, output_dir)
+    assert (output_dir / ARTIFACT_MANIFEST_FILENAME).is_file()
+
+    second_root = tmp_path / "second_ds"
+    _make_two_class_dataset(second_root, ("cat", "dog"))
+    second_spec = _second_spec()
+
+    def fail_manifest(_bundle_dir: Path) -> Path:
+        raise OSError("simulated manifest publication failure")
+
+    monkeypatch.setattr(imagefolder_workflow, "write_manifest", fail_manifest)
+    with pytest.raises(OSError, match="simulated manifest publication failure"):
+        _run_once(_write_model_json(tmp_path / "second", second_spec), second_root, output_dir)
+
+    assert not (output_dir / ARTIFACT_MANIFEST_FILENAME).exists()
+    assert load_model_spec(output_dir / _MODEL_DEFINITION_FILENAME) == second_spec
+    assert load_class_mapping(output_dir / "class_mapping.json")["classes"] == ["cat", "dog"]
+    load_state_dict(build_model(second_spec), output_dir / "best_model_state_dict.pt")
+    assert _helper_temp_files(output_dir) == []
+
+
+def test_manifest_invalidation_failure_prevents_any_canonical_replacement(
+    tmp_path: Path
+) -> None:
+    """An unremovable manifest-shaped directory fails before artifact writes."""
+    _make_standard_dataset(tmp_path)
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    manifest_path = output_dir / ARTIFACT_MANIFEST_FILENAME
+    manifest_path.mkdir()
+    sentinel = b"old model bytes"
+    (output_dir / _MODEL_DEFINITION_FILENAME).write_bytes(sentinel)
+
+    with pytest.raises(OSError):
+        _run_once(_write_model_json(tmp_path / "model", _spec()), tmp_path, output_dir)
+
+    assert manifest_path.is_dir()
+    assert (output_dir / _MODEL_DEFINITION_FILENAME).read_bytes() == sentinel

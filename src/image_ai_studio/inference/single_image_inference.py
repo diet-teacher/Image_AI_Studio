@@ -20,6 +20,7 @@ phase6a_inference_architecture.md §1-C/§3). `state_dict + ModelSpec`
 반환하는 함수 하나가 public surface의 전부다."""
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +31,12 @@ from PIL import Image
 from image_ai_studio.model_definition.builder import build_model
 from image_ai_studio.model_definition.serialization import load_model_spec
 from image_ai_studio.model_definition.validation import validate_model_spec
+from image_ai_studio.training.artifact_manifest import (
+    ARTIFACT_MANIFEST_FILENAME,
+    ManifestError,
+    load_manifest,
+    verify_manifest,
+)
 from image_ai_studio.training.checkpoint import load_state_dict
 from image_ai_studio.training.config import PRECISION_CHOICES
 from image_ai_studio.training.device import (
@@ -44,6 +51,12 @@ from image_ai_studio.training.torchvision_dataset import (
 )
 
 _CUDA_AUTOCAST_DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
+
+_CANONICAL_BUNDLE_FILENAMES = (
+    "model_definition.json",
+    "best_model_state_dict.pt",
+    "class_mapping.json",
+)
 
 
 @dataclass(frozen=True)
@@ -78,6 +91,63 @@ def _require_valid_precision(precision: str) -> None:
         raise ValueError(f"precision must be one of {PRECISION_CHOICES}, got {precision!r}")
 
 
+def _physical_parent_identity(path: Path) -> str:
+    """Return a platform-normalized identity for ``path``'s parent directory.
+
+    ``Path.resolve(strict=True)`` normalizes relative components and resolves
+    directory symlinks (and Windows junctions via the platform realpath
+    implementation).  Only the parent is resolved: the artifact path itself
+    remains untouched so ``verify_manifest()`` can still reject an individual
+    canonical artifact that is a symlink.  A canonical parent whose identity
+    cannot be established fails closed instead of silently bypassing integrity
+    verification.
+    """
+    try:
+        resolved_parent = path.parent.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ManifestError(
+            f"cannot resolve parent directory for canonical artifact {path.name!r} "
+            f"({type(exc).__name__})"
+        ) from exc
+    return os.path.normcase(os.fspath(resolved_parent))
+
+
+def _verify_canonical_bundle_manifest(request: InferenceRequest) -> None:
+    """Verify an optional Phase 15 manifest before any artifact is decoded.
+
+    Automatic binding is deliberately narrow: all three request paths must use
+    the exact canonical filenames and normalize to one common directory.
+    Explicit noncanonical paths retain the pre-Phase-15 behavior even if an
+    unrelated sibling manifest exists.  A completely absent manifest likewise
+    preserves legacy bundle compatibility, while a present invalid manifest
+    fails closed through the existing ``ValueError``-compatible boundary.
+    """
+    artifact_paths = (
+        Path(request.model_json_path),
+        Path(request.state_dict_path),
+        Path(request.class_mapping_path),
+    )
+    if tuple(path.name for path in artifact_paths) != _CANONICAL_BUNDLE_FILENAMES:
+        return
+
+    try:
+        physical_parents = {_physical_parent_identity(path) for path in artifact_paths}
+        if len(physical_parents) != 1:
+            return
+
+        # Keep an original request parent as the access path.  Resolving only
+        # for identity avoids erasing evidence that an artifact itself is a
+        # symlink, which verify_manifest() must continue to reject.
+        bundle_dir = artifact_paths[0].parent
+        manifest = load_manifest(bundle_dir)
+        if manifest is not None:
+            verify_manifest(bundle_dir)
+    except ManifestError as exc:
+        # ManifestError is already bounded and never embeds artifact contents.
+        # Add a stable high-level prefix for application/GUI error surfaces.
+        raise ManifestError(f"artifact bundle integrity verification failed: {exc}") from exc
+
+
 def run_single_image_inference(request: InferenceRequest) -> InferenceResult:
     """canonical inference 경로(Phase 6A §1-C):
 
@@ -102,6 +172,10 @@ def run_single_image_inference(request: InferenceRequest) -> InferenceResult:
     _validate_device(request.device)
     _require_valid_precision(request.precision)
     _validate_precision_device_compatibility(request.precision, request.device)
+
+    # This must precede model JSON, mapping, state-dict, and image decoding so
+    # corrupt/mixed canonical bundles are rejected without deserialization.
+    _verify_canonical_bundle_manifest(request)
 
     model_spec = load_model_spec(request.model_json_path)
     shape_trace = validate_model_spec(model_spec)
