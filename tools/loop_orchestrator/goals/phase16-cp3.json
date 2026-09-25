@@ -1,0 +1,37 @@
+{
+  "template": false,
+  "checkpoint_id": "phase16-cp3-auto-split-cpu-graduation",
+  "objective": "Graduate deterministic ImageFolder automatic splitting through the actual MainWindow training path with a bounded local-CPU run, preserve all Phase 0-15 contracts, and document the supported workflow and limitations accurately.",
+  "acceptance_criteria": [
+    "A focused qtbot integration drives the actual MainWindow and TrainingPage in automatic-split mode against a tiny local class-root ImageFolder dataset that has no pre-created train, val, or test directories.",
+    "The integration performs a real bounded CPU training run through the existing controller and Qt worker, observes progress and successful asynchronous cleanup, and verifies the established portable artifacts and integrity manifest rather than substituting fabricated backend results.",
+    "The test proves deterministic per-class split membership, complete and disjoint coverage, the selected seed and fractions reaching the workflow, class mapping preservation, and compatibility of produced artifacts with the existing single-image inference path.",
+    "A checkpoint/resume or equivalent workflow-level recovery exercise proves that unchanged automatic-split inputs are accepted and changed split identity fails before training or output publication.",
+    "Invalid automatic-split input is reported as a bounded actionable GUI failure, starts no training work when rejected during request construction, and can be corrected and rerun without stale error, stale progress, duplicate signal, leaked worker, or leaked thread state.",
+    "Prepared train/val/test mode receives focused regression coverage in the same final tree and all existing Training, Inference, Model Designer, preview, folder progress/cancellation/export, close coordination, portable-artifact, and integrity contracts remain intact.",
+    "README adds concise automatic-split usage and a relative link to docs/phase16_imagefolder_auto_split.md without unrelated restructuring or claims stronger than the implementation.",
+    "The detailed document states layout selection, deterministic stratification and rounding, seed/fraction validation, resume identity, lifecycle and failure behavior, automated evidence, manual checks, and limitations including no augmentation, file copying, content hashing, multi-label stratification, network data, or CUDA requirement.",
+    "The graduation uses local bounded fixtures, qtbot state observation, and CPU only; it performs no external download, network access, CUDA work, screenshot comparison, arbitrary sleep, busy loop, QThread.terminate(), assertion deletion, skip/xfail escape, or marker addition.",
+    "No public API is broken, no existing artifact or checkpoint schema is silently changed, no file outside the cumulative thirteen-file Phase allowlist is changed, and no Git operation is performed."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/training/torchvision_dataset.py",
+    "src/image_ai_studio/training/imagefolder_resume.py",
+    "tests/training/test_imagefolder_dataset.py",
+    "tests/training/test_imagefolder_resume.py",
+    "src/image_ai_studio/training/imagefolder_workflow.py",
+    "src/image_ai_studio/application/training_controller.py",
+    "src/image_ai_studio/gui/training_page.py",
+    "tests/training/test_imagefolder_workflow.py",
+    "tests/application/test_training_controller.py",
+    "tests/gui/test_training_page.py",
+    "tests/gui/test_imagefolder_auto_split_integration.py",
+    "README.md",
+    "docs/phase16_imagefolder_auto_split.md"
+  ],
+  "required_tests": [
+    "phase16_cp3_auto_split_cpu_graduation"
+  ],
+  "claude_prompt": "Implement Phase 16 CP3 only in the cumulative thirteen allowed files, retaining the completed CP1 and CP2 contracts. Add one bounded real-CPU qtbot graduation in tests/gui/test_imagefolder_auto_split_integration.py that uses the actual MainWindow, TrainingPage, controller, Qt worker, workflow, tiny local class-root ImageFolder data, and existing model/artifact/inference APIs. Prove automatic deterministic stratification, request propagation, real asynchronous training, progress, cleanup, portable artifacts plus integrity manifest, single-image inference compatibility, unchanged-input recovery, changed-identity rejection, invalid-input correction, and successful rerun without fabricated backends for the graduation path. Retain a prepared-layout regression. Update README minimally and add docs/phase16_imagefolder_auto_split.md with exact usage, deterministic allocation, validation, resume identity, lifecycle, evidence, manual checks, limitations, and explicit non-goals. Do not change files outside the allowlist, weaken assertions, add markers/dependencies, use CUDA/network/downloads/screenshots/sleeps, alter established schemas or public lifecycle behavior, or perform Git operations.",
+  "estimated_scope": "One bounded real-CPU GUI graduation plus focused cumulative regressions and documentation, approximately 320-560 changed lines across the cumulative thirteen files."
+}

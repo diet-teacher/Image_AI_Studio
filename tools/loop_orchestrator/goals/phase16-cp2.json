@@ -1,0 +1,34 @@
+{
+  "template": false,
+  "checkpoint_id": "phase16-cp2-auto-split-training-workflow-integration",
+  "objective": "Integrate the CP1 deterministic single-root split into the existing training request, workflow, and TrainingPage as an explicit opt-in mode while preserving every prepared-layout, lifecycle, artifact, cancellation, and resume contract.",
+  "acceptance_criteria": [
+    "ImageFolderWorkflowRequest and build_training_request gain only backward-compatible defaulted inputs needed to select prepared layout or automatic split and to carry validation/test fractions; existing callers that omit them retain prepared-layout behavior.",
+    "The workflow selects the CP1 automatic splitter only when explicitly requested, uses the request seed for deterministic membership, and otherwise calls the existing prepared train/val/test loader unchanged.",
+    "Automatic-split validation and dataset construction complete before training, checkpoint, history, portable artifacts, integrity manifest, or other output publication begins, so invalid input fails without partial new output.",
+    "Checkpoint and resume use the exact deterministic split membership and reject changed split configuration or source membership while preserving existing continuous-versus-resumed behavior and prepared-layout compatibility.",
+    "TrainingPage exposes one clear prepared-versus-automatic dataset layout choice and bounded validation/test fraction controls, with the established prepared mode selected by default and auto-split controls enabled only in automatic mode.",
+    "TrainingPage continues to construct work only through _build_request and build_training_request; no second controller, worker, training backend, or validation implementation is introduced.",
+    "All dataset-layout controls are disabled during active work and restored after success, failure, stop, and cleanup; request-build or split-validation failure starts no worker and leaves the page reusable.",
+    "Existing QThread/QtTrainingWorker ordering, cooperative stop, progress, close coordination, duplicate-run prevention, rerun, result presentation, Model Designer handoff, and portable artifact publication remain unchanged.",
+    "Focused tests cover request mapping, default compatibility, explicit automatic mode, invalid fractions, pre-output failure atomicity, resume mismatch, control state, failure recovery, stop, cleanup, and rerun using local images and fake backends where real training is not required.",
+    "No inference API, model-definition schema, artifact schema, worker public API, CLI behavior, dependency, launcher, marker registry, CUDA/network feature, assertion meaning, or file outside the cumulative ten-file allowlist is changed."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/training/torchvision_dataset.py",
+    "src/image_ai_studio/training/imagefolder_resume.py",
+    "tests/training/test_imagefolder_dataset.py",
+    "tests/training/test_imagefolder_resume.py",
+    "src/image_ai_studio/training/imagefolder_workflow.py",
+    "src/image_ai_studio/application/training_controller.py",
+    "src/image_ai_studio/gui/training_page.py",
+    "tests/training/test_imagefolder_workflow.py",
+    "tests/application/test_training_controller.py",
+    "tests/gui/test_training_page.py"
+  ],
+  "required_tests": [
+    "phase16_cp2_auto_split_training_workflow_integration"
+  ],
+  "claude_prompt": "Implement Phase 16 CP2 only in the cumulative ten allowed files, preserving the CP1 implementation and tests. Add backward-compatible defaulted request-builder/workflow fields for an explicit prepared versus automatic ImageFolder layout and validation/test fractions. Prepared mode must remain the default and follow the existing path unchanged. Automatic mode must call the CP1 deterministic splitter with the request seed, finish all validation before any output publication, and preserve exact split membership in checkpoint/resume compatibility. Add minimal TrainingPage controls and map them through the existing _build_request -> build_training_request -> ImageFolderWorkflowRequest path. Preserve the established controller, Qt worker/thread ordering, progress, cooperative stop, close coordination, cleanup, rerun, Model Designer handoff, artifacts, integrity manifest, and existing public behavior. Test default compatibility, request mapping, atomic validation failure, resume mismatch, control enablement, failure recovery, stop/cleanup, and rerun with local fixtures and fakes where appropriate. Do not modify CLI scripts, inference, model-definition, artifacts, workers, MainWindow, dependencies, markers, files outside the allowlist, or perform Git operations.",
+  "estimated_scope": "Medium workflow and GUI integration building on CP1, approximately 350-620 changed lines across the cumulative ten files."
+}

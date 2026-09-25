@@ -1,0 +1,44 @@
+{
+  "phase_id": "phase16-deterministic-imagefolder-auto-split",
+  "objective": "Let users train from one local class-root ImageFolder through a strict deterministic class-stratified Train/Validation/Test split, while keeping the existing prepared-split workflow as the compatible default and preserving all training, GUI, resume, artifact-integrity, and inference contracts.",
+  "checkpoints": [
+    {"checkpoint_id": "phase16-cp1-deterministic-imagefolder-auto-split-contract", "goal": "tools/loop_orchestrator/goals/phase16-cp1.json"},
+    {"checkpoint_id": "phase16-cp2-auto-split-training-workflow-integration", "goal": "tools/loop_orchestrator/goals/phase16-cp2.json"},
+    {"checkpoint_id": "phase16-cp3-auto-split-cpu-graduation", "goal": "tools/loop_orchestrator/goals/phase16-cp3.json"}
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/training/torchvision_dataset.py",
+    "src/image_ai_studio/training/imagefolder_resume.py",
+    "tests/training/test_imagefolder_dataset.py",
+    "tests/training/test_imagefolder_resume.py",
+    "src/image_ai_studio/training/imagefolder_workflow.py",
+    "src/image_ai_studio/application/training_controller.py",
+    "src/image_ai_studio/gui/training_page.py",
+    "tests/training/test_imagefolder_workflow.py",
+    "tests/application/test_training_controller.py",
+    "tests/gui/test_training_page.py",
+    "tests/gui/test_imagefolder_auto_split_integration.py",
+    "README.md",
+    "docs/phase16_imagefolder_auto_split.md"
+  ],
+  "allowed_tests": [
+    "phase16_cp1_deterministic_imagefolder_auto_split_contract",
+    "phase16_cp2_auto_split_training_workflow_integration",
+    "phase16_cp3_auto_split_cpu_graduation"
+  ],
+  "final_harness_profile": "full",
+  "max_checkpoints": 3,
+  "max_rework_rounds": 1,
+  "max_model_calls": 16,
+  "max_claude_cost_usd": 7.5,
+  "max_elapsed_seconds": 14400,
+  "completion_conditions": [
+    "Each checkpoint durably records its pre-maker baseline, passes its fixed required-test allowlist, and receives a read-only checkpoint verifier PASS before the next checkpoint starts.",
+    "CP1 provides strict deterministic per-class automatic splitting with complete disjoint membership, stable class mapping, global-RNG isolation, safe path handling, resume identity, and unchanged prepared-layout behavior.",
+    "CP2 exposes automatic splitting only through an explicit backward-compatible request and TrainingPage mode, validates before output publication, and preserves training lifecycle, cooperative stop, cleanup, rerun, Model Designer handoff, checkpoint/resume, portable artifacts, and integrity manifest behavior.",
+    "CP3 completes one bounded real local-CPU MainWindow training graduation from a class-root dataset, verifies artifacts and inference compatibility plus recovery behavior, and documents the implemented contract and limitations without fabricated results.",
+    "All Phase 0-15 Training, Inference, Model Designer, preview, folder inference, export, cancellation, close, artifact, and integrity contracts remain compatible; no CUDA, network, download, augmentation, data copying, multi-label stratification, dependency, launcher, packaging, or schema migration work is introduced.",
+    "No change occurs outside the thirteen Phase files, no existing assertion is deleted or meaningfully weakened, and no unregistered marker, arbitrary sleep, busy loop, forced thread termination, skip, or xfail is used as evidence of success.",
+    "After all checkpoint verifiers pass, the Phase-wide read-only verifier runs exactly once against the complete manifest-scoped delta and completion evidence; only its PASS permits the canonical full project harness to run exactly once, with no verifier after the harness and any mutation, ambiguous durable state, failure, or incomplete evidence failing closed without automatic Phase restart."
+  ]
+}

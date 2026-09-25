@@ -1,0 +1,28 @@
+{
+  "template": false,
+  "checkpoint_id": "phase16-cp1-deterministic-imagefolder-auto-split-contract",
+  "objective": "Define a strict, deterministic, class-stratified Train/Validation/Test split contract for a single class-root ImageFolder dataset while preserving the existing prepared-split path and exact-resume identity checks.",
+  "acceptance_criteria": [
+    "A focused training dataset API accepts one local ImageFolder class root and explicit validation fraction, test fraction, and seed, without copying, moving, renaming, or modifying source images.",
+    "Split parameters reject booleans, non-finite values, values outside their documented ranges, validation-plus-test fractions that leave no training share, unsupported paths, symlinked dataset roots or class directories, empty classes, and any class that cannot contribute at least one sample to every split.",
+    "Assignment is stratified per class, uses a stable canonical relative-path ordering plus an isolated seeded generator, and produces identical membership and order for identical inputs without consuming or mutating global Python or Torch RNG state.",
+    "Every discovered image appears in exactly one of train, validation, or test; no sample is lost or duplicated; every split has the same deterministic classes and class_to_idx mapping; and different supported seeds can change membership without changing counts or labels.",
+    "Rounding and remainder allocation are explicitly deterministic per class and documented by tests at minimum-size and uneven-count boundaries.",
+    "The returned split datasets remain compatible with DataLoader and with existing ImageFolder resume metadata hashing, which fingerprints the actual split membership using canonical relative paths rather than object identity or absolute repository location.",
+    "Prepared root/train, root/val, root/test loading remains byte-for-byte behaviorally compatible and remains the default existing API path; automatic detection or reinterpretation of an existing prepared root is not introduced.",
+    "Resume metadata rejects a changed seed, fractions, membership, class mapping, or file set through the existing compatibility boundary without changing the existing metadata JSON schema unless a versioned backward-compatible change is demonstrably required.",
+    "Tests use only tiny local tmp_path images and cover determinism, stratification, disjointness, completeness, invalid fractions, too-small classes, symlink rejection where supported, global RNG isolation, prepared-layout compatibility, and resume identity without CUDA, network, downloads, sleeps, new markers, or weakened assertions.",
+    "Only the four allowed files are changed and no Git operation is performed."
+  ],
+  "allowed_files": [
+    "src/image_ai_studio/training/torchvision_dataset.py",
+    "src/image_ai_studio/training/imagefolder_resume.py",
+    "tests/training/test_imagefolder_dataset.py",
+    "tests/training/test_imagefolder_resume.py"
+  ],
+  "required_tests": [
+    "phase16_cp1_deterministic_imagefolder_auto_split_contract"
+  ],
+  "claude_prompt": "Implement Phase 16 CP1 only in the four allowed files. Add an explicit, standalone deterministic class-stratified splitter for a single local ImageFolder class root. Reuse torchvision ImageFolder discovery and the existing deterministic transform, but do not copy or mutate source data and do not auto-detect layout. Validate finite fractions, remaining train share, regular non-symlink roots/classes, nonempty classes, and enough samples for one item per class per split. Base membership on canonical relative-path ordering and an isolated seed so all samples are disjoint and complete and global RNG state is untouched. Make the split datasets work with DataLoader and adapt the existing resume fingerprint boundary only as needed so it hashes actual canonical split membership while retaining prepared-layout and legacy metadata compatibility. Keep the existing make_imagefolder_datasets prepared train/val/test behavior unchanged. Add thorough local deterministic tests for boundaries, invalid input, symlinks where supported, repeatability, seed variation, RNG isolation, prepared compatibility, and resume mismatch. Do not modify workflow, controller, GUI, public model/training schemas, dependencies, markers, other files, or perform Git operations.",
+  "estimated_scope": "Medium isolated dataset and resume-identity contract, approximately 300-520 changed lines across four files."
+}
